@@ -3,6 +3,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Price = Decimal;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExchangeId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClientId(pub String);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Ask,
@@ -31,8 +37,8 @@ impl Default for OrderLifecycle {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Order {
-    pub exchange_id: String,
-    pub client_id: String,
+    pub exchange_id: ExchangeId,
+    pub client_id: ClientId,
     pub order_type: OrderType,
     pub price: Price,
     pub side: Side,
@@ -43,8 +49,8 @@ pub struct Order {
 
 #[derive(Debug, Clone)]
 pub struct OrderBuilder {
-    exchange_id: Option<String>,
-    client_id: Option<String>,
+    exchange_id: Option<ExchangeId>,
+    client_id: Option<ClientId>,
     order_type: Option<OrderType>,
     price: Option<Price>,
     side: Option<Side>,
@@ -97,12 +103,12 @@ impl OrderBuilder {
     }
 
     pub fn exchange_id(mut self, exchange_id: impl Into<String>) -> Self {
-        self.exchange_id = Some(exchange_id.into());
+        self.exchange_id = Some(ExchangeId(exchange_id.into()));
         self
     }
 
     pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
-        self.client_id = Some(client_id.into());
+        self.client_id = Some(ClientId(client_id.into()));
         self
     }
 
@@ -138,7 +144,7 @@ impl Order {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PriceLevel {
     pub price: Price,
     pub side: Side,
@@ -173,11 +179,11 @@ impl PriceLevel {
         Ok(self)
     }
 
-    pub fn remove_order(&mut self, order_exchange_id: &str) -> Option<Order> {
+    pub fn remove_order(&mut self, order_exchange_id: &ExchangeId) -> Option<Order> {
         let idx = self
             .orders
             .iter()
-            .position(|order| order.exchange_id == order_exchange_id)?;
+            .position(|order| &order.exchange_id == order_exchange_id)?;
 
         Some(self.orders.remove(idx))
     }
@@ -249,13 +255,13 @@ mod tests {
             .exchange_id("exchange_id")
             .quantity(10)
             .build();
-        let order_id = order.exchange_id.clone();
+        let exchange_id = order.exchange_id.clone();
 
         let result = price_level.add_order(order);
 
         assert!(result.is_ok());
 
-        let result = price_level.remove_order(&order_id);
+        let result = price_level.remove_order(&exchange_id);
 
         assert!(result.is_some());
         assert!(price_level.is_empty());
@@ -265,7 +271,7 @@ mod tests {
     fn price_level_remote_nonexistent_doesnt_crash() {
         let mut price_level = price_level_ask(None);
 
-        price_level.remove_order("exchange_id");
+        price_level.remove_order(&ExchangeId("exchange_id".to_owned()));
 
         assert!(price_level.is_empty());
     }
@@ -299,6 +305,7 @@ mod tests {
             .exchange_id("order_1")
             .quantity(10)
             .build();
+
         let order2 = Order::builder()
             .side(Side::Bid)
             .price(Decimal::new(100, 2))
