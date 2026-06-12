@@ -88,6 +88,48 @@ impl OrderBook {
 
         Ok(())
     }
+
+    pub fn best_bid(&self) -> Option<Price> {
+        self.bids.iter().next().map(|(price, _)| price.0)
+    }
+
+    pub fn best_ask(&self) -> Option<Price> {
+        self.asks.iter().next().map(|(price, _)| *price)
+    }
+
+    pub fn spread(&self) -> Option<Price> {
+        match (self.best_ask(), self.best_bid()) {
+            (Some(ask), Some(bid)) => Some(ask - bid),
+            _ => None,
+        }
+    }
+
+    pub fn best_bid_level(&self) -> Option<PriceLevel> {
+        self.bids
+            .iter()
+            .next()
+            .map(|(_price, price_level)| price_level.clone())
+    }
+
+    pub fn best_ask_level(&self) -> Option<PriceLevel> {
+        self.asks
+            .iter()
+            .next()
+            .map(|(_price, price_level)| price_level.clone())
+    }
+
+    pub fn crosses(&self, side: Side, price: Price) -> bool {
+        match side {
+            Side::Ask => match self.best_bid() {
+                None => false,
+                Some(best_bid) => price <= best_bid,
+            },
+            Side::Bid => match self.best_ask() {
+                None => false,
+                Some(best_ask) => price >= best_ask,
+            },
+        }
+    }
 }
 /*
 Q: Why knowing the *spread* is important?
@@ -100,7 +142,20 @@ A: At any moment when a LIMIT order arrives, we must check if it crosses the spr
 #[cfg(test)]
 mod test {
     use super::*;
-    use rust_decimal::Decimal;
+    use crate::test_helpers::{order, px};
+
+    /// A non-crossed book: bids 99/98/97, asks 100/101/102.
+    /// best_bid = 99, best_ask = 100, spread = 1.
+    fn book_with_depth() -> OrderBook {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Bid, 99, 110, "bid_99")).unwrap();
+        ob.add_order(order(Side::Bid, 98, 500, "bid_98")).unwrap();
+        ob.add_order(order(Side::Bid, 97, 500, "bid_97")).unwrap();
+        ob.add_order(order(Side::Ask, 100, 100, "ask_100")).unwrap();
+        ob.add_order(order(Side::Ask, 101, 200, "ask_101")).unwrap();
+        ob.add_order(order(Side::Ask, 102, 500, "ask_102")).unwrap();
+        ob
+    }
 
     #[test]
     fn order_book_new_returns_empty_orderbook() {
@@ -114,16 +169,12 @@ mod test {
     #[test]
     fn add_order_adds_order_to_correct_side_ask() {
         let mut orderbook = OrderBook::new();
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
 
-        let result = orderbook.add_order(order);
-        assert!(result.is_ok());
+        assert!(
+            orderbook
+                .add_order(order(Side::Ask, 100, 10, "ex_1"))
+                .is_ok()
+        );
         assert_eq!(orderbook.asks.len(), 1);
         assert_eq!(orderbook.bids.len(), 0);
     }
@@ -131,16 +182,12 @@ mod test {
     #[test]
     fn add_order_adds_order_to_correct_side_bid() {
         let mut orderbook = OrderBook::new();
-        let order = Order::builder()
-            .side(Side::Bid)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
 
-        let result = orderbook.add_order(order);
-        assert!(result.is_ok());
+        assert!(
+            orderbook
+                .add_order(order(Side::Bid, 100, 10, "ex_1"))
+                .is_ok()
+        );
         assert_eq!(orderbook.asks.len(), 0);
         assert_eq!(orderbook.bids.len(), 1);
     }
@@ -148,70 +195,49 @@ mod test {
     #[test]
     fn add_order_adds_multiple_orders() {
         let mut orderbook = OrderBook::new();
-        let order1 = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
-        let order2 = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id_1")
-            .exchange_id("exchange_id_1")
-            .quantity(5)
-            .build();
 
-        assert!(orderbook.add_order(order1).is_ok());
-        assert!(orderbook.add_order(order2).is_ok());
+        assert!(
+            orderbook
+                .add_order(order(Side::Ask, 100, 10, "ex_1"))
+                .is_ok()
+        );
+        assert!(
+            orderbook
+                .add_order(order(Side::Ask, 100, 5, "ex_2"))
+                .is_ok()
+        );
 
         assert_eq!(orderbook.bids.len(), 0);
 
-        let level = orderbook.asks.get(&Decimal::new(100, 2)).unwrap();
+        let level = orderbook.asks.get(&px(100)).unwrap();
         assert_eq!(level.total_quantity(), 15); // 10 + 5
     }
 
     #[test]
     fn maintains_an_index_of_all_orders() {
         let mut orderbook = OrderBook::new();
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("ex_1")
-            .quantity(10)
-            .build();
 
-        orderbook.add_order(order).unwrap();
+        orderbook
+            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .unwrap();
 
         let (side, price) = orderbook.index.get(&ExchangeId("ex_1".to_owned())).unwrap();
         assert_eq!(*side, Side::Ask);
-        assert_eq!(*price, Decimal::new(100, 2));
+        assert_eq!(*price, px(100));
     }
 
     #[test]
     fn add_order_rejects_duplicate_exchange_id() {
         let mut orderbook = OrderBook::new();
-        let order1 = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_1")
-            .exchange_id("same_id")
-            .quantity(10)
-            .build();
-        let order2 = Order::builder()
-            .side(Side::Bid)
-            .price(Decimal::new(99, 2))
-            .client_id("client_2")
-            .exchange_id("same_id")
-            .quantity(5)
-            .build();
 
-        assert!(orderbook.add_order(order1).is_ok());
         assert!(
             orderbook
-                .add_order(order2)
+                .add_order(order(Side::Ask, 100, 10, "same_id"))
+                .is_ok()
+        );
+        assert!(
+            orderbook
+                .add_order(order(Side::Bid, 99, 5, "same_id"))
                 .is_err_and(|e| e == OrderBookError::ExchangeIdDuplicated)
         );
     }
@@ -219,18 +245,15 @@ mod test {
     #[test]
     fn cancel_order_cancels_existing_order_by_id() {
         let mut orderbook = OrderBook::new();
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("order_to_cancel_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
 
-        assert!(orderbook.add_order(order).is_ok());
         assert!(
             orderbook
-                .cancel_order(ExchangeId("exchange_id".to_owned()))
+                .add_order(order(Side::Ask, 100, 10, "ex_1"))
+                .is_ok()
+        );
+        assert!(
+            orderbook
+                .cancel_order(ExchangeId("ex_1".to_owned()))
                 .is_ok()
         );
     }
@@ -238,15 +261,11 @@ mod test {
     #[test]
     fn cancel_order_on_bid_side() {
         let mut orderbook = OrderBook::new();
-        let order = Order::builder()
-            .side(Side::Bid)
-            .price(Decimal::new(99, 2))
-            .client_id("client_id")
-            .exchange_id("bid_order")
-            .quantity(10)
-            .build();
 
-        orderbook.add_order(order).unwrap();
+        orderbook
+            .add_order(order(Side::Bid, 99, 10, "bid_order"))
+            .unwrap();
+
         assert!(
             orderbook
                 .cancel_order(ExchangeId("bid_order".to_owned()))
@@ -259,30 +278,20 @@ mod test {
     #[test]
     fn cancel_order_removes_only_target_order_from_level() {
         let mut orderbook = OrderBook::new();
-        let order1 = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_1")
-            .exchange_id("ex_1")
-            .quantity(10)
-            .build();
-        let order2 = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_2")
-            .exchange_id("ex_2")
-            .quantity(5)
-            .build();
 
-        orderbook.add_order(order1).unwrap();
-        orderbook.add_order(order2).unwrap();
+        orderbook
+            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .unwrap();
+        orderbook
+            .add_order(order(Side::Ask, 100, 5, "ex_2"))
+            .unwrap();
 
         orderbook
             .cancel_order(ExchangeId("ex_1".to_owned()))
             .unwrap();
 
         // price level still exists with remaining order
-        let level = orderbook.asks.get(&Decimal::new(100, 2)).unwrap();
+        let level = orderbook.asks.get(&px(100)).unwrap();
         assert_eq!(level.orders.len(), 1);
         assert_eq!(level.total_quantity(), 5);
 
@@ -294,15 +303,10 @@ mod test {
     #[test]
     fn cancel_order_cleans_up_empty_price_level() {
         let mut orderbook = OrderBook::new();
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("ex_1")
-            .quantity(10)
-            .build();
 
-        orderbook.add_order(order).unwrap();
+        orderbook
+            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .unwrap();
         orderbook
             .cancel_order(ExchangeId("ex_1".to_owned()))
             .unwrap();
@@ -317,5 +321,94 @@ mod test {
         let result = orderbook.cancel_order(ExchangeId("nonexisting_order".to_owned()));
 
         assert!(result.is_err_and(|e| e == OrderBookError::OrderNotFound));
+    }
+
+    #[test]
+    fn best_bid_and_best_ask_return_top_of_book() {
+        let orderbook = book_with_depth();
+
+        assert_eq!(orderbook.best_bid(), Some(px(99)));
+        assert_eq!(orderbook.best_ask(), Some(px(100)));
+    }
+
+    #[test]
+    fn best_bid_and_ask_are_none_on_empty_book() {
+        let orderbook = OrderBook::new();
+
+        assert_eq!(orderbook.best_bid(), None);
+        assert_eq!(orderbook.best_ask(), None);
+    }
+
+    #[test]
+    fn spread_is_difference_between_best_ask_and_best_bid() {
+        let orderbook = book_with_depth();
+
+        assert_eq!(orderbook.spread(), Some(px(1))); // 100 - 99
+    }
+
+    #[test]
+    fn spread_is_none_when_either_side_empty() {
+        let mut orderbook = OrderBook::new();
+        assert_eq!(orderbook.spread(), None);
+
+        orderbook
+            .add_order(order(Side::Bid, 99, 10, "bid"))
+            .unwrap();
+        assert_eq!(orderbook.spread(), None); // only one side present
+    }
+
+    #[test]
+    fn best_level_returns_top_of_book_with_its_orders() {
+        let orderbook = book_with_depth();
+
+        let bid_level = orderbook.best_bid_level().unwrap();
+        assert_eq!(bid_level.price, px(99));
+        assert_eq!(bid_level.total_quantity(), 110);
+
+        let ask_level = orderbook.best_ask_level().unwrap();
+        assert_eq!(ask_level.price, px(100));
+        assert_eq!(ask_level.total_quantity(), 100);
+    }
+
+    #[test]
+    fn best_level_is_none_on_empty_book() {
+        let orderbook = OrderBook::new();
+
+        assert!(orderbook.best_bid_level().is_none());
+        assert!(orderbook.best_ask_level().is_none());
+    }
+
+    #[test]
+    fn crosses_returns_false_on_empty_book() {
+        let orderbook = OrderBook::new();
+
+        assert!(!orderbook.crosses(Side::Bid, px(100)));
+        assert!(!orderbook.crosses(Side::Ask, px(100)));
+    }
+
+    #[test]
+    fn crosses_detects_marketable_orders() {
+        // book_with_depth: best_bid = 99, best_ask = 100
+        let orderbook = book_with_depth();
+
+        // (incoming side, limit price in cents, should it cross?)
+        let cases = [
+            // a BUY crosses when it meets or beats the best ask (100)
+            (Side::Bid, 101, true),
+            (Side::Bid, 100, true),
+            (Side::Bid, 99, false),
+            // a SELL crosses when it meets or undercuts the best bid (99)
+            (Side::Ask, 98, true),
+            (Side::Ask, 99, true),
+            (Side::Ask, 100, false),
+        ];
+
+        for (side, price, expected) in cases {
+            assert_eq!(
+                orderbook.crosses(side, px(price)),
+                expected,
+                "crosses({side:?}, {price}) should be {expected}",
+            );
+        }
     }
 }

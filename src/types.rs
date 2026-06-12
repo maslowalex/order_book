@@ -198,152 +198,83 @@ impl PriceLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{order, price_level, px};
 
     #[test]
     fn price_level_constructor_works() {
-        let price = Decimal::new(500, 2);
-        let side = Side::Ask;
-        let price_level = PriceLevel::new(price, side);
+        let level = price_level(Side::Ask, 500);
 
-        assert_eq!(price_level.price, price);
-        assert_eq!(price_level.side, side);
-        assert_eq!(price_level.orders, vec![]);
+        assert_eq!(level.price, px(500));
+        assert_eq!(level.side, Side::Ask);
+        assert_eq!(level.orders, vec![]);
     }
 
     #[test]
     fn price_level_add_order_works() {
-        let mut price_level = price_level_ask(None);
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
+        let mut level = price_level(Side::Ask, 100);
 
-        _ = price_level.add_order(order);
+        level
+            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .expect("order should be added");
 
-        assert!(!price_level.is_empty());
+        assert!(!level.is_empty());
     }
 
     #[test]
     fn price_level_add_order_invalid_level_doesnt_change_orders_of_level() {
-        let mut price_level = price_level_bid(None);
+        let mut level = price_level(Side::Bid, 100);
 
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
-
-        let result = price_level.add_order(order);
+        let result = level.add_order(order(Side::Ask, 100, 10, "ex_1"));
 
         assert!(result.is_err_and(|x| x == OrderError::InvalidSide));
-
-        assert!(price_level.is_empty());
+        assert!(level.is_empty());
     }
 
     #[test]
     fn price_level_remove_order_works() {
-        let mut price_level = price_level_ask(None);
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
-        let exchange_id = order.exchange_id.clone();
+        let mut level = price_level(Side::Ask, 100);
+        let to_remove = order(Side::Ask, 100, 10, "ex_1");
+        let exchange_id = to_remove.exchange_id.clone();
 
-        let result = price_level.add_order(order);
+        level.add_order(to_remove).expect("order should be added");
 
-        assert!(result.is_ok());
-
-        let result = price_level.remove_order(&exchange_id);
-
-        assert!(result.is_some());
-        assert!(price_level.is_empty());
+        assert!(level.remove_order(&exchange_id).is_some());
+        assert!(level.is_empty());
     }
 
     #[test]
     fn price_level_remote_nonexistent_doesnt_crash() {
-        let mut price_level = price_level_ask(None);
+        let mut level = price_level(Side::Ask, 100);
 
-        price_level.remove_order(&ExchangeId("exchange_id".to_owned()));
+        level.remove_order(&ExchangeId("ex_1".to_owned()));
 
-        assert!(price_level.is_empty());
+        assert!(level.is_empty());
     }
 
     #[test]
     fn price_level_is_empty_works() {
-        let mut price_level = price_level_ask(None);
+        let mut level = price_level(Side::Ask, 100);
 
-        assert!(price_level.is_empty());
+        assert!(level.is_empty());
 
-        let order = Order::builder()
-            .side(Side::Ask)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id")
-            .exchange_id("exchange_id")
-            .quantity(10)
-            .build();
+        level
+            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .expect("order should be added");
 
-        _ = price_level.add_order(order);
-
-        assert!(!price_level.is_empty());
+        assert!(!level.is_empty());
     }
 
     #[test]
     fn price_level_total_quantity_works() {
-        let mut price_level = price_level_bid(None);
-        let order1 = Order::builder()
-            .side(Side::Bid)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id_1")
-            .exchange_id("order_1")
-            .quantity(10)
-            .build();
+        let mut level = price_level(Side::Bid, 100);
 
-        let order2 = Order::builder()
-            .side(Side::Bid)
-            .price(Decimal::new(100, 2))
-            .client_id("client_id_2")
-            .exchange_id("order_2")
-            .quantity(35)
-            .build();
+        level
+            .add_order(order(Side::Bid, 100, 10, "order_1"))
+            .expect("order 1 should be added");
+        level
+            .add_order(order(Side::Bid, 100, 35, "order_2"))
+            .expect("order 2 should be added");
 
-        price_level
-            .add_order(order1)
-            .expect("Order 1 doesn't added");
-        price_level
-            .add_order(order2)
-            .expect("Order 2 doesn't added");
-
-        assert_eq!(price_level.total_quantity(), 45);
-    }
-
-    fn price_level_ask(price: Option<i64>) -> PriceLevel {
-        let price = match price {
-            Some(price) => Decimal::new(price, 2),
-
-            _ => Decimal::new(100, 2),
-        };
-        let side = Side::Ask;
-
-        PriceLevel::new(price, side)
-    }
-
-    fn price_level_bid(price: Option<i64>) -> PriceLevel {
-        let price = match price {
-            Some(price) => Decimal::new(price, 2),
-
-            _ => Decimal::new(100, 2),
-        };
-
-        let side = Side::Bid;
-
-        PriceLevel::new(price, side)
+        assert_eq!(level.total_quantity(), 45);
     }
 }
