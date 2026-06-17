@@ -25,8 +25,9 @@ pub enum OrderType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderLifecycle {
     New,
-    PartiallyFilled(u64), // represents how much is filled
+    PartiallyFilled, // represents how much is filled
     Filled,
+    Cancelled,
 }
 
 impl Default for OrderLifecycle {
@@ -42,7 +43,8 @@ pub struct Order {
     pub order_type: OrderType,
     pub price: Price,
     pub side: Side,
-    pub quantity: u64,
+    pub original_quantity: u64,
+    pub remaining_quantity: u64,
     pub timestamp: u128, // matters, because of the FIFO processing we need to know the time of the order
     pub lifecycle: OrderLifecycle,
 }
@@ -54,7 +56,8 @@ pub struct OrderBuilder {
     order_type: Option<OrderType>,
     price: Option<Price>,
     side: Option<Side>,
-    quantity: Option<u64>,
+    original_quantity: Option<u64>,
+    remaining_quantity: Option<u64>,
     timestamp: Option<u128>,
     lifecycle: Option<OrderLifecycle>,
 }
@@ -73,7 +76,8 @@ impl Default for OrderBuilder {
             exchange_id: None,
             client_id: None,
             price: None,
-            quantity: None,
+            original_quantity: None,
+            remaining_quantity: None,
             side: None,
         }
     }
@@ -81,6 +85,7 @@ impl Default for OrderBuilder {
 
 impl OrderBuilder {
     pub fn build(self) -> Order {
+        let original_quantity = self.original_quantity.expect("quantity doesn't provided");
         Order {
             exchange_id: self.exchange_id.expect("exchange_id should be present"),
             client_id: self.client_id.expect("client_id should be present"),
@@ -91,7 +96,10 @@ impl OrderBuilder {
                 .timestamp
                 .expect("somehow timetamp is not provided and default doesn't applied"),
             side: self.side.expect("side doesn't provided"),
-            quantity: self.quantity.expect("quantity doesn't provided"),
+            // a fresh order has nothing filled yet, so remaining == original unless
+            // a test explicitly seeds a pre-filled resting order via .remaining_quantity()
+            remaining_quantity: self.remaining_quantity.unwrap_or(original_quantity),
+            original_quantity: self.original_quantity.unwrap_or(original_quantity),
             order_type: self.order_type.expect("order_type doesn't provided"),
             price: self.price.expect("price doesn't provided"),
         }
@@ -128,7 +136,12 @@ impl OrderBuilder {
     }
 
     pub fn quantity(mut self, quantity: u64) -> Self {
-        self.quantity = Some(quantity);
+        self.original_quantity = Some(quantity);
+        self
+    }
+
+    pub fn remaining_quantity(mut self, remaining_quantity: u64) -> Self {
+        self.remaining_quantity = Some(remaining_quantity);
         self
     }
 
@@ -191,7 +204,7 @@ impl PriceLevel {
     pub fn total_quantity(&self) -> u64 {
         self.orders
             .iter()
-            .fold(0, |acc, order| acc + order.quantity)
+            .fold(0, |acc, order| acc + order.remaining_quantity)
     }
 }
 
@@ -214,7 +227,7 @@ mod tests {
         let mut level = price_level(Side::Ask, 100);
 
         level
-            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .expect("order should be added");
 
         assert!(!level.is_empty());
@@ -224,7 +237,7 @@ mod tests {
     fn price_level_add_order_invalid_level_doesnt_change_orders_of_level() {
         let mut level = price_level(Side::Bid, 100);
 
-        let result = level.add_order(order(Side::Ask, 100, 10, "ex_1"));
+        let result = level.add_order(order(Side::Ask, 100, 10, None, "ex_1"));
 
         assert!(result.is_err_and(|x| x == OrderError::InvalidSide));
         assert!(level.is_empty());
@@ -233,7 +246,7 @@ mod tests {
     #[test]
     fn price_level_remove_order_works() {
         let mut level = price_level(Side::Ask, 100);
-        let to_remove = order(Side::Ask, 100, 10, "ex_1");
+        let to_remove = order(Side::Ask, 100, 10, None, "ex_1");
         let exchange_id = to_remove.exchange_id.clone();
 
         level.add_order(to_remove).expect("order should be added");
@@ -258,7 +271,7 @@ mod tests {
         assert!(level.is_empty());
 
         level
-            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .expect("order should be added");
 
         assert!(!level.is_empty());
@@ -269,12 +282,27 @@ mod tests {
         let mut level = price_level(Side::Bid, 100);
 
         level
-            .add_order(order(Side::Bid, 100, 10, "order_1"))
+            .add_order(order(Side::Bid, 100, 10, None, "order_1"))
             .expect("order 1 should be added");
         level
-            .add_order(order(Side::Bid, 100, 35, "order_2"))
+            .add_order(order(Side::Bid, 100, 35, None, "order_2"))
             .expect("order 2 should be added");
 
         assert_eq!(level.total_quantity(), 45);
+    }
+
+    #[test]
+    fn price_level_total_quantity_with_prefilled_order_works() {
+        let mut level = price_level(Side::Bid, 100);
+        let partially_filled = order(Side::Bid, 100, 10, Some(5), "order_1");
+
+        level
+            .add_order(partially_filled)
+            .expect("order 1 should be added");
+        level
+            .add_order(order(Side::Bid, 100, 35, None, "order_2"))
+            .expect("order 2 should be added");
+
+        assert_eq!(level.total_quantity(), 40);
     }
 }

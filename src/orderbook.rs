@@ -148,12 +148,18 @@ mod test {
     /// best_bid = 99, best_ask = 100, spread = 1.
     fn book_with_depth() -> OrderBook {
         let mut ob = OrderBook::new();
-        ob.add_order(order(Side::Bid, 99, 110, "bid_99")).unwrap();
-        ob.add_order(order(Side::Bid, 98, 500, "bid_98")).unwrap();
-        ob.add_order(order(Side::Bid, 97, 500, "bid_97")).unwrap();
-        ob.add_order(order(Side::Ask, 100, 100, "ask_100")).unwrap();
-        ob.add_order(order(Side::Ask, 101, 200, "ask_101")).unwrap();
-        ob.add_order(order(Side::Ask, 102, 500, "ask_102")).unwrap();
+        ob.add_order(order(Side::Bid, 99, 110, None, "bid_99"))
+            .unwrap();
+        ob.add_order(order(Side::Bid, 98, 500, None, "bid_98"))
+            .unwrap();
+        ob.add_order(order(Side::Bid, 97, 500, None, "bid_97"))
+            .unwrap();
+        ob.add_order(order(Side::Ask, 100, 100, None, "ask_100"))
+            .unwrap();
+        ob.add_order(order(Side::Ask, 101, 200, None, "ask_101"))
+            .unwrap();
+        ob.add_order(order(Side::Ask, 102, 500, None, "ask_102"))
+            .unwrap();
         ob
     }
 
@@ -172,7 +178,7 @@ mod test {
 
         assert!(
             orderbook
-                .add_order(order(Side::Ask, 100, 10, "ex_1"))
+                .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
                 .is_ok()
         );
         assert_eq!(orderbook.asks.len(), 1);
@@ -185,7 +191,7 @@ mod test {
 
         assert!(
             orderbook
-                .add_order(order(Side::Bid, 100, 10, "ex_1"))
+                .add_order(order(Side::Bid, 100, 10, None, "ex_1"))
                 .is_ok()
         );
         assert_eq!(orderbook.asks.len(), 0);
@@ -198,12 +204,12 @@ mod test {
 
         assert!(
             orderbook
-                .add_order(order(Side::Ask, 100, 10, "ex_1"))
+                .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
                 .is_ok()
         );
         assert!(
             orderbook
-                .add_order(order(Side::Ask, 100, 5, "ex_2"))
+                .add_order(order(Side::Ask, 100, 5, None, "ex_2"))
                 .is_ok()
         );
 
@@ -218,7 +224,7 @@ mod test {
         let mut orderbook = OrderBook::new();
 
         orderbook
-            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .unwrap();
 
         let (side, price) = orderbook.index.get(&ExchangeId("ex_1".to_owned())).unwrap();
@@ -232,12 +238,12 @@ mod test {
 
         assert!(
             orderbook
-                .add_order(order(Side::Ask, 100, 10, "same_id"))
+                .add_order(order(Side::Ask, 100, 10, None, "same_id"))
                 .is_ok()
         );
         assert!(
             orderbook
-                .add_order(order(Side::Bid, 99, 5, "same_id"))
+                .add_order(order(Side::Bid, 99, 5, None, "same_id"))
                 .is_err_and(|e| e == OrderBookError::ExchangeIdDuplicated)
         );
     }
@@ -248,7 +254,7 @@ mod test {
 
         assert!(
             orderbook
-                .add_order(order(Side::Ask, 100, 10, "ex_1"))
+                .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
                 .is_ok()
         );
         assert!(
@@ -263,7 +269,7 @@ mod test {
         let mut orderbook = OrderBook::new();
 
         orderbook
-            .add_order(order(Side::Bid, 99, 10, "bid_order"))
+            .add_order(order(Side::Bid, 99, 10, None, "bid_order"))
             .unwrap();
 
         assert!(
@@ -280,10 +286,10 @@ mod test {
         let mut orderbook = OrderBook::new();
 
         orderbook
-            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .unwrap();
         orderbook
-            .add_order(order(Side::Ask, 100, 5, "ex_2"))
+            .add_order(order(Side::Ask, 100, 5, None, "ex_2"))
             .unwrap();
 
         orderbook
@@ -305,7 +311,7 @@ mod test {
         let mut orderbook = OrderBook::new();
 
         orderbook
-            .add_order(order(Side::Ask, 100, 10, "ex_1"))
+            .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .unwrap();
         orderbook
             .cancel_order(ExchangeId("ex_1".to_owned()))
@@ -352,7 +358,7 @@ mod test {
         assert_eq!(orderbook.spread(), None);
 
         orderbook
-            .add_order(order(Side::Bid, 99, 10, "bid"))
+            .add_order(order(Side::Bid, 99, 10, None, "bid"))
             .unwrap();
         assert_eq!(orderbook.spread(), None); // only one side present
     }
