@@ -22,6 +22,8 @@ pub enum OrderBookError {
     Generic,
     ExchangeIdDuplicated,
     OrderNotFound,
+    /// Order type the matching engine doesn't handle (e.g. `StopMarket`).
+    Unsupported,
 }
 
 impl OrderBook {
