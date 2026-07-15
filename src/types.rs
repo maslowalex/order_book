@@ -6,6 +6,12 @@ pub type Price = Decimal;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExchangeId(pub String);
 
+impl ExchangeId {
+    pub fn from_sequence(seq: u64) -> ExchangeId {
+        ExchangeId(format!("exchId-{}", seq))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientId(pub String);
 
@@ -172,8 +178,8 @@ pub enum OrderError {
 impl PriceLevel {
     pub fn new(price: Price, side: Side) -> Self {
         Self {
-            price: price,
-            side: side,
+            price,
+            side,
             orders: vec![],
         }
     }

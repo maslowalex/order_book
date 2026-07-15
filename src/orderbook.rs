@@ -15,6 +15,7 @@ pub struct OrderBook {
     pub bids: BTreeMap<Reverse<Price>, PriceLevel>, // descending: best (highest) bid first
     pub asks: BTreeMap<Price, PriceLevel>,          // ascending: best (lowest) ask first
     pub index: HashMap<ExchangeId, (Side, Price)>,
+    pub next_seq: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -32,6 +33,7 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             index: HashMap::new(),
+            next_seq: 1,
         }
     }
 
