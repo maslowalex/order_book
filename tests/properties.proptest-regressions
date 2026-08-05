@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a98701f942df9f573c8810b383e2f6952115566647a17f1a4cd1d7f5195add36 # shrinks to stream = [Order { exchange_id: ExchangeId("caller-provided"), client_id: ClientId("client-1"), order_type: Limit, price: 95.50, side: Bid, original_quantity: 1, remaining_quantity: 1, timestamp: 1785951423609009000, lifecycle: New }, Order { exchange_id: ExchangeId("caller-provided"), client_id: ClientId("client-0"), order_type: Limit, price: 95.00, side: Ask, original_quantity: 1, remaining_quantity: 1, timestamp: 1785951423609010000, lifecycle: New }]

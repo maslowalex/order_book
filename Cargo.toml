@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 rust_decimal = "1.42.1"
+
+[dev-dependencies]
+proptest = "1"
