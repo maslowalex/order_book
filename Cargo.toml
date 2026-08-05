@@ -8,3 +8,9 @@ rust_decimal = "1.42.1"
 
 [dev-dependencies]
 proptest = "1"
+criterion = { version = "0.8", features = ["html_reports"] }
+rand = "0.9"
+
+[[bench]]
+name = "order_book"
+harness = false
