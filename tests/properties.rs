@@ -18,7 +18,6 @@
 //! random streams actually cross; clients come from a pool of 4 so self-trade
 //! prevention gets exercised.
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use order_book::matching::SubmitOutcome;
@@ -101,18 +100,9 @@ fn total_depth(book: &OrderBook) -> u64 {
         .sum()
 }
 
-/// Remaining quantity of `id` if it rests in the book, found via the index.
+/// Remaining quantity of `id` if it rests in the book.
 fn rested_remaining(book: &OrderBook, id: &ExchangeId) -> Option<u64> {
-    let (side, price) = book.index.get(id)?;
-    let level = match side {
-        Side::Bid => book.bids.get(&Reverse(*price))?,
-        Side::Ask => book.asks.get(price)?,
-    };
-    level
-        .orders
-        .iter()
-        .find(|o| &o.exchange_id == id)
-        .map(|o| o.remaining_quantity)
+    book.get_order(id).map(|o| o.remaining_quantity)
 }
 
 /// Engine-assigned ids are "exchId-N"; N is the arrival sequence number.

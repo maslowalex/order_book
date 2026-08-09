@@ -128,6 +128,30 @@ impl OrderBook {
             .map(|(_price, price_level)| price_level.clone())
     }
 
+    /// Aggregated market depth: the top `levels` price levels of `side`,
+    /// best price first, as `(price, total resting quantity)`.
+    pub fn depth(&self, side: Side, levels: usize) -> Vec<(Price, u64)> {
+        let aggregate = |level: &PriceLevel| (level.price, level.total_quantity());
+        match side {
+            Side::Bid => self.bids.values().take(levels).map(aggregate).collect(),
+            Side::Ask => self.asks.values().take(levels).map(aggregate).collect(),
+        }
+    }
+
+    /// Look up a live resting order by its exchange id: index hop to the
+    /// level, then a linear scan within it (same O(level) cost as cancel).
+    pub fn get_order(&self, exchange_id: &ExchangeId) -> Option<&Order> {
+        let (side, price) = self.index.get(exchange_id)?;
+        let level = match side {
+            Side::Bid => self.bids.get(&Reverse(*price))?,
+            Side::Ask => self.asks.get(price)?,
+        };
+        level
+            .orders
+            .iter()
+            .find(|o| &o.exchange_id == exchange_id)
+    }
+
     pub fn crosses(&self, side: Side, price: Price) -> bool {
         match side {
             Side::Ask => match self.best_bid() {
@@ -392,6 +416,74 @@ mod test {
 
         assert!(orderbook.best_bid_level().is_none());
         assert!(orderbook.best_ask_level().is_none());
+    }
+
+    #[test]
+    fn depth_returns_best_levels_first_aggregated() {
+        // bids 99×110, 98×500, 97×500; asks 100×100, 101×200, 102×500
+        let orderbook = book_with_depth();
+
+        assert_eq!(
+            orderbook.depth(Side::Bid, 2),
+            vec![(px(99), 110), (px(98), 500)]
+        );
+        assert_eq!(
+            orderbook.depth(Side::Ask, 2),
+            vec![(px(100), 100), (px(101), 200)]
+        );
+    }
+
+    #[test]
+    fn depth_is_capped_by_available_levels() {
+        let orderbook = book_with_depth();
+
+        assert_eq!(orderbook.depth(Side::Ask, 10).len(), 3);
+        assert_eq!(OrderBook::new().depth(Side::Bid, 5), vec![]);
+    }
+
+    #[test]
+    fn depth_sums_all_orders_at_a_level() {
+        let mut orderbook = OrderBook::new();
+        orderbook
+            .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
+            .unwrap();
+        orderbook
+            .add_order(order(Side::Ask, 100, 5, None, "ex_2"))
+            .unwrap();
+
+        assert_eq!(orderbook.depth(Side::Ask, 1), vec![(px(100), 15)]);
+    }
+
+    #[test]
+    fn get_order_finds_a_resting_order() {
+        let orderbook = book_with_depth();
+
+        let found = orderbook
+            .get_order(&ExchangeId("ask_101".to_owned()))
+            .unwrap();
+        assert_eq!(found.side, Side::Ask);
+        assert_eq!(found.remaining_quantity, 200);
+    }
+
+    #[test]
+    fn get_order_returns_none_for_unknown_id() {
+        let orderbook = book_with_depth();
+
+        assert!(orderbook.get_order(&ExchangeId("nope".to_owned())).is_none());
+    }
+
+    #[test]
+    fn get_order_returns_none_after_cancel() {
+        let mut orderbook = book_with_depth();
+        orderbook
+            .cancel_order(ExchangeId("bid_99".to_owned()))
+            .unwrap();
+
+        assert!(
+            orderbook
+                .get_order(&ExchangeId("bid_99".to_owned()))
+                .is_none()
+        );
     }
 
     #[test]
