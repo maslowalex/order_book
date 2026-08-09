@@ -39,11 +39,12 @@ fn arb_limit_price() -> impl Strategy<Value = Price> {
 }
 
 fn arb_order_type() -> impl Strategy<Value = OrderType> {
-    // Mostly GTC limits (they build the book), some IOC limits and markets
-    // (they sweep it without adding depth).
+    // Mostly GTC limits (they build the book), some IOC/FOK limits and
+    // markets (they sweep it without adding depth).
     prop_oneof![
         3 => arb_limit_price().prop_map(OrderType::limit_gtc),
         1 => arb_limit_price().prop_map(OrderType::limit_ioc),
+        1 => arb_limit_price().prop_map(OrderType::limit_fok),
         1 => Just(OrderType::Market),
     ]
 }
@@ -138,9 +139,16 @@ proptest! {
                 order.order_type,
                 OrderType::Market
                     | OrderType::Limit {
-                        tif: TimeInForce::Ioc,
+                        tif: TimeInForce::Ioc | TimeInForce::Fok,
                         ..
                     }
+            );
+            let is_fok = matches!(
+                order.order_type,
+                OrderType::Limit {
+                    tif: TimeInForce::Fok,
+                    ..
+                }
             );
 
             let report = book.submit(order).unwrap();
@@ -164,8 +172,14 @@ proptest! {
                     prop_assert_eq!(rested, Some(original - filled));
                 }
                 SubmitOutcome::Killed => {
-                    prop_assert!(can_kill, "only market/IOC remainders are killed");
+                    prop_assert!(can_kill, "only market/IOC/FOK remainders are killed");
                     prop_assert!(filled < original);
+                    if is_fok {
+                        // all-or-nothing: a killed FOK executed NOTHING —
+                        // no fills and no self-trade cancellations
+                        prop_assert_eq!(filled, 0, "FOK partially filled");
+                        prop_assert!(report.cancelled.is_empty());
+                    }
                     prop_assert_eq!(rested, None);
                 }
             }

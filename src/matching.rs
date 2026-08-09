@@ -70,8 +70,7 @@ impl OrderBook {
                 TimeInForce::Gtc | TimeInForce::Ioc => {
                     self.process_limit_order(order, price, tif)
                 }
-                // FOK arrives in the next commit
-                TimeInForce::Fok => Err(OrderBookError::Unsupported),
+                TimeInForce::Fok => self.process_fok_limit_order(order, price),
             },
             OrderType::Market => self.process_market_order(order),
             OrderType::StopMarket { .. } | OrderType::StopLimit { .. } => {
@@ -134,6 +133,44 @@ impl OrderBook {
         })
     }
 
+    /// FOK is "check before execute": decide fillability against a read-only
+    /// view of the book, then either sweep normally (full fill guaranteed) or
+    /// return `Killed` having touched **nothing** — no partial fills, and no
+    /// self-trade cancellations either, because nothing executed.
+    fn process_fok_limit_order(
+        &mut self,
+        mut order: Order,
+        limit: Price,
+    ) -> Result<MatchingResult, OrderBookError> {
+        let available = match order.side {
+            Side::Bid => fillable_quantity(&self.asks, &order, limit),
+            Side::Ask => fillable_quantity(&self.bids, &order, limit),
+        };
+
+        if available < order.remaining_quantity {
+            return Ok(MatchingResult {
+                trades: vec![],
+                cancelled: vec![],
+                outcome: SubmitOutcome::Killed,
+            });
+        }
+
+        let (trades, cancelled) = match order.side {
+            Side::Bid => fill_against(&mut self.asks, &mut self.index, &mut order, Some(limit)),
+            Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, Some(limit)),
+        };
+        debug_assert_eq!(
+            order.remaining_quantity, 0,
+            "FOK dry-run promised a full fill"
+        );
+
+        Ok(MatchingResult {
+            trades,
+            cancelled,
+            outcome: SubmitOutcome::Filled,
+        })
+    }
+
     fn process_market_order(&mut self, mut order: Order) -> Result<MatchingResult, OrderBookError> {
         // A market order accepts any price, so there is no limit bound.
         let (trades, cancelled) = match order.side {
@@ -154,6 +191,42 @@ impl OrderBook {
             outcome,
         })
     }
+}
+
+/// How much of `taker` the book could fill right now within `limit`, without
+/// touching anything. Mirrors `fill_against`'s walk (best price first, stop
+/// once a level no longer crosses) but read-only. Resting orders owned by the
+/// taker's client are EXCLUDED: self-trade prevention cancels them instead of
+/// trading, so counting them would overpromise and let a "fill or kill"
+/// partially fill. Returns early once `taker.remaining_quantity` is reachable.
+fn fillable_quantity<K: Ord>(
+    side: &BTreeMap<K, PriceLevel>,
+    taker: &Order,
+    limit: Price,
+) -> u64 {
+    let needed = taker.remaining_quantity;
+    let mut available: u64 = 0;
+
+    for level in side.values() {
+        let crosses = match taker.side {
+            Side::Bid => level.price <= limit,
+            Side::Ask => level.price >= limit,
+        };
+        if !crosses {
+            break;
+        }
+        for order in &level.orders {
+            if order.client_id == taker.client_id {
+                continue; // would be STP-cancelled, not traded
+            }
+            available += order.remaining_quantity;
+            if available >= needed {
+                return available;
+            }
+        }
+    }
+
+    available
 }
 
 /// Walk the opposite side of the book and fill `taker` against it — best price
@@ -276,6 +349,16 @@ mod tests {
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::limit_ioc(px(price)))
+            .build()
+    }
+
+    fn fok_order(side: Side, price: i64, qty: u64, id: &str) -> Order {
+        Order::builder()
+            .side(side)
+            .quantity(qty)
+            .client_id(id)
+            .exchange_id(id)
+            .order_type(OrderType::limit_fok(px(price)))
             .build()
     }
 
@@ -737,6 +820,92 @@ mod tests {
         // the 101 level is untouched, and nothing rested
         assert_eq!(ob.best_ask(), Some(px(101)));
         assert_eq!(ob.best_bid(), None);
+    }
+
+    // ---- FOK: fill completely right now, or touch nothing ----
+
+    #[test]
+    fn fok_fills_completely_when_depth_suffices() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
+        ob.add_order(order(Side::Ask, 101, 5, None, "a2")).unwrap();
+
+        let report = ob.submit(fok_order(Side::Bid, 101, 10, "t1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Filled);
+        assert_eq!(report.trades.len(), 2);
+        let filled: u64 = report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, 10);
+        assert_eq!(ob.best_ask(), None);
+    }
+
+    #[test]
+    fn fok_kills_without_touching_the_book_when_depth_insufficient() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
+
+        // wants 10, only 5 exists — nothing may execute, not even the 5
+        let report = ob.submit(fok_order(Side::Bid, 100, 10, "t1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Killed);
+        assert!(report.trades.is_empty());
+        assert!(report.cancelled.is_empty());
+
+        // a1 still resting, untouched
+        assert_eq!(ob.best_ask(), Some(px(100)));
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 5);
+        assert!(ob.index.contains_key(&id("a1")));
+    }
+
+    #[test]
+    fn fok_only_counts_depth_within_its_limit_price() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
+        ob.add_order(order(Side::Ask, 102, 20, None, "a2")).unwrap();
+
+        // 25 exists in total, but only 5 within the 101 limit
+        let report = ob.submit(fok_order(Side::Bid, 101, 10, "t1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Killed);
+        assert!(report.trades.is_empty());
+        assert_eq!(ob.index.len(), 2); // both makers untouched
+    }
+
+    #[test]
+    fn fok_excludes_own_resting_orders_from_fillability() {
+        let mut ob = OrderBook::new();
+        // alice's own ask can't fill alice — STP would cancel it, not trade it
+        ob.add_order(limit_order(Side::Ask, 100, 5, "alice"))
+            .unwrap();
+        ob.add_order(limit_order(Side::Ask, 100, 5, "bob")).unwrap();
+
+        // 10 rests at 100, but only bob's 5 is really fillable for alice
+        let report = ob.submit(fok_order(Side::Bid, 100, 10, "alice")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Killed);
+        assert!(report.trades.is_empty());
+        // crucially: alice's resting order was NOT self-trade-cancelled,
+        // because nothing executed
+        assert!(report.cancelled.is_empty());
+        assert_eq!(ob.index.len(), 2);
+    }
+
+    #[test]
+    fn fok_executes_through_own_order_cancelling_it() {
+        let mut ob = OrderBook::new();
+        // alice's order is first in FIFO, bob's behind it has enough depth
+        ob.add_order(limit_order(Side::Ask, 100, 5, "alice"))
+            .unwrap();
+        ob.add_order(limit_order(Side::Ask, 100, 10, "bob")).unwrap();
+
+        // dry-run: bob's 10 ≥ 10 → execute; sweep STP-cancels alice's on the way
+        let report = ob.submit(fok_order(Side::Bid, 100, 10, "alice")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Filled);
+        let filled: u64 = report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, 10);
+        assert_eq!(report.cancelled, vec![id("alice")]);
+        assert_eq!(ob.best_ask(), None); // level fully drained
     }
 
     // ---- report plumbing ----
