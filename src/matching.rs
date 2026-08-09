@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::orderbook::{OrderBook, OrderBookError};
-use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, PriceLevel, Side};
+use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, PriceLevel, Side, TimeInForce};
 
 /// A single executed fill between a resting maker and an incoming taker.
 ///
@@ -66,9 +66,15 @@ impl OrderBook {
         order.exchange_id = order_id.clone();
 
         let matching_result = match order.order_type {
-            OrderType::Limit => self.process_limit_order(order),
+            OrderType::Limit { price, tif } => match tif {
+                TimeInForce::Gtc => self.process_limit_order(order, price),
+                // IOC/FOK arrive in the next commits
+                TimeInForce::Ioc | TimeInForce::Fok => Err(OrderBookError::Unsupported),
+            },
             OrderType::Market => self.process_market_order(order),
-            OrderType::StopMarket => Err(OrderBookError::Unsupported),
+            OrderType::StopMarket { .. } | OrderType::StopLimit { .. } => {
+                Err(OrderBookError::Unsupported)
+            }
         }?;
 
         Ok(ExecutionReport {
@@ -79,10 +85,13 @@ impl OrderBook {
         })
     }
 
-    fn process_limit_order(&mut self, mut order: Order) -> Result<MatchingResult, OrderBookError> {
+    fn process_limit_order(
+        &mut self,
+        mut order: Order,
+        limit: Price,
+    ) -> Result<MatchingResult, OrderBookError> {
         // A limit only sweeps the marketable prefix: fill against the opposite
-        // side while it crosses `order.price`, then rest whatever is left.
-        let limit = order.price;
+        // side while it crosses the limit price, then rest whatever is left.
         let (trades, cancelled) = match order.side {
             Side::Bid => fill_against(&mut self.asks, &mut self.index, &mut order, Some(limit)),
             Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, Some(limit)),
@@ -189,7 +198,7 @@ fn fill_against<K: Ord>(
 
             let fill = taker.remaining_quantity.min(front.remaining_quantity);
             trades.push(Trade {
-                price: front.price, // maker's price
+                price: level.price, // maker's price == its level's price
                 quantity: fill,
                 maker_order_id: front.exchange_id.clone(),
                 taker_order_id: taker.exchange_id.clone(),
@@ -223,25 +232,22 @@ mod tests {
     use super::*;
     use crate::test_helpers::{order, px};
 
-    // The `order()` helper defaults to a Market order type and sets
-    // client_id == exchange_id == id. That's fine for *resting* makers (order
-    // type is irrelevant once an order is in the book), but the incoming taker
-    // must control its own type, so these build it explicitly.
+    // The `order()` helper builds a resting GTC limit maker with
+    // client_id == exchange_id == id; the incoming taker controls its own
+    // type, so these build it explicitly.
     fn limit_order(side: Side, price: i64, qty: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .price(px(price))
             .quantity(qty)
             .client_id(id)
             .exchange_id(id)
-            .order_type(OrderType::Limit)
+            .order_type(OrderType::limit_gtc(px(price)))
             .build()
     }
 
     fn market_order(side: Side, qty: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .price(px(0)) // ignored for market orders; build() just requires a price
             .quantity(qty)
             .client_id(id)
             .exchange_id(id)
@@ -681,17 +687,15 @@ mod tests {
         let mut ob = OrderBook::new();
         let maker = Order::builder()
             .side(Side::Ask)
-            .price(px(100))
             .quantity(10)
             .client_id("alice")
             .exchange_id("a1")
-            .order_type(OrderType::Limit)
+            .order_type(OrderType::limit_gtc(px(100)))
             .build();
         ob.add_order(maker).unwrap();
 
         let taker = Order::builder()
             .side(Side::Bid)
-            .price(px(0))
             .quantity(5)
             .client_id("alice") // same client as the resting order
             .exchange_id("t1")

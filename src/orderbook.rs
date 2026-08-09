@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::types::{ExchangeId, Order, Price, PriceLevel, Side};
+use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
 
 /*
 If we were to store the quantities in plain u64 we might need to normalize/denormalize the quantity.
@@ -23,8 +23,12 @@ pub enum OrderBookError {
     Generic,
     ExchangeIdDuplicated,
     OrderNotFound,
-    /// Order type the matching engine doesn't handle (e.g. `StopMarket`).
+    /// Order type the matching engine doesn't handle yet.
     Unsupported,
+    /// Only limit orders can rest in the book — market orders execute or die,
+    /// stops park in the stop book until triggered. Before `OrderType` carried
+    /// its price, `add_order` would silently rest a market order at 0.00.
+    NotRestable,
 }
 
 impl OrderBook {
@@ -38,7 +42,9 @@ impl OrderBook {
     }
 
     pub fn add_order(&mut self, order: Order) -> Result<(), OrderBookError> {
-        let price = order.price;
+        let OrderType::Limit { price, .. } = order.order_type else {
+            return Err(OrderBookError::NotRestable);
+        };
         let side = order.side;
         let exchange_id = order.exchange_id.clone();
 
@@ -50,7 +56,7 @@ impl OrderBook {
         let price_level = match side {
             Side::Ask => self
                 .asks
-                .entry(order.price)
+                .entry(price)
                 .or_insert_with(|| PriceLevel::new(price, side)),
             Side::Bid => self
                 .bids

@@ -21,11 +21,67 @@ pub enum Side {
     Bid,
 }
 
+/// What happens to the unfilled remainder of a limit order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeInForce {
+    /// Good Till Cancel: the remainder rests until filled or cancelled.
+    Gtc,
+    /// Immediate Or Cancel: fill what crosses right now, discard the rest.
+    Ioc,
+    /// Fill Or Kill: fill completely right now, or do nothing at all.
+    Fok,
+}
+
+/// Execution style, carrying exactly the data that style needs — a `Market`
+/// order has no price to carry, a stop can't exist without a trigger, and TIF
+/// only means something for limits. Invalid combinations (a GTC market order,
+/// a stop with no trigger) are unrepresentable rather than validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
-    Limit,
+    /// Execute at `price` or better; `tif` decides the remainder's fate.
+    Limit { price: Price, tif: TimeInForce },
+    /// Execute now at the best available prices; inherently IOC.
     Market,
-    StopMarket,
+    /// Parks until the market trades at/past `trigger`, then becomes `Market`.
+    StopMarket { trigger: Price },
+    /// Parks until `trigger`, then becomes `Limit { price, tif }`.
+    StopLimit {
+        trigger: Price,
+        price: Price,
+        tif: TimeInForce,
+    },
+}
+
+impl OrderType {
+    pub fn limit_gtc(price: Price) -> Self {
+        OrderType::Limit { price, tif: TimeInForce::Gtc }
+    }
+
+    pub fn limit_ioc(price: Price) -> Self {
+        OrderType::Limit { price, tif: TimeInForce::Ioc }
+    }
+
+    pub fn limit_fok(price: Price) -> Self {
+        OrderType::Limit { price, tif: TimeInForce::Fok }
+    }
+
+    pub fn stop_market(trigger: Price) -> Self {
+        OrderType::StopMarket { trigger }
+    }
+
+    pub fn stop_limit(trigger: Price, price: Price) -> Self {
+        OrderType::StopLimit { trigger, price, tif: TimeInForce::Gtc }
+    }
+
+    /// The price this order rests at in the book — now (`Limit`) or after
+    /// triggering (`StopLimit`). `None` for market-style orders, which never
+    /// rest.
+    pub fn limit_price(&self) -> Option<Price> {
+        match self {
+            OrderType::Limit { price, .. } | OrderType::StopLimit { price, .. } => Some(*price),
+            OrderType::Market | OrderType::StopMarket { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +102,9 @@ impl Default for OrderLifecycle {
 pub struct Order {
     pub exchange_id: ExchangeId,
     pub client_id: ClientId,
+    /// Carries the price(s) too — see `OrderType`. A resting order is always
+    /// `Limit`, and its price is its level's price.
     pub order_type: OrderType,
-    pub price: Price,
     pub side: Side,
     pub original_quantity: u64,
     pub remaining_quantity: u64,
@@ -60,7 +117,6 @@ pub struct OrderBuilder {
     exchange_id: Option<ExchangeId>,
     client_id: Option<ClientId>,
     order_type: Option<OrderType>,
-    price: Option<Price>,
     side: Option<Side>,
     original_quantity: Option<u64>,
     remaining_quantity: Option<u64>,
@@ -78,10 +134,11 @@ impl Default for OrderBuilder {
         OrderBuilder {
             lifecycle: Some(OrderLifecycle::New),
             timestamp: Some(timestamp_ns),
-            order_type: Some(OrderType::Market),
+            // no order_type default: `Market` silently standing in for a
+            // forgotten `.order_type(...)` hid intent — now it's a loud panic
+            order_type: None,
             exchange_id: None,
             client_id: None,
-            price: None,
             original_quantity: None,
             remaining_quantity: None,
             side: None,
@@ -107,7 +164,6 @@ impl OrderBuilder {
             remaining_quantity: self.remaining_quantity.unwrap_or(original_quantity),
             original_quantity: self.original_quantity.unwrap_or(original_quantity),
             order_type: self.order_type.expect("order_type doesn't provided"),
-            price: self.price.expect("price doesn't provided"),
         }
     }
 
@@ -128,11 +184,6 @@ impl OrderBuilder {
 
     pub fn order_type(mut self, order_type: OrderType) -> Self {
         self.order_type = Some(order_type);
-        self
-    }
-
-    pub fn price(mut self, price: Price) -> Self {
-        self.price = Some(price);
         self
     }
 

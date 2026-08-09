@@ -99,9 +99,8 @@ mod generators {
         Order::builder()
             .exchange_id(id)
             .client_id(client)
-            .order_type(OrderType::Limit)
+            .order_type(OrderType::limit_gtc(price))
             .side(side)
-            .price(price)
             .quantity(qty)
             .timestamp(ts)
             .build()
@@ -163,18 +162,17 @@ mod generators {
                 let side = if rng.random_range(0..2) == 0 { Side::Bid } else { Side::Ask };
                 let qty = rng.random_range(1..=50);
                 let is_market = rng.random_range(0..5) == 0;
-                let (order_type, price) = if is_market {
-                    (OrderType::Market, Decimal::ZERO) // market ignores price
+                let order_type = if is_market {
+                    OrderType::Market
                 } else {
                     let tick = rng.random_range(full.0..=full.1);
-                    (OrderType::Limit, Decimal::new(tick * dist.tick_cents, 2))
+                    OrderType::limit_gtc(Decimal::new(tick * dist.tick_cents, 2))
                 };
                 Order::builder()
                     .exchange_id(format!("burst-{i}"))
                     .client_id(format!("burst-{i}"))
                     .order_type(order_type)
                     .side(side)
-                    .price(price)
                     .quantity(qty)
                     .timestamp(2_000_000 + i as u128)
                     .build()
@@ -236,7 +234,6 @@ mod generators {
                     .client_id(format!("taker-{j}"))
                     .order_type(OrderType::Market)
                     .side(Side::Bid)
-                    .price(Decimal::ZERO)
                     .quantity(levels_each as u64 * level_depth)
                     .timestamp(3_000_000 + j as u128)
                     .build()

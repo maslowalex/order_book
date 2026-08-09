@@ -33,31 +33,28 @@ fn arb_side() -> impl Strategy<Value = Side> {
     prop_oneof![Just(Side::Bid), Just(Side::Ask)]
 }
 
-fn arb_order_type() -> impl Strategy<Value = OrderType> {
-    // Mostly limits (they build the book), some markets (they sweep it).
-    prop_oneof![3 => Just(OrderType::Limit), 1 => Just(OrderType::Market)]
-}
-
 fn arb_limit_price() -> impl Strategy<Value = Price> {
     // 95.00 ..= 105.00 in 0.25 ticks
     (380u32..=420).prop_map(|ticks| Decimal::new(i64::from(ticks) * 25, 2))
 }
 
+fn arb_order_type() -> impl Strategy<Value = OrderType> {
+    // Mostly limits (they build the book), some markets (they sweep it).
+    prop_oneof![
+        3 => arb_limit_price().prop_map(OrderType::limit_gtc),
+        1 => Just(OrderType::Market),
+    ]
+}
+
 fn arb_order() -> impl Strategy<Value = Order> {
-    (arb_side(), arb_order_type(), arb_limit_price(), 1..=50u64, 0..4u8).prop_map(
-        |(side, order_type, price, quantity, client)| {
+    (arb_side(), arb_order_type(), 1..=50u64, 0..4u8).prop_map(
+        |(side, order_type, quantity, client)| {
             Order::builder()
                 // submit() overrides this with an engine-assigned id
                 .exchange_id("caller-provided")
                 .client_id(format!("client-{client}"))
                 .order_type(order_type)
                 .side(side)
-                // convention: market orders ignore price, carry ZERO
-                .price(if order_type == OrderType::Market {
-                    Decimal::ZERO
-                } else {
-                    price
-                })
                 .quantity(quantity)
                 .build()
         },
@@ -82,12 +79,13 @@ fn resting_snapshot(book: &OrderBook) -> HashMap<ExchangeId, (Side, Price, u64)>
     book.bids
         .values()
         .chain(book.asks.values())
-        .flat_map(|level| &level.orders)
-        .map(|o| {
-            (
-                o.exchange_id.clone(),
-                (o.side, o.price, o.remaining_quantity),
-            )
+        .flat_map(|level| {
+            level.orders.iter().map(|o| {
+                (
+                    o.exchange_id.clone(),
+                    (o.side, level.price, o.remaining_quantity),
+                )
+            })
         })
         .collect()
 }
@@ -204,8 +202,8 @@ proptest! {
 
         for order in stream {
             let taker_side = order.side;
-            let is_limit = order.order_type == OrderType::Limit;
-            let limit = order.price;
+            // Some(price) for limit takers, None for market takers
+            let limit = order.order_type.limit_price();
 
             let before = resting_snapshot(&book);
             let report = book.submit(order).unwrap();
@@ -221,7 +219,7 @@ proptest! {
                 prop_assert_eq!(trade.taker_side, taker_side);
                 prop_assert_eq!(&trade.taker_order_id, &report.order_id);
 
-                if is_limit {
+                if let Some(limit) = limit {
                     match taker_side {
                         Side::Bid => prop_assert!(trade.price <= limit),
                         Side::Ask => prop_assert!(trade.price >= limit),
@@ -300,7 +298,8 @@ proptest! {
             for o in &level.orders {
                 live_orders += 1;
                 prop_assert!(o.remaining_quantity > 0);
-                prop_assert_eq!(o.price, level.price);
+                // everything resting must be a limit at its level's price
+                prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
                 let expected = (Side::Ask, level.price);
                 prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
             }
@@ -312,7 +311,8 @@ proptest! {
             for o in &level.orders {
                 live_orders += 1;
                 prop_assert!(o.remaining_quantity > 0);
-                prop_assert_eq!(o.price, level.price);
+                // everything resting must be a limit at its level's price
+                prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
                 let expected = (Side::Bid, level.price);
                 prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
             }
