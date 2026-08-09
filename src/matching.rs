@@ -1,6 +1,7 @@
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::orderbook::{OrderBook, OrderBookError};
+use crate::orderbook::{OrderBook, OrderBookError, OrderLocation};
 use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, PriceLevel, Side, TimeInForce};
 
 /// A single executed fill between a resting maker and an incoming taker.
@@ -29,8 +30,11 @@ pub enum SubmitOutcome {
     PartiallyFilledAndRested,
     /// Order fully filled — nothing left to rest.
     Filled,
-    /// Market order's unfilled remainder was discarded (IOC semantics).
+    /// The unfilled remainder was discarded (market/IOC), or a FOK couldn't
+    /// fill completely and executed nothing.
     Killed,
+    /// A stop order parked in the stop book, waiting for its trigger.
+    StopPending,
 }
 
 /// The result of submitting one order: every fill it caused, what became of it,
@@ -43,6 +47,11 @@ pub struct ExecutionReport {
     /// Resting orders cancelled because they belonged to the taker's own client
     /// (self-trade prevention).
     pub cancelled: Vec<ExchangeId>,
+    /// Stop orders this submit's trades set off, one report per activated
+    /// stop, in trigger order. FLAT: a triggered stop's own trades may
+    /// trigger further stops, but those land here too (their `triggered` is
+    /// always empty), so consumers never recurse.
+    pub triggered: Vec<ExecutionReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +65,13 @@ impl OrderBook {
     /// Submit an order to be matched against the book, resting any remainder
     /// (limit) or discarding it (market). Contrast with `add_order`, which
     /// always rests without matching (used for seeding the book).
+    ///
+    /// If the resulting trades move the last-trade price through pending stop
+    /// triggers, those stops activate here, in a loop: each activation may
+    /// trade, which may trigger further stops. The loop terminates because
+    /// every iteration permanently removes one stop and activations (market/
+    /// limit orders) can never add one. The cascade's reports are collected
+    /// flat into the returned report's `triggered`.
     pub fn submit(&mut self, mut order: Order) -> Result<ExecutionReport, OrderBookError> {
         // The exchange assigns the order's id on receipt — ignoring whatever id
         // the caller put on it — and advances the sequence for the next order.
@@ -63,7 +79,21 @@ impl OrderBook {
         // remainder, and `order_id` all referring to the same assigned id.
         let order_id = ExchangeId::from_sequence(self.next_seq);
         self.next_seq += 1;
-        order.exchange_id = order_id.clone();
+        order.exchange_id = order_id;
+
+        let mut report = self.execute(order)?;
+
+        while let Some(stop) = self.pop_triggered_stop() {
+            report.triggered.push(self.execute(activate(stop))?);
+        }
+
+        Ok(report)
+    }
+
+    /// Run ONE order through matching — no cascade, no id minting (the id is
+    /// already stamped). Both `submit` and stop activation come through here.
+    fn execute(&mut self, order: Order) -> Result<ExecutionReport, OrderBookError> {
+        let order_id = order.exchange_id.clone();
 
         let matching_result = match order.order_type {
             OrderType::Limit { price, tif } => match tif {
@@ -73,17 +103,90 @@ impl OrderBook {
                 TimeInForce::Fok => self.process_fok_limit_order(order, price),
             },
             OrderType::Market => self.process_market_order(order),
-            OrderType::StopMarket { .. } | OrderType::StopLimit { .. } => {
-                Err(OrderBookError::Unsupported)
+            OrderType::StopMarket { trigger } | OrderType::StopLimit { trigger, .. } => {
+                return self.park_or_activate_stop(order, trigger);
             }
         }?;
+
+        // the trigger signal for stops: the price of the most recent trade
+        if let Some(last) = matching_result.trades.last() {
+            self.last_trade_price = Some(last.price);
+        }
 
         Ok(ExecutionReport {
             order_id,
             trades: matching_result.trades,
             outcome: matching_result.outcome,
             cancelled: matching_result.cancelled,
+            triggered: vec![],
         })
+    }
+
+    /// A stop whose trigger the market has already reached activates
+    /// immediately; otherwise it parks in the stop book until a trade
+    /// reaches its trigger.
+    fn park_or_activate_stop(
+        &mut self,
+        order: Order,
+        trigger: Price,
+    ) -> Result<ExecutionReport, OrderBookError> {
+        let already_triggered = match (self.last_trade_price, order.side) {
+            (None, _) => false, // no trade has ever printed — nothing to compare
+            (Some(last), Side::Bid) => last >= trigger, // buy stop: market rose to it
+            (Some(last), Side::Ask) => last <= trigger, // sell stop: market fell to it
+        };
+        if already_triggered {
+            // recursion depth is 1: `activate` yields Market/Limit, which
+            // can never re-enter this function
+            return self.execute(activate(order));
+        }
+
+        let order_id = order.exchange_id.clone();
+        match self.index.entry(order_id.clone()) {
+            Entry::Occupied(_) => return Err(OrderBookError::ExchangeIdDuplicated),
+            Entry::Vacant(e) => e.insert(OrderLocation::StopBook {
+                side: order.side,
+                trigger,
+            }),
+        };
+        let stops = match order.side {
+            Side::Bid => &mut self.stop_bids,
+            Side::Ask => &mut self.stop_asks,
+        };
+        stops.entry(trigger).or_default().push(order);
+
+        Ok(ExecutionReport {
+            order_id,
+            trades: vec![],
+            outcome: SubmitOutcome::StopPending,
+            cancelled: vec![],
+            triggered: vec![],
+        })
+    }
+
+    /// The next pending stop whose trigger the last trade price has reached,
+    /// removed from the stop book and the index. Buy stops are checked first
+    /// (lowest trigger — nearest to a rising market), then sell stops
+    /// (highest trigger — nearest to a falling market); FIFO within one
+    /// trigger price.
+    fn pop_triggered_stop(&mut self) -> Option<Order> {
+        let last = self.last_trade_price?;
+
+        let queue_entry = match self.stop_bids.first_entry() {
+            Some(entry) if *entry.key() <= last => Some(entry),
+            _ => match self.stop_asks.last_entry() {
+                Some(entry) if *entry.key() >= last => Some(entry),
+                _ => None,
+            },
+        };
+
+        let mut entry = queue_entry?;
+        let order = entry.get_mut().remove(0);
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+        self.index.remove(&order.exchange_id);
+        Some(order)
     }
 
     fn process_limit_order(
@@ -193,6 +296,19 @@ impl OrderBook {
     }
 }
 
+/// What a triggered stop becomes: `StopMarket` → `Market`, `StopLimit` →
+/// `Limit` at its stored price/TIF. Id, side, quantities, and timestamp are
+/// untouched — the exchange id assigned at submission follows the order
+/// through activation.
+fn activate(mut order: Order) -> Order {
+    order.order_type = match order.order_type {
+        OrderType::StopMarket { .. } => OrderType::Market,
+        OrderType::StopLimit { price, tif, .. } => OrderType::Limit { price, tif },
+        other => other,
+    };
+    order
+}
+
 /// How much of `taker` the book could fill right now within `limit`, without
 /// touching anything. Mirrors `fill_against`'s walk (best price first, stop
 /// once a level no longer crosses) but read-only. Resting orders owned by the
@@ -244,7 +360,7 @@ fn fillable_quantity<K: Ord>(
 /// `&mut` args (rather than `&mut self`) is what keeps the borrows disjoint.
 fn fill_against<K: Ord>(
     side: &mut BTreeMap<K, PriceLevel>,
-    index: &mut HashMap<ExchangeId, (Side, Price)>,
+    index: &mut HashMap<ExchangeId, OrderLocation>,
     taker: &mut Order,
     limit: Option<Price>,
 ) -> (Vec<Trade>, Vec<ExchangeId>) {
@@ -359,6 +475,26 @@ mod tests {
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::limit_fok(px(price)))
+            .build()
+    }
+
+    fn stop_market(side: Side, trigger: i64, qty: u64, id: &str) -> Order {
+        Order::builder()
+            .side(side)
+            .quantity(qty)
+            .client_id(id)
+            .exchange_id(id)
+            .order_type(OrderType::stop_market(px(trigger)))
+            .build()
+    }
+
+    fn stop_limit(side: Side, trigger: i64, price: i64, qty: u64, id: &str) -> Order {
+        Order::builder()
+            .side(side)
+            .quantity(qty)
+            .client_id(id)
+            .exchange_id(id)
+            .order_type(OrderType::stop_limit(px(trigger), px(price)))
             .build()
     }
 
@@ -906,6 +1042,171 @@ mod tests {
         assert_eq!(filled, 10);
         assert_eq!(report.cancelled, vec![id("alice")]);
         assert_eq!(ob.best_ask(), None); // level fully drained
+    }
+
+    // ---- stops: park, trigger off trades, cascade ----
+
+    #[test]
+    fn stop_parks_when_no_trade_has_printed() {
+        let mut ob = OrderBook::new();
+
+        let report = ob.submit(stop_market(Side::Bid, 101, 10, "s1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::StopPending);
+        assert!(report.trades.is_empty());
+        assert!(report.triggered.is_empty());
+
+        // parked: findable and cancellable, but holds no book depth
+        assert!(ob.get_order(&report.order_id).is_some());
+        assert_eq!(ob.best_bid(), None);
+        assert!(ob.depth(Side::Bid, 10).is_empty());
+        assert_eq!(ob.stop_bids.len(), 1);
+    }
+
+    #[test]
+    fn buy_stop_triggers_when_market_trades_up_to_trigger() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 101, 10, None, "a1")).unwrap();
+        ob.add_order(order(Side::Ask, 102, 10, None, "a2")).unwrap();
+
+        // parks: no trade has printed yet
+        let parked = ob.submit(stop_market(Side::Bid, 101, 10, "s1")).unwrap();
+        assert_eq!(parked.outcome, SubmitOutcome::StopPending);
+
+        // this trade prints at 101 >= trigger → stop fires as a market buy
+        let report = ob.submit(market_order(Side::Bid, 10, "t1")).unwrap();
+
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].price, px(101));
+        assert_eq!(report.triggered.len(), 1);
+
+        let stop_report = &report.triggered[0];
+        assert_eq!(stop_report.order_id, parked.order_id); // id survives activation
+        assert_eq!(stop_report.outcome, SubmitOutcome::Filled);
+        assert_eq!(stop_report.trades[0].price, px(102)); // swept the next level
+
+        // stop book is drained, nothing pending
+        assert!(ob.stop_bids.is_empty());
+        assert!(ob.get_order(&parked.order_id).is_none());
+    }
+
+    #[test]
+    fn sell_stop_triggers_when_market_trades_down_to_trigger() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Bid, 99, 10, None, "b1")).unwrap();
+        ob.add_order(order(Side::Bid, 98, 10, None, "b2")).unwrap();
+
+        let parked = ob.submit(stop_market(Side::Ask, 99, 10, "s1")).unwrap();
+        assert_eq!(parked.outcome, SubmitOutcome::StopPending);
+
+        // sell 5 @ 99 → last trade 99 <= trigger 99 → stop fires
+        let report = ob.submit(market_order(Side::Ask, 5, "t1")).unwrap();
+
+        assert_eq!(report.triggered.len(), 1);
+        let stop_report = &report.triggered[0];
+        assert_eq!(stop_report.outcome, SubmitOutcome::Filled);
+        // fills the rest of 99 (5 left), then 5 more at 98
+        let filled: u64 = stop_report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, 10);
+        assert_eq!(stop_report.trades.last().unwrap().price, px(98));
+    }
+
+    #[test]
+    fn stop_cascade_chains_and_stays_flat() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 101, 10, None, "a1")).unwrap();
+        ob.add_order(order(Side::Ask, 102, 10, None, "a2")).unwrap();
+        ob.add_order(order(Side::Ask, 103, 10, None, "a3")).unwrap();
+
+        // stop A fires at 101; its fill at 102 fires stop B
+        let a = ob.submit(stop_market(Side::Bid, 101, 10, "sA")).unwrap();
+        let b = ob.submit(stop_market(Side::Bid, 102, 10, "sB")).unwrap();
+
+        let report = ob.submit(market_order(Side::Bid, 10, "t1")).unwrap();
+
+        // one flat list, in trigger order, no nesting
+        assert_eq!(report.triggered.len(), 2);
+        assert_eq!(report.triggered[0].order_id, a.order_id);
+        assert_eq!(report.triggered[1].order_id, b.order_id);
+        assert!(report.triggered.iter().all(|r| r.triggered.is_empty()));
+
+        assert_eq!(report.triggered[0].trades[0].price, px(102));
+        assert_eq!(report.triggered[1].trades[0].price, px(103));
+        assert!(ob.stop_bids.is_empty());
+    }
+
+    #[test]
+    fn stop_already_triggered_on_arrival_executes_immediately() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
+
+        // print a trade at 100
+        ob.submit(market_order(Side::Bid, 5, "t1")).unwrap();
+
+        // trigger 100 <= last trade 100 → activates NOW, never parks
+        let report = ob.submit(stop_market(Side::Bid, 100, 5, "s1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Filled);
+        assert_eq!(report.trades.len(), 1);
+        assert!(ob.stop_bids.is_empty());
+    }
+
+    #[test]
+    fn stop_limit_becomes_limit_and_rests_its_remainder() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 101, 10, None, "a1")).unwrap();
+        ob.add_order(order(Side::Ask, 102, 20, None, "a2")).unwrap();
+
+        // trigger at 101, then buy up to 30 at limit 102
+        let parked = ob
+            .submit(stop_limit(Side::Bid, 101, 102, 30, "s1"))
+            .unwrap();
+        assert_eq!(parked.outcome, SubmitOutcome::StopPending);
+
+        let report = ob.submit(market_order(Side::Bid, 10, "t1")).unwrap();
+
+        let stop_report = &report.triggered[0];
+        assert_eq!(stop_report.outcome, SubmitOutcome::PartiallyFilledAndRested);
+        let filled: u64 = stop_report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, 20); // all of a2
+
+        // the unfilled 10 rests as a normal limit bid at 102
+        assert_eq!(ob.best_bid(), Some(px(102)));
+        let rested = ob.get_order(&stop_report.order_id).unwrap();
+        assert_eq!(rested.remaining_quantity, 10);
+        assert_eq!(rested.order_type.limit_price(), Some(px(102)));
+    }
+
+    #[test]
+    fn pending_stop_can_be_cancelled() {
+        let mut ob = OrderBook::new();
+
+        let parked = ob.submit(stop_market(Side::Ask, 95, 10, "s1")).unwrap();
+        assert_eq!(parked.outcome, SubmitOutcome::StopPending);
+
+        assert!(ob.cancel_order(parked.order_id.clone()).is_ok());
+        assert!(ob.stop_asks.is_empty());
+        assert!(ob.index.is_empty());
+        assert!(
+            ob.cancel_order(parked.order_id)
+                .is_err_and(|e| e == OrderBookError::OrderNotFound)
+        );
+    }
+
+    #[test]
+    fn stops_fifo_within_same_trigger_price() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
+        ob.add_order(order(Side::Ask, 101, 20, None, "a2")).unwrap();
+
+        let first = ob.submit(stop_market(Side::Bid, 100, 5, "s1")).unwrap();
+        let second = ob.submit(stop_market(Side::Bid, 100, 5, "s2")).unwrap();
+
+        let report = ob.submit(market_order(Side::Bid, 5, "t1")).unwrap();
+
+        assert_eq!(report.triggered.len(), 2);
+        assert_eq!(report.triggered[0].order_id, first.order_id); // parked first, fires first
+        assert_eq!(report.triggered[1].order_id, second.order_id);
     }
 
     // ---- report plumbing ----

@@ -10,11 +10,32 @@ For example, 1 USD is 100 cents, and 1 BTC is 100_000_000 satoshis.
 For OrderBook operations we store at the lowest fraction for precision,
 and do the normalization on the higher levels.
 */
+/// Where a live order physically is — needed by `cancel_order`/`get_order`
+/// to know which structure to search. A bare `(Side, Price, kind)` tuple
+/// would invite reading a trigger price as a book price; the enum makes the
+/// two residencies impossible to confuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderLocation {
+    /// Resting in the book at this level price.
+    Book { side: Side, price: Price },
+    /// Parked in the stop book, waiting for the market to reach `trigger`.
+    StopBook { side: Side, trigger: Price },
+}
+
 #[derive(Debug, Clone)]
 pub struct OrderBook {
     pub bids: BTreeMap<Reverse<Price>, PriceLevel>, // descending: best (highest) bid first
     pub asks: BTreeMap<Price, PriceLevel>,          // ascending: best (lowest) ask first
-    pub index: HashMap<ExchangeId, (Side, Price)>,
+    /// Buy stops keyed by trigger, FIFO within one trigger price. A buy stop
+    /// fires when the market trades UP to its trigger, so the LOWEST key is
+    /// nearest to firing.
+    pub stop_bids: BTreeMap<Price, Vec<Order>>,
+    /// Sell stops keyed by trigger. Fires when the market trades DOWN to the
+    /// trigger, so the HIGHEST key is nearest to firing.
+    pub stop_asks: BTreeMap<Price, Vec<Order>>,
+    /// Price of the most recent trade — the signal stop triggers compare to.
+    pub last_trade_price: Option<Price>,
+    pub index: HashMap<ExchangeId, OrderLocation>,
     pub next_seq: u64,
 }
 
@@ -36,6 +57,9 @@ impl OrderBook {
         OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            stop_bids: BTreeMap::new(),
+            stop_asks: BTreeMap::new(),
+            last_trade_price: None,
             index: HashMap::new(),
             next_seq: 1,
         }
@@ -50,7 +74,7 @@ impl OrderBook {
 
         match self.index.entry(exchange_id) {
             Entry::Occupied(_) => return Err(OrderBookError::ExchangeIdDuplicated),
-            Entry::Vacant(e) => e.insert((side, price)),
+            Entry::Vacant(e) => e.insert(OrderLocation::Book { side, price }),
         };
 
         let price_level = match side {
@@ -72,13 +96,13 @@ impl OrderBook {
     }
 
     pub fn cancel_order(&mut self, exchange_id: ExchangeId) -> Result<(), OrderBookError> {
-        let (side, price) = self
+        let location = self
             .index
             .remove(&exchange_id)
             .ok_or(OrderBookError::OrderNotFound)?;
 
-        match side {
-            Side::Ask => {
+        match location {
+            OrderLocation::Book { side: Side::Ask, price } => {
                 if let Some(level) = self.asks.get_mut(&price) {
                     level.remove_order(&exchange_id);
                     if level.is_empty() {
@@ -86,11 +110,23 @@ impl OrderBook {
                     }
                 }
             }
-            Side::Bid => {
+            OrderLocation::Book { side: Side::Bid, price } => {
                 if let Some(level) = self.bids.get_mut(&Reverse(price)) {
                     level.remove_order(&exchange_id);
                     if level.is_empty() {
                         self.bids.remove(&Reverse(price));
+                    }
+                }
+            }
+            OrderLocation::StopBook { side, trigger } => {
+                let stops = match side {
+                    Side::Bid => &mut self.stop_bids,
+                    Side::Ask => &mut self.stop_asks,
+                };
+                if let Some(queue) = stops.get_mut(&trigger) {
+                    queue.retain(|o| o.exchange_id != exchange_id);
+                    if queue.is_empty() {
+                        stops.remove(&trigger);
                     }
                 }
             }
@@ -138,18 +174,19 @@ impl OrderBook {
         }
     }
 
-    /// Look up a live resting order by its exchange id: index hop to the
-    /// level, then a linear scan within it (same O(level) cost as cancel).
+    /// Look up a live order by its exchange id — resting in the book or
+    /// parked in the stop book. Index hop to the level/queue, then a linear
+    /// scan within it (same O(level) cost as cancel).
     pub fn get_order(&self, exchange_id: &ExchangeId) -> Option<&Order> {
-        let (side, price) = self.index.get(exchange_id)?;
-        let level = match side {
-            Side::Bid => self.bids.get(&Reverse(*price))?,
-            Side::Ask => self.asks.get(price)?,
+        let orders = match self.index.get(exchange_id)? {
+            OrderLocation::Book { side: Side::Bid, price } => {
+                &self.bids.get(&Reverse(*price))?.orders
+            }
+            OrderLocation::Book { side: Side::Ask, price } => &self.asks.get(price)?.orders,
+            OrderLocation::StopBook { side: Side::Bid, trigger } => self.stop_bids.get(trigger)?,
+            OrderLocation::StopBook { side: Side::Ask, trigger } => self.stop_asks.get(trigger)?,
         };
-        level
-            .orders
-            .iter()
-            .find(|o| &o.exchange_id == exchange_id)
+        orders.iter().find(|o| &o.exchange_id == exchange_id)
     }
 
     pub fn crosses(&self, side: Side, price: Price) -> bool {
@@ -261,9 +298,14 @@ mod test {
             .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .unwrap();
 
-        let (side, price) = orderbook.index.get(&ExchangeId("ex_1".to_owned())).unwrap();
-        assert_eq!(*side, Side::Ask);
-        assert_eq!(*price, px(100));
+        let location = orderbook.index.get(&ExchangeId("ex_1".to_owned())).unwrap();
+        assert_eq!(
+            *location,
+            OrderLocation::Book {
+                side: Side::Ask,
+                price: px(100)
+            }
+        );
     }
 
     #[test]
