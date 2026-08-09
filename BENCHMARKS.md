@@ -106,3 +106,11 @@ orders/level), **wide** = ~20k levels over 1.00–200.00 (0.01 tick; ~5 orders/l
 Two criterion warnings ("Unable to complete 20 samples in 2.0s") fired on the slowest 100k
 configs; sample counts were still ≥10, so estimates stand. Raise that group's
 `measurement_time` if re-runs look noisy.
+
+## Addendum (2026-08-09, after Phase 4)
+
+The Shape B order-type refactor (price/TIF/trigger moved into `OrderType` variants) grew
+`Order` by ~24 bytes. Spot-check against the `phase62` baseline: `add_order/wide/10000`
+unchanged; `cancel_order/tight/10000` **+6%** (512 → 542 µs/1k ops, stable across two runs) —
+the linear level scan and `Vec` shifting now move more bytes per order. Type safety priced in
+RAM traffic; one more exhibit for the 6.2a storage bake-off (compact resting-order layout).
