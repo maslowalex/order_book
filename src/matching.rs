@@ -67,9 +67,11 @@ impl OrderBook {
 
         let matching_result = match order.order_type {
             OrderType::Limit { price, tif } => match tif {
-                TimeInForce::Gtc => self.process_limit_order(order, price),
-                // IOC/FOK arrive in the next commits
-                TimeInForce::Ioc | TimeInForce::Fok => Err(OrderBookError::Unsupported),
+                TimeInForce::Gtc | TimeInForce::Ioc => {
+                    self.process_limit_order(order, price, tif)
+                }
+                // FOK arrives in the next commit
+                TimeInForce::Fok => Err(OrderBookError::Unsupported),
             },
             OrderType::Market => self.process_market_order(order),
             OrderType::StopMarket { .. } | OrderType::StopLimit { .. } => {
@@ -89,9 +91,11 @@ impl OrderBook {
         &mut self,
         mut order: Order,
         limit: Price,
+        tif: TimeInForce,
     ) -> Result<MatchingResult, OrderBookError> {
         // A limit only sweeps the marketable prefix: fill against the opposite
-        // side while it crosses the limit price, then rest whatever is left.
+        // side while it crosses the limit price, then TIF decides the
+        // remainder's fate.
         let (trades, cancelled) = match order.side {
             Side::Bid => fill_against(&mut self.asks, &mut self.index, &mut order, Some(limit)),
             Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, Some(limit)),
@@ -105,13 +109,23 @@ impl OrderBook {
             });
         }
 
-        // Some quantity is left over — rest it in the book.
-        let outcome = if trades.is_empty() {
-            SubmitOutcome::Rested
-        } else {
-            SubmitOutcome::PartiallyFilledAndRested
+        let outcome = match tif {
+            // GTC: the remainder rests in the book.
+            TimeInForce::Gtc => {
+                let outcome = if trades.is_empty() {
+                    SubmitOutcome::Rested
+                } else {
+                    SubmitOutcome::PartiallyFilledAndRested
+                };
+                self.add_order(order)?;
+                outcome
+            }
+            // IOC: the remainder is discarded — same fate as a market
+            // order's remainder, just bounded by the limit price.
+            TimeInForce::Ioc => SubmitOutcome::Killed,
+            // FOK never reaches here: fillability is decided before matching.
+            TimeInForce::Fok => return Err(OrderBookError::Unsupported),
         };
-        self.add_order(order)?;
 
         Ok(MatchingResult {
             trades,
@@ -252,6 +266,16 @@ mod tests {
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::Market)
+            .build()
+    }
+
+    fn ioc_order(side: Side, price: i64, qty: u64, id: &str) -> Order {
+        Order::builder()
+            .side(side)
+            .quantity(qty)
+            .client_id(id)
+            .exchange_id(id)
+            .order_type(OrderType::limit_ioc(px(price)))
             .build()
     }
 
@@ -644,6 +668,75 @@ mod tests {
         assert_eq!(ob.best_bid(), Some(px(97))); // only b3 remains
         assert_eq!(ob.best_ask(), Some(px(99))); // remainder rests
         assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 2);
+    }
+
+    // ---- IOC: fill what crosses now, never rest ----
+
+    #[test]
+    fn ioc_full_fill_behaves_like_gtc() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
+
+        let report = ob.submit(ioc_order(Side::Bid, 100, 10, "t1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Filled);
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].quantity, 10);
+        assert_eq!(ob.best_ask(), None);
+    }
+
+    #[test]
+    fn ioc_partial_fill_kills_remainder_instead_of_resting() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
+
+        // wants 15, only 10 crosses — GTC would rest the 5, IOC discards it
+        let report = ob.submit(ioc_order(Side::Bid, 100, 15, "t1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Killed);
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].quantity, 10);
+
+        // nothing rested: no bid side, taker not in the index
+        assert_eq!(ob.best_bid(), None);
+        assert!(!ob.index.contains_key(&report.order_id));
+    }
+
+    #[test]
+    fn ioc_that_does_not_cross_is_killed_with_no_trades() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
+
+        // bid at 99 doesn't reach the 100 ask — GTC would rest, IOC dies
+        let report = ob.submit(ioc_order(Side::Bid, 99, 5, "t1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Killed);
+        assert!(report.trades.is_empty());
+
+        // book completely untouched
+        assert_eq!(ob.best_ask(), Some(px(100)));
+        assert_eq!(ob.best_bid(), None);
+        assert_eq!(ob.index.len(), 1);
+    }
+
+    #[test]
+    fn ioc_respects_its_limit_price_while_sweeping() {
+        let mut ob = OrderBook::new();
+        ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
+        ob.add_order(order(Side::Ask, 101, 5, None, "a2")).unwrap();
+
+        // wants 8 but only the 100 level crosses its limit
+        let report = ob.submit(ioc_order(Side::Bid, 100, 8, "t1")).unwrap();
+
+        assert_eq!(report.outcome, SubmitOutcome::Killed);
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(
+            (report.trades[0].price, report.trades[0].quantity),
+            (px(100), 5)
+        );
+        // the 101 level is untouched, and nothing rested
+        assert_eq!(ob.best_ask(), Some(px(101)));
+        assert_eq!(ob.best_bid(), None);
     }
 
     // ---- report plumbing ----

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use order_book::matching::SubmitOutcome;
 use order_book::orderbook::OrderBook;
-use order_book::types::{ExchangeId, Order, OrderType, Price, Side};
+use order_book::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 
@@ -39,9 +39,11 @@ fn arb_limit_price() -> impl Strategy<Value = Price> {
 }
 
 fn arb_order_type() -> impl Strategy<Value = OrderType> {
-    // Mostly limits (they build the book), some markets (they sweep it).
+    // Mostly GTC limits (they build the book), some IOC limits and markets
+    // (they sweep it without adding depth).
     prop_oneof![
         3 => arb_limit_price().prop_map(OrderType::limit_gtc),
+        1 => arb_limit_price().prop_map(OrderType::limit_ioc),
         1 => Just(OrderType::Market),
     ]
 }
@@ -131,7 +133,15 @@ proptest! {
 
         for order in stream {
             let original = order.original_quantity;
-            let is_market = order.order_type == OrderType::Market;
+            // order types whose unfilled remainder is discarded, not rested
+            let can_kill = matches!(
+                order.order_type,
+                OrderType::Market
+                    | OrderType::Limit {
+                        tif: TimeInForce::Ioc,
+                        ..
+                    }
+            );
 
             let report = book.submit(order).unwrap();
             let filled: u64 = report.trades.iter().map(|t| t.quantity).sum();
@@ -154,7 +164,7 @@ proptest! {
                     prop_assert_eq!(rested, Some(original - filled));
                 }
                 SubmitOutcome::Killed => {
-                    prop_assert!(is_market, "only market remainders are killed");
+                    prop_assert!(can_kill, "only market/IOC remainders are killed");
                     prop_assert!(filled < original);
                     prop_assert_eq!(rested, None);
                 }
