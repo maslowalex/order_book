@@ -97,10 +97,10 @@ impl OrderBook {
 
         let matching_result = match order.order_type {
             OrderType::Limit { price, tif } => match tif {
-                TimeInForce::Gtc | TimeInForce::Ioc => {
+                TimeInForce::GTC | TimeInForce::IOC => {
                     self.process_limit_order(order, price, tif)
                 }
-                TimeInForce::Fok => self.process_fok_limit_order(order, price),
+                TimeInForce::FOK => self.process_fok_limit_order(order, price),
             },
             OrderType::Market => self.process_market_order(order),
             OrderType::StopMarket { trigger } | OrderType::StopLimit { trigger, .. } => {
@@ -213,7 +213,7 @@ impl OrderBook {
 
         let outcome = match tif {
             // GTC: the remainder rests in the book.
-            TimeInForce::Gtc => {
+            TimeInForce::GTC => {
                 let outcome = if trades.is_empty() {
                     SubmitOutcome::Rested
                 } else {
@@ -224,9 +224,9 @@ impl OrderBook {
             }
             // IOC: the remainder is discarded — same fate as a market
             // order's remainder, just bounded by the limit price.
-            TimeInForce::Ioc => SubmitOutcome::Killed,
+            TimeInForce::IOC => SubmitOutcome::Killed,
             // FOK never reaches here: fillability is decided before matching.
-            TimeInForce::Fok => return Err(OrderBookError::Unsupported),
+            TimeInForce::FOK => return Err(OrderBookError::Unsupported),
         };
 
         Ok(MatchingResult {

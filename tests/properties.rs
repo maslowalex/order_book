@@ -164,14 +164,14 @@ proptest! {
             let can_kill = matches!(
                 order.order_type,
                 OrderType::Market
-                    | OrderType::Limit { tif: TimeInForce::Ioc | TimeInForce::Fok, .. }
+                    | OrderType::Limit { tif: TimeInForce::IOC | TimeInForce::FOK, .. }
                     // an already-triggered stop activates immediately as market/limit
                     | OrderType::StopMarket { .. }
-                    | OrderType::StopLimit { tif: TimeInForce::Ioc | TimeInForce::Fok, .. }
+                    | OrderType::StopLimit { tif: TimeInForce::IOC | TimeInForce::FOK, .. }
             );
             let is_fok = matches!(
                 order.order_type,
-                OrderType::Limit { tif: TimeInForce::Fok, .. }
+                OrderType::Limit { tif: TimeInForce::FOK, .. }
             );
 
             let report = book.submit(order).unwrap();

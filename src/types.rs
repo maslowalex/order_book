@@ -25,11 +25,11 @@ pub enum Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeInForce {
     /// Good Till Cancel: the remainder rests until filled or cancelled.
-    Gtc,
+    GTC,
     /// Immediate Or Cancel: fill what crosses right now, discard the rest.
-    Ioc,
+    IOC,
     /// Fill Or Kill: fill completely right now, or do nothing at all.
-    Fok,
+    FOK,
 }
 
 /// Execution style, carrying exactly the data that style needs — a `Market`
@@ -54,15 +54,15 @@ pub enum OrderType {
 
 impl OrderType {
     pub fn limit_gtc(price: Price) -> Self {
-        OrderType::Limit { price, tif: TimeInForce::Gtc }
+        OrderType::Limit { price, tif: TimeInForce::GTC }
     }
 
     pub fn limit_ioc(price: Price) -> Self {
-        OrderType::Limit { price, tif: TimeInForce::Ioc }
+        OrderType::Limit { price, tif: TimeInForce::IOC }
     }
 
     pub fn limit_fok(price: Price) -> Self {
-        OrderType::Limit { price, tif: TimeInForce::Fok }
+        OrderType::Limit { price, tif: TimeInForce::FOK }
     }
 
     pub fn stop_market(trigger: Price) -> Self {
@@ -70,7 +70,7 @@ impl OrderType {
     }
 
     pub fn stop_limit(trigger: Price, price: Price) -> Self {
-        OrderType::StopLimit { trigger, price, tif: TimeInForce::Gtc }
+        OrderType::StopLimit { trigger, price, tif: TimeInForce::GTC }
     }
 
     /// The price this order rests at in the book — now (`Limit`) or after
