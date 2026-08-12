@@ -36,7 +36,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{
-    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput,
+    BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 
 /// Deterministic workload generation. Self-contained because
@@ -116,7 +116,11 @@ mod generators {
         let mut book = OrderBook::new();
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
-            let side = if rng.random_range(0..2) == 0 { Side::Bid } else { Side::Ask };
+            let side = if rng.random_range(0..2) == 0 {
+                Side::Bid
+            } else {
+                Side::Ask
+            };
             let price = dist.price(&mut rng, side);
             let qty = rng.random_range(1..=50);
             let id = format!("seed-{i}");
@@ -135,7 +139,11 @@ mod generators {
         let mut rng = StdRng::seed_from_u64(SEED ^ 0xADD);
         (0..count)
             .map(|i| {
-                let side = if rng.random_range(0..2) == 0 { Side::Bid } else { Side::Ask };
+                let side = if rng.random_range(0..2) == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                };
                 let price = dist.price(&mut rng, side);
                 let qty = rng.random_range(1..=50);
                 limit(
@@ -159,7 +167,11 @@ mod generators {
         let full = (dist.bid_ticks.0, dist.ask_ticks.1);
         (0..count)
             .map(|i| {
-                let side = if rng.random_range(0..2) == 0 { Side::Bid } else { Side::Ask };
+                let side = if rng.random_range(0..2) == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                };
                 let qty = rng.random_range(1..=50);
                 let is_market = rng.random_range(0..5) == 0;
                 let order_type = if is_market {
@@ -256,7 +268,11 @@ fn chunk(n: usize) -> usize {
 /// clones would be hundreds of MB resident — use `PerIteration` there; its
 /// per-call overhead is amortized because the routine is a µs–ms K-op chunk.
 fn batch_for(n: usize) -> BatchSize {
-    if n >= 100_000 { BatchSize::PerIteration } else { BatchSize::LargeInput }
+    if n >= 100_000 {
+        BatchSize::PerIteration
+    } else {
+        BatchSize::LargeInput
+    }
 }
 
 /// `add_order` (rest-only, no matching): BTreeMap entry + Vec push + HashMap
@@ -345,9 +361,10 @@ fn bench_best_price(c: &mut Criterion) {
     for dist in DISTS {
         for n in [100usize, 100_000] {
             let (book, _) = generators::seeded_book(dist, n);
-            group.bench_function(BenchmarkId::new(format!("best_bid/{}", dist.name), n), |b| {
-                b.iter(|| black_box(book.best_bid()))
-            });
+            group.bench_function(
+                BenchmarkId::new(format!("best_bid/{}", dist.name), n),
+                |b| b.iter(|| black_box(book.best_bid())),
+            );
             if n == 100_000 {
                 group.bench_function(
                     BenchmarkId::new(format!("best_bid_level_clone/{}", dist.name), n),
@@ -357,7 +374,9 @@ fn bench_best_price(c: &mut Criterion) {
         }
     }
     let (book, _) = generators::seeded_book(generators::TIGHT, 100_000);
-    group.bench_function("spread/tight/100000", |b| b.iter(|| black_box(book.spread())));
+    group.bench_function("spread/tight/100000", |b| {
+        b.iter(|| black_box(book.spread()))
+    });
     group.finish();
 }
 
@@ -381,18 +400,22 @@ fn bench_submit(c: &mut Criterion) {
         let (book, _) = generators::seeded_book(dist, 10_000);
         let orders = generators::resting_orders(dist, 100);
         group.throughput(Throughput::Elements(orders.len() as u64));
-        group.bench_with_input(BenchmarkId::new(format!("rest_limit/{}", dist.name), 10_000), &(), |b, _| {
-            b.iter_batched(
-                || (book.clone(), orders.clone()),
-                |(mut book, orders)| {
-                    for order in orders {
-                        black_box(book.submit(order)).unwrap();
-                    }
-                    book
-                },
-                BatchSize::LargeInput,
-            )
-        });
+        group.bench_with_input(
+            BenchmarkId::new(format!("rest_limit/{}", dist.name), 10_000),
+            &(),
+            |b, _| {
+                b.iter_batched(
+                    || (book.clone(), orders.clone()),
+                    |(mut book, orders)| {
+                        for order in orders {
+                            black_box(book.submit(order)).unwrap();
+                        }
+                        book
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
     }
 
     // 1000 levels × (10 makers × qty 10) = 10k orders, level depth exactly 100.
@@ -402,35 +425,43 @@ fn bench_submit(c: &mut Criterion) {
     for levels_each in [1usize, 5, 20] {
         let takers = generators::crossing_takers(TAKERS, levels_each, 100);
         group.throughput(Throughput::Elements(TAKERS as u64));
-        group.bench_with_input(BenchmarkId::new("cross_limit/levels", levels_each), &(), |b, _| {
-            b.iter_batched(
-                || (ladder.clone(), takers.clone()),
-                |(mut book, takers)| {
-                    for taker in takers {
-                        black_box(book.submit(taker)).unwrap();
-                    }
-                    book
-                },
-                BatchSize::LargeInput,
-            )
-        });
+        group.bench_with_input(
+            BenchmarkId::new("cross_limit/levels", levels_each),
+            &(),
+            |b, _| {
+                b.iter_batched(
+                    || (ladder.clone(), takers.clone()),
+                    |(mut book, takers)| {
+                        for taker in takers {
+                            black_box(book.submit(taker)).unwrap();
+                        }
+                        book
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
     }
 
     for levels_each in [1usize, 20] {
         let takers = generators::market_takers(TAKERS, levels_each, 100);
         group.throughput(Throughput::Elements(TAKERS as u64));
-        group.bench_with_input(BenchmarkId::new("market/levels", levels_each), &(), |b, _| {
-            b.iter_batched(
-                || (ladder.clone(), takers.clone()),
-                |(mut book, takers)| {
-                    for taker in takers {
-                        black_box(book.submit(taker)).unwrap();
-                    }
-                    book
-                },
-                BatchSize::LargeInput,
-            )
-        });
+        group.bench_with_input(
+            BenchmarkId::new("market/levels", levels_each),
+            &(),
+            |b, _| {
+                b.iter_batched(
+                    || (ladder.clone(), takers.clone()),
+                    |(mut book, takers)| {
+                        for taker in takers {
+                            black_box(book.submit(taker)).unwrap();
+                        }
+                        book
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
     }
 
     group.finish();

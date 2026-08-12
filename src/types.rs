@@ -54,15 +54,24 @@ pub enum OrderType {
 
 impl OrderType {
     pub fn limit_gtc(price: Price) -> Self {
-        OrderType::Limit { price, tif: TimeInForce::GTC }
+        OrderType::Limit {
+            price,
+            tif: TimeInForce::GTC,
+        }
     }
 
     pub fn limit_ioc(price: Price) -> Self {
-        OrderType::Limit { price, tif: TimeInForce::IOC }
+        OrderType::Limit {
+            price,
+            tif: TimeInForce::IOC,
+        }
     }
 
     pub fn limit_fok(price: Price) -> Self {
-        OrderType::Limit { price, tif: TimeInForce::FOK }
+        OrderType::Limit {
+            price,
+            tif: TimeInForce::FOK,
+        }
     }
 
     pub fn stop_market(trigger: Price) -> Self {
@@ -70,7 +79,11 @@ impl OrderType {
     }
 
     pub fn stop_limit(trigger: Price, price: Price) -> Self {
-        OrderType::StopLimit { trigger, price, tif: TimeInForce::GTC }
+        OrderType::StopLimit {
+            trigger,
+            price,
+            tif: TimeInForce::GTC,
+        }
     }
 
     /// The price this order rests at in the book — now (`Limit`) or after

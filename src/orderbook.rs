@@ -102,7 +102,10 @@ impl OrderBook {
             .ok_or(OrderBookError::OrderNotFound)?;
 
         match location {
-            OrderLocation::Book { side: Side::Ask, price } => {
+            OrderLocation::Book {
+                side: Side::Ask,
+                price,
+            } => {
                 if let Some(level) = self.asks.get_mut(&price) {
                     level.remove_order(&exchange_id);
                     if level.is_empty() {
@@ -110,7 +113,10 @@ impl OrderBook {
                     }
                 }
             }
-            OrderLocation::Book { side: Side::Bid, price } => {
+            OrderLocation::Book {
+                side: Side::Bid,
+                price,
+            } => {
                 if let Some(level) = self.bids.get_mut(&Reverse(price)) {
                     level.remove_order(&exchange_id);
                     if level.is_empty() {
@@ -179,12 +185,22 @@ impl OrderBook {
     /// scan within it (same O(level) cost as cancel).
     pub fn get_order(&self, exchange_id: &ExchangeId) -> Option<&Order> {
         let orders = match self.index.get(exchange_id)? {
-            OrderLocation::Book { side: Side::Bid, price } => {
-                &self.bids.get(&Reverse(*price))?.orders
-            }
-            OrderLocation::Book { side: Side::Ask, price } => &self.asks.get(price)?.orders,
-            OrderLocation::StopBook { side: Side::Bid, trigger } => self.stop_bids.get(trigger)?,
-            OrderLocation::StopBook { side: Side::Ask, trigger } => self.stop_asks.get(trigger)?,
+            OrderLocation::Book {
+                side: Side::Bid,
+                price,
+            } => &self.bids.get(&Reverse(*price))?.orders,
+            OrderLocation::Book {
+                side: Side::Ask,
+                price,
+            } => &self.asks.get(price)?.orders,
+            OrderLocation::StopBook {
+                side: Side::Bid,
+                trigger,
+            } => self.stop_bids.get(trigger)?,
+            OrderLocation::StopBook {
+                side: Side::Ask,
+                trigger,
+            } => self.stop_asks.get(trigger)?,
         };
         orders.iter().find(|o| &o.exchange_id == exchange_id)
     }
@@ -511,7 +527,11 @@ mod test {
     fn get_order_returns_none_for_unknown_id() {
         let orderbook = book_with_depth();
 
-        assert!(orderbook.get_order(&ExchangeId("nope".to_owned())).is_none());
+        assert!(
+            orderbook
+                .get_order(&ExchangeId("nope".to_owned()))
+                .is_none()
+        );
     }
 
     #[test]

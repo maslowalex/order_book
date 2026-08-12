@@ -97,9 +97,7 @@ impl OrderBook {
 
         let matching_result = match order.order_type {
             OrderType::Limit { price, tif } => match tif {
-                TimeInForce::GTC | TimeInForce::IOC => {
-                    self.process_limit_order(order, price, tif)
-                }
+                TimeInForce::GTC | TimeInForce::IOC => self.process_limit_order(order, price, tif),
                 TimeInForce::FOK => self.process_fok_limit_order(order, price),
             },
             OrderType::Market => self.process_market_order(order),
@@ -315,11 +313,7 @@ fn activate(mut order: Order) -> Order {
 /// taker's client are EXCLUDED: self-trade prevention cancels them instead of
 /// trading, so counting them would overpromise and let a "fill or kill"
 /// partially fill. Returns early once `taker.remaining_quantity` is reachable.
-fn fillable_quantity<K: Ord>(
-    side: &BTreeMap<K, PriceLevel>,
-    taker: &Order,
-    limit: Price,
-) -> u64 {
+fn fillable_quantity<K: Ord>(side: &BTreeMap<K, PriceLevel>, taker: &Order, limit: Price) -> u64 {
     let needed = taker.remaining_quantity;
     let mut available: u64 = 0;
 
@@ -1032,7 +1026,8 @@ mod tests {
         // alice's order is first in FIFO, bob's behind it has enough depth
         ob.add_order(limit_order(Side::Ask, 100, 5, "alice"))
             .unwrap();
-        ob.add_order(limit_order(Side::Ask, 100, 10, "bob")).unwrap();
+        ob.add_order(limit_order(Side::Ask, 100, 10, "bob"))
+            .unwrap();
 
         // dry-run: bob's 10 ≥ 10 → execute; sweep STP-cancels alice's on the way
         let report = ob.submit(fok_order(Side::Bid, 100, 10, "alice")).unwrap();
