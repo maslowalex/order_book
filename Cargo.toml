@@ -1,7 +1,12 @@
 [package]
 name = "order_book"
+authors = ["Oleksandr Maslo"]
 version = "0.1.0"
 edition = "2024"
+description = "A limit order book and matching engine with pluggable allocation policies"
+license = "MIT"
+readme = "README.md"
+publish = false
 
 [dependencies]
 rust_decimal = "1.42.1"
