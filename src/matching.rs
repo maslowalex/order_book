@@ -427,7 +427,7 @@ fn fill_against<K: Ord>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{order, px};
+    use crate::test_helpers::{book, order, px};
 
     // The `order()` helper builds a resting GTC limit maker with
     // client_id == exchange_id == id; the incoming taker controls its own
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn market_buy_fully_fills_single_resting_ask() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         let report = ob.submit(market_order(Side::Bid, 10, "t1")).unwrap();
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn market_buy_partial_fill_reduces_resting_maker() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         // taker smaller than the resting maker: taker fills, maker shrinks and stays
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn market_buy_sweeps_levels_best_price_first() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 101, 5, None, "a2")).unwrap();
         ob.add_order(order(Side::Ask, 102, 5, None, "a3")).unwrap();
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn market_buy_is_fifo_within_a_level() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         // same price — the one added first must fill first
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 100, 5, None, "a2")).unwrap();
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn market_buy_on_empty_book_is_killed() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
 
         let report = ob.submit(market_order(Side::Bid, 5, "t1")).unwrap();
 
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn market_buy_insufficient_liquidity_kills_remainder() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 3, None, "a1")).unwrap();
 
         let report = ob.submit(market_order(Side::Bid, 10, "t1")).unwrap();
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn market_sell_fills_against_best_bids_first() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 99, 5, None, "b1")).unwrap();
         ob.add_order(order(Side::Bid, 98, 5, None, "b2")).unwrap();
 
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn limit_buy_non_crossing_rests() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         // buy at 99 < best ask 100 -> does not cross
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn limit_buy_crossing_fully_fills() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         let report = ob.submit(limit_order(Side::Bid, 100, 5, "t1")).unwrap();
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn limit_buy_partial_fill_rests_remainder() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
 
         // wants 8, only 5 available at a crossing price -> fill 5, rest 3
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn limit_buy_sweeps_only_marketable_prefix() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 102, 5, None, "a2")).unwrap();
 
@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn limit_buy_prints_at_maker_price_not_taker_price() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         // aggressive buy at 105 against an ask resting at 100
@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn limit_buy_crosses_multiple_levels_and_fully_fills() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 101, 5, None, "a2")).unwrap();
 
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn limit_buy_crosses_multiple_levels_then_rests_remainder() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 101, 5, None, "a2")).unwrap();
         ob.add_order(order(Side::Ask, 103, 5, None, "a3")).unwrap();
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn limit_sell_non_crossing_rests() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 99, 10, None, "b1")).unwrap();
 
         // sell at 100 > best bid 99 -> does not cross
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn limit_sell_crossing_fully_fills() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 100, 10, None, "b1")).unwrap();
 
         let report = ob.submit(limit_order(Side::Ask, 100, 5, "s1")).unwrap();
@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn limit_sell_partial_fill_rests_remainder() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 100, 5, None, "b1")).unwrap();
 
         // wants to sell 8, only 5 bid at a crossing price -> fill 5, rest 3
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn limit_sell_sweeps_only_marketable_prefix() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 100, 5, None, "b1")).unwrap();
         ob.add_order(order(Side::Bid, 98, 5, None, "b2")).unwrap();
 
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn limit_sell_crosses_multiple_levels_then_rests_remainder() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 100, 5, None, "b1")).unwrap();
         ob.add_order(order(Side::Bid, 99, 5, None, "b2")).unwrap();
         ob.add_order(order(Side::Bid, 97, 5, None, "b3")).unwrap();
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn ioc_full_fill_behaves_like_gtc() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         let report = ob.submit(ioc_order(Side::Bid, 100, 10, "t1")).unwrap();
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn ioc_partial_fill_kills_remainder_instead_of_resting() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         // wants 15, only 10 crosses — GTC would rest the 5, IOC discards it
@@ -917,7 +917,7 @@ mod tests {
 
     #[test]
     fn ioc_that_does_not_cross_is_killed_with_no_trades() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         // bid at 99 doesn't reach the 100 ask — GTC would rest, IOC dies
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn ioc_respects_its_limit_price_while_sweeping() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 101, 5, None, "a2")).unwrap();
 
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn fok_fills_completely_when_depth_suffices() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 101, 5, None, "a2")).unwrap();
 
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn fok_kills_without_touching_the_book_when_depth_insufficient() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
 
         // wants 10, only 5 exists — nothing may execute, not even the 5
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn fok_only_counts_depth_within_its_limit_price() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 102, 20, None, "a2")).unwrap();
 
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn fok_excludes_own_resting_orders_from_fillability() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         // alice's own ask can't fill alice — STP would cancel it, not trade it
         ob.add_order(limit_order(Side::Ask, 100, 5, "alice"))
             .unwrap();
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn fok_executes_through_own_order_cancelling_it() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         // alice's order is first in FIFO, bob's behind it has enough depth
         ob.add_order(limit_order(Side::Ask, 100, 5, "alice"))
             .unwrap();
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[test]
     fn stop_parks_when_no_trade_has_printed() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
 
         let report = ob.submit(stop_market(Side::Bid, 101, 10, "s1")).unwrap();
 
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn buy_stop_triggers_when_market_trades_up_to_trigger() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 101, 10, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 102, 10, None, "a2")).unwrap();
 
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[test]
     fn sell_stop_triggers_when_market_trades_down_to_trigger() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 99, 10, None, "b1")).unwrap();
         ob.add_order(order(Side::Bid, 98, 10, None, "b2")).unwrap();
 
@@ -1108,7 +1108,7 @@ mod tests {
 
     #[test]
     fn stop_cascade_chains_and_stays_flat() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 101, 10, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 102, 10, None, "a2")).unwrap();
         ob.add_order(order(Side::Ask, 103, 10, None, "a3")).unwrap();
@@ -1132,7 +1132,7 @@ mod tests {
 
     #[test]
     fn stop_already_triggered_on_arrival_executes_immediately() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         // print a trade at 100
@@ -1148,7 +1148,7 @@ mod tests {
 
     #[test]
     fn stop_limit_becomes_limit_and_rests_its_remainder() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 101, 10, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 102, 20, None, "a2")).unwrap();
 
@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn pending_stop_can_be_cancelled() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
 
         let parked = ob.submit(stop_market(Side::Ask, 95, 10, "s1")).unwrap();
         assert_eq!(parked.outcome, SubmitOutcome::StopPending);
@@ -1190,7 +1190,7 @@ mod tests {
 
     #[test]
     fn stops_fifo_within_same_trigger_price() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 5, None, "a1")).unwrap();
         ob.add_order(order(Side::Ask, 101, 20, None, "a2")).unwrap();
 
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn submit_assigns_exchange_id_and_ignores_caller_id() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 10, None, "a1")).unwrap();
 
         // whatever id the caller stamped on the order is ignored — the exchange
@@ -1224,7 +1224,7 @@ mod tests {
 
     #[test]
     fn submit_assigns_sequential_ids() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Ask, 100, 100, None, "a1"))
             .unwrap();
 
@@ -1242,7 +1242,7 @@ mod tests {
     // Delete or adjust if you haven't wired self-trade prevention yet.
     #[test]
     fn self_trade_cancels_resting_order_instead_of_filling() {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         let maker = Order::builder()
             .side(Side::Ask)
             .quantity(10)

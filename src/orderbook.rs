@@ -2,14 +2,9 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
+use crate::instrument::{InstrumentSpec, Ticks};
 use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
 
-/*
-If we were to store the quantities in plain u64 we might need to normalize/denormalize the quantity.
-For example, 1 USD is 100 cents, and 1 BTC is 100_000_000 satoshis.
-For OrderBook operations we store at the lowest fraction for precision,
-and do the normalization on the higher levels.
-*/
 /// Where a live order physically is — needed by `cancel_order`/`get_order`
 /// to know which structure to search. A bare `(Side, Price, kind)` tuple
 /// would invite reading a trigger price as a book price; the enum makes the
@@ -37,6 +32,15 @@ pub struct OrderBook {
     pub last_trade_price: Option<Price>,
     pub index: HashMap<ExchangeId, OrderLocation>,
     pub next_seq: u64,
+    /// The instrument's tick and lot grid.
+    ///
+    /// This field replaces a comment. The book used to carry a note saying that
+    /// quantities were stored "at the lowest fraction for precision" with
+    /// normalization done "on the higher levels" — a description of an
+    /// invariant that nothing enforced and, with `Price` aliased to `Decimal`,
+    /// nothing could. Every price and quantity in this book is now a point on
+    /// this spec's lattice, and the type system knows it.
+    spec: InstrumentSpec,
 }
 
 #[derive(Debug, PartialEq)]
@@ -53,7 +57,14 @@ pub enum OrderBookError {
 }
 
 impl OrderBook {
-    pub fn new() -> Self {
+    /// A book must be told what instrument it trades before it can hold a
+    /// single order — there is no `Default`, deliberately. A *default* lattice
+    /// would be the "someone upstream normalized this" assumption sneaking back
+    /// in through a derive, which is the exact failure this spec exists to end.
+    /// Callers should be able to point at the line where they chose a grid;
+    /// [`InstrumentSpec::cents`] is the named one-cent-tick default.
+    #[allow(clippy::new_without_default)]
+    pub fn new(spec: InstrumentSpec) -> Self {
         OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
@@ -62,7 +73,12 @@ impl OrderBook {
             last_trade_price: None,
             index: HashMap::new(),
             next_seq: 1,
+            spec,
         }
+    }
+
+    pub fn spec(&self) -> InstrumentSpec {
+        self.spec
     }
 
     pub fn add_order(&mut self, order: Order) -> Result<(), OrderBookError> {
@@ -149,9 +165,18 @@ impl OrderBook {
         self.asks.iter().next().map(|(price, _)| *price)
     }
 
-    pub fn spread(&self) -> Option<Price> {
+    /// The touch, measured in ticks — which is how a spread is actually quoted
+    /// ("it's two ticks wide"), and the only unit in which the number is
+    /// comparable across instruments. A currency spread of `0.50` is tight on
+    /// one book and wide on another; two ticks is two ticks.
+    ///
+    /// Returning [`Ticks`] rather than a `Price` is not decoration. A price
+    /// difference is not a price — you cannot rest an order at a spread — and
+    /// keeping the types apart makes `best_ask() + best_bid()` fail to compile
+    /// instead of quietly type-checking.
+    pub fn spread(&self) -> Option<Ticks> {
         match (self.best_ask(), self.best_bid()) {
-            (Some(ask), Some(bid)) => Some(ask - bid),
+            (Some(ask), Some(bid)) => Some(self.spec.ticks_between(ask, bid)),
             _ => None,
         }
     }
@@ -229,12 +254,12 @@ A: At any moment when a LIMIT order arrives, we must check if it crosses the spr
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::test_helpers::{order, px};
+    use crate::test_helpers::{book, order, px};
 
     /// A non-crossed book: bids 99/98/97, asks 100/101/102.
     /// best_bid = 99, best_ask = 100, spread = 1.
     fn book_with_depth() -> OrderBook {
-        let mut ob = OrderBook::new();
+        let mut ob = book();
         ob.add_order(order(Side::Bid, 99, 110, None, "bid_99"))
             .unwrap();
         ob.add_order(order(Side::Bid, 98, 500, None, "bid_98"))
@@ -252,7 +277,7 @@ mod test {
 
     #[test]
     fn order_book_new_returns_empty_orderbook() {
-        let orderbook = OrderBook::new();
+        let orderbook = book();
         let empty_bids: BTreeMap<Reverse<Price>, PriceLevel> = BTreeMap::new();
         let empty_asks: BTreeMap<Price, PriceLevel> = BTreeMap::new();
         assert_eq!(orderbook.bids, empty_bids);
@@ -261,7 +286,7 @@ mod test {
 
     #[test]
     fn add_order_adds_order_to_correct_side_ask() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         assert!(
             orderbook
@@ -274,7 +299,7 @@ mod test {
 
     #[test]
     fn add_order_adds_order_to_correct_side_bid() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         assert!(
             orderbook
@@ -287,7 +312,7 @@ mod test {
 
     #[test]
     fn add_order_adds_multiple_orders() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         assert!(
             orderbook
@@ -308,7 +333,7 @@ mod test {
 
     #[test]
     fn maintains_an_index_of_all_orders() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         orderbook
             .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
@@ -326,7 +351,7 @@ mod test {
 
     #[test]
     fn add_order_rejects_duplicate_exchange_id() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         assert!(
             orderbook
@@ -342,7 +367,7 @@ mod test {
 
     #[test]
     fn cancel_order_cancels_existing_order_by_id() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         assert!(
             orderbook
@@ -358,7 +383,7 @@ mod test {
 
     #[test]
     fn cancel_order_on_bid_side() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         orderbook
             .add_order(order(Side::Bid, 99, 10, None, "bid_order"))
@@ -375,7 +400,7 @@ mod test {
 
     #[test]
     fn cancel_order_removes_only_target_order_from_level() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         orderbook
             .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
@@ -400,7 +425,7 @@ mod test {
 
     #[test]
     fn cancel_order_cleans_up_empty_price_level() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
 
         orderbook
             .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
@@ -415,7 +440,7 @@ mod test {
 
     #[test]
     fn cancel_order_with_non_existing_order_returns_error() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
         let result = orderbook.cancel_order(ExchangeId("nonexisting_order".to_owned()));
 
         assert!(result.is_err_and(|e| e == OrderBookError::OrderNotFound));
@@ -431,7 +456,7 @@ mod test {
 
     #[test]
     fn best_bid_and_ask_are_none_on_empty_book() {
-        let orderbook = OrderBook::new();
+        let orderbook = book();
 
         assert_eq!(orderbook.best_bid(), None);
         assert_eq!(orderbook.best_ask(), None);
@@ -441,12 +466,14 @@ mod test {
     fn spread_is_difference_between_best_ask_and_best_bid() {
         let orderbook = book_with_depth();
 
-        assert_eq!(orderbook.spread(), Some(px(1))); // 100 - 99
+        // 100.00 − 99.99, which on a one-cent tick is one tick wide. The
+        // number is unchanged; the unit is now stated rather than assumed.
+        assert_eq!(orderbook.spread(), Some(Ticks::from_count(1)));
     }
 
     #[test]
     fn spread_is_none_when_either_side_empty() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
         assert_eq!(orderbook.spread(), None);
 
         orderbook
@@ -470,7 +497,7 @@ mod test {
 
     #[test]
     fn best_level_is_none_on_empty_book() {
-        let orderbook = OrderBook::new();
+        let orderbook = book();
 
         assert!(orderbook.best_bid_level().is_none());
         assert!(orderbook.best_ask_level().is_none());
@@ -496,12 +523,12 @@ mod test {
         let orderbook = book_with_depth();
 
         assert_eq!(orderbook.depth(Side::Ask, 10).len(), 3);
-        assert_eq!(OrderBook::new().depth(Side::Bid, 5), vec![]);
+        assert_eq!(book().depth(Side::Bid, 5), vec![]);
     }
 
     #[test]
     fn depth_sums_all_orders_at_a_level() {
-        let mut orderbook = OrderBook::new();
+        let mut orderbook = book();
         orderbook
             .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .unwrap();
@@ -550,7 +577,7 @@ mod test {
 
     #[test]
     fn crosses_returns_false_on_empty_book() {
-        let orderbook = OrderBook::new();
+        let orderbook = book();
 
         assert!(!orderbook.crosses(Side::Bid, px(100)));
         assert!(!orderbook.crosses(Side::Ask, px(100)));

@@ -43,12 +43,12 @@ use criterion::{
 /// `src/test_helpers.rs` is `#[cfg(test)]`-private and invisible to bench
 /// targets (benches link the lib as an external crate).
 mod generators {
+    use order_book::instrument::InstrumentSpec;
     use order_book::orderbook::OrderBook;
     use order_book::types::{ExchangeId, Order, OrderType, Price, Side};
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
-    use rust_decimal::Decimal;
 
     pub const SEED: u64 = 0xB00C;
 
@@ -63,9 +63,15 @@ mod generators {
     #[derive(Clone, Copy)]
     pub struct Dist {
         pub name: &'static str,
-        bid_ticks: (i64, i64), // inclusive
-        ask_ticks: (i64, i64), // inclusive
-        tick_cents: i64,       // mantissa (scale 2) per tick
+        bid_ticks: (u64, u64), // inclusive
+        ask_ticks: (u64, u64), // inclusive
+        tick_cents: u64,       // minor units (cents) per tick
+    }
+
+    /// The quarter-tick grid the matching ladder is built on, shared by
+    /// `matching_book` and every taker generator that has to land on it.
+    pub fn quarter_tick() -> InstrumentSpec {
+        InstrumentSpec::new(2, 0, 25, 1).expect("2/0/25/1 is a valid spec")
     }
 
     /// Mirrors the proptest grid in tests/properties.rs: 95.00–99.75 bids,
@@ -86,12 +92,22 @@ mod generators {
     };
 
     impl Dist {
+        /// Each distribution now carries the tick it was always drawing on —
+        /// 0.25 for tight, 0.01 for wide — instead of implying it through a
+        /// mantissa multiplier. Tick indices are dense as a result, which is
+        /// what a future tick-indexed ladder wants.
+        pub fn spec(&self) -> InstrumentSpec {
+            InstrumentSpec::new(2, 0, self.tick_cents, 1).expect("dist ticks are non-zero")
+        }
+
         fn price(&self, rng: &mut StdRng, side: Side) -> Price {
             let (lo, hi) = match side {
                 Side::Bid => self.bid_ticks,
                 Side::Ask => self.ask_ticks,
             };
-            Decimal::new(rng.random_range(lo..=hi) * self.tick_cents, 2)
+            self.spec()
+                .price_from_minor(rng.random_range(lo..=hi) * self.tick_cents)
+                .expect("drawn on the tick grid")
         }
     }
 
@@ -113,7 +129,7 @@ mod generators {
     /// submit benchmark can accidentally trip self-trade prevention.
     pub fn seeded_book(dist: Dist, n: usize) -> (OrderBook, Vec<ExchangeId>) {
         let mut rng = StdRng::seed_from_u64(SEED);
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(dist.spec());
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
             let side = if rng.random_range(0..2) == 0 {
@@ -178,7 +194,11 @@ mod generators {
                     OrderType::Market
                 } else {
                     let tick = rng.random_range(full.0..=full.1);
-                    OrderType::limit_gtc(Decimal::new(tick * dist.tick_cents, 2))
+                    OrderType::limit_gtc(
+                        dist.spec()
+                            .price_from_minor(tick * dist.tick_cents)
+                            .expect("drawn on the tick grid"),
+                    )
                 };
                 Order::builder()
                     .exchange_id(format!("burst-{i}"))
@@ -197,9 +217,12 @@ mod generators {
     /// of `qty` — so level depth is exactly `per_level * qty` and a taker can
     /// be sized to consume an exact number of levels by construction.
     pub fn matching_book(levels: usize, per_level: usize, qty: u64) -> OrderBook {
-        let mut book = OrderBook::new();
+        let spec = quarter_tick();
+        let mut book = OrderBook::new(spec);
         for j in 0..levels {
-            let price = Decimal::new(10_025 + (j as i64) * 25, 2);
+            let price = spec
+                .price_from_minor(10_025 + (j as u64) * 25)
+                .expect("ladder steps one tick at a time");
             for m in 0..per_level {
                 let order = limit(
                     format!("mm-{j}-{m}"),
@@ -223,12 +246,14 @@ mod generators {
     pub fn crossing_takers(count: usize, levels_each: usize, level_depth: u64) -> Vec<Order> {
         (0..count)
             .map(|j| {
-                let last_level = ((j + 1) * levels_each - 1) as i64;
+                let last_level = ((j + 1) * levels_each - 1) as u64;
                 limit(
                     format!("taker-{j}"),
                     format!("taker-{j}"),
                     Side::Bid,
-                    Decimal::new(10_025 + last_level * 25, 2),
+                    quarter_tick()
+                        .price_from_minor(10_025 + last_level * 25)
+                        .expect("takers land on ladder levels"),
                     levels_each as u64 * level_depth,
                     3_000_000 + j as u128,
                 )

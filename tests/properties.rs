@@ -23,11 +23,11 @@
 
 use std::collections::HashMap;
 
+use order_book::instrument::InstrumentSpec;
 use order_book::matching::{ExecutionReport, SubmitOutcome};
 use order_book::orderbook::{OrderBook, OrderLocation};
 use order_book::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
-use rust_decimal::Decimal;
 
 // --- strategies ---------------------------------------------------------
 
@@ -35,9 +35,22 @@ fn arb_side() -> impl Strategy<Value = Side> {
     prop_oneof![Just(Side::Bid), Just(Side::Ask)]
 }
 
+/// The instrument every property runs against: cents, a 0.25 tick, unit lot.
+///
+/// The tick is deliberately NOT one minor unit. A one-cent tick would make
+/// every cent-scale price legal, so the lattice would be vacuously satisfied
+/// and no property could tell a working tick check from a missing one.
+fn spec() -> InstrumentSpec {
+    InstrumentSpec::new(2, 0, 25, 1).expect("2/0/25/1 is a valid spec")
+}
+
 fn arb_limit_price() -> impl Strategy<Value = Price> {
     // 95.00 ..= 105.00 in 0.25 ticks
-    (380u32..=420).prop_map(|ticks| Decimal::new(i64::from(ticks) * 25, 2))
+    (380u64..=420).prop_map(|ticks| {
+        spec()
+            .price_from_minor(ticks * 25)
+            .expect("drawn on the tick grid")
+    })
 }
 
 fn arb_order_type() -> impl Strategy<Value = OrderType> {
@@ -153,7 +166,7 @@ proptest! {
     /// consumed from it.
     #[test]
     fn conservation_per_submit(stream in arb_stream()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(spec());
         // original quantity of every currently-parked stop, by assigned id
         let mut parked: HashMap<ExchangeId, u64> = HashMap::new();
 
@@ -287,7 +300,7 @@ proptest! {
     /// used, so intra-cascade consumption of freshly rested orders balances.
     #[test]
     fn book_depth_accounting(stream in arb_stream()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(spec());
         let mut parked: HashMap<ExchangeId, u64> = HashMap::new();
 
         for order in stream {
@@ -354,7 +367,7 @@ proptest! {
     /// and each execution sweeps prices best-first (monotonically).
     #[test]
     fn trades_at_maker_price_within_taker_limit(stream in arb_stream()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(spec());
 
         for order in stream {
             let taker_side = order.side;
@@ -411,7 +424,7 @@ proptest! {
     /// the moment it rests and checks stamps never decrease per level.
     #[test]
     fn same_price_fifo_priority(stream in arb_stream()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(spec());
         let mut next_stamp: u64 = 0;
         // order id → when it (last) came to rest in the book
         let mut rest_stamp: HashMap<ExchangeId, u64> = HashMap::new();
@@ -434,7 +447,7 @@ proptest! {
                     if let Some(&prev) = last_traded.get(&key) {
                         prop_assert!(
                             stamp >= prev,
-                            "FIFO violated at {}: maker stamped {} traded after {}",
+                            "FIFO violated at {:?}: maker stamped {} traded after {}",
                             trade.price, stamp, prev
                         );
                     }
@@ -454,12 +467,12 @@ proptest! {
     /// Invariant 5 — no crossing: after every submit the book is uncrossed.
     #[test]
     fn book_never_crossed_after_submit(stream in arb_stream()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(spec());
 
         for order in stream {
             book.submit(order).unwrap();
             if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
-                prop_assert!(bid < ask, "book crossed: bid {} >= ask {}", bid, ask);
+                prop_assert!(bid < ask, "book crossed: bid {bid:?} >= ask {ask:?}");
             }
         }
     }
@@ -470,7 +483,7 @@ proptest! {
     /// cancelling every indexed id drains everything to empty.
     #[test]
     fn index_matches_levels_and_book_drains(stream in arb_stream()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(spec());
         for order in stream {
             book.submit(order).unwrap();
         }
@@ -536,7 +549,7 @@ proptest! {
     /// the cascade failed to fire it.
     #[test]
     fn no_satisfied_stop_left_pending(stream in arb_stream()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(spec());
 
         for order in stream {
             book.submit(order).unwrap();
@@ -544,14 +557,14 @@ proptest! {
                 for trigger in book.stop_bids.keys() {
                     prop_assert!(
                         *trigger > last,
-                        "pending buy stop at {} but market already traded {}",
+                        "pending buy stop at {:?} but market already traded {:?}",
                         trigger, last
                     );
                 }
                 for trigger in book.stop_asks.keys() {
                     prop_assert!(
                         *trigger < last,
-                        "pending sell stop at {} but market already traded {}",
+                        "pending sell stop at {:?} but market already traded {:?}",
                         trigger, last
                     );
                 }

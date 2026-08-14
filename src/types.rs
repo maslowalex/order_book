@@ -1,7 +1,10 @@
-use rust_decimal::Decimal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub type Price = Decimal;
+/// Re-exported so the ~70 `use crate::types::Price` sites keep working. The
+/// type itself lives in [`crate::instrument`], with the tick grid that gives it
+/// meaning — a price is not a standalone number, it is a point on an
+/// instrument's lattice.
+pub use crate::instrument::Price;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExchangeId(pub String);

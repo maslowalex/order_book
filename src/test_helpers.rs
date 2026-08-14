@@ -1,8 +1,23 @@
+use crate::instrument::InstrumentSpec;
+use crate::orderbook::OrderBook;
 use crate::types::{Order, OrderType, Price, PriceLevel, Side};
-use rust_decimal::Decimal;
 
+/// The grid the suite has always used implicitly: prices in cents on a
+/// one-cent tick, quantities in whole units on a one-unit lot.
+pub fn spec() -> InstrumentSpec {
+    InstrumentSpec::cents()
+}
+
+pub fn book() -> OrderBook {
+    OrderBook::new(spec())
+}
+
+/// A price from a whole number of cents. The signature is unchanged from when
+/// this returned a `Decimal`, which is why the ~60 `px(..)` assertions across
+/// the suite needed no edit: on a one-cent tick, "the 10025th cent" and
+/// "100.25" are the same point, and the assertions only ever compared points.
 pub fn px(cents: i64) -> Price {
-    Decimal::new(cents, 2)
+    Price::from_minor_unchecked(u64::try_from(cents).expect("test prices are non-negative"))
 }
 
 /// A resting GTC limit maker (the only kind of order that can rest).
