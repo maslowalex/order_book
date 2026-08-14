@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use order_book::instrument::InstrumentSpec;
+use order_book::instrument::{InstrumentSpec, Qty};
 use order_book::matching::{ExecutionReport, SubmitOutcome};
 use order_book::orderbook::{OrderBook, OrderLocation};
 use order_book::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
@@ -42,6 +42,14 @@ fn arb_side() -> impl Strategy<Value = Side> {
 /// and no property could tell a working tick check from a missing one.
 fn spec() -> InstrumentSpec {
     InstrumentSpec::new(2, 0, 25, 1).expect("2/0/25/1 is a valid spec")
+}
+
+/// Base units as a `Qty`. The spec's lot is one, so base units and lots
+/// coincide and every quantity literal below reads exactly as it always did.
+fn qty(n: u64) -> Qty {
+    spec()
+        .qty_from_base(n)
+        .expect("a unit lot accepts any count")
 }
 
 fn arb_limit_price() -> impl Strategy<Value = Price> {
@@ -76,7 +84,7 @@ fn arb_order() -> impl Strategy<Value = Order> {
                 .client_id(format!("client-{client}"))
                 .order_type(order_type)
                 .side(side)
-                .quantity(quantity)
+                .quantity(qty(quantity))
                 .build()
         },
     )
@@ -97,7 +105,7 @@ fn opposite(side: Side) -> Side {
 
 /// Everything resting in the book right now: id → (side, price, remaining).
 /// Parked stops are deliberately NOT part of this — they hold no depth.
-fn resting_snapshot(book: &OrderBook) -> HashMap<ExchangeId, (Side, Price, u64)> {
+fn resting_snapshot(book: &OrderBook) -> HashMap<ExchangeId, (Side, Price, Qty)> {
     book.bids
         .values()
         .chain(book.asks.values())
@@ -112,7 +120,7 @@ fn resting_snapshot(book: &OrderBook) -> HashMap<ExchangeId, (Side, Price, u64)>
         .collect()
 }
 
-fn total_depth(book: &OrderBook) -> u64 {
+fn total_depth(book: &OrderBook) -> Qty {
     book.bids
         .values()
         .chain(book.asks.values())
@@ -121,7 +129,7 @@ fn total_depth(book: &OrderBook) -> u64 {
 }
 
 /// Remaining quantity of `id` if it rests in the BOOK (not the stop book).
-fn rested_remaining(book: &OrderBook, id: &ExchangeId) -> Option<u64> {
+fn rested_remaining(book: &OrderBook, id: &ExchangeId) -> Option<Qty> {
     match book.index.get(id)? {
         OrderLocation::Book { .. } => book.get_order(id).map(|o| o.remaining_quantity),
         OrderLocation::StopBook { .. } => None,
@@ -129,7 +137,7 @@ fn rested_remaining(book: &OrderBook, id: &ExchangeId) -> Option<u64> {
 }
 
 /// Remaining quantity of `id` if it's parked in the stop book.
-fn parked_remaining(book: &OrderBook, id: &ExchangeId) -> Option<u64> {
+fn parked_remaining(book: &OrderBook, id: &ExchangeId) -> Option<Qty> {
     match book.index.get(id)? {
         OrderLocation::StopBook { .. } => book.get_order(id).map(|o| o.remaining_quantity),
         OrderLocation::Book { .. } => None,
@@ -145,8 +153,8 @@ fn all_reports(report: &ExecutionReport) -> impl Iterator<Item = &ExecutionRepor
 /// Total traded quantity per maker id across the whole cascade — needed
 /// because an order can rest and then be (partially) consumed or cancelled
 /// within the SAME submit once stops chain.
-fn fills_by_maker(report: &ExecutionReport) -> HashMap<ExchangeId, u64> {
-    let mut fills: HashMap<ExchangeId, u64> = HashMap::new();
+fn fills_by_maker(report: &ExecutionReport) -> HashMap<ExchangeId, Qty> {
+    let mut fills: HashMap<ExchangeId, Qty> = HashMap::new();
     for r in all_reports(report) {
         for t in &r.trades {
             *fills.entry(t.maker_order_id.clone()).or_default() += t.quantity;
@@ -168,7 +176,7 @@ proptest! {
     fn conservation_per_submit(stream in arb_stream()) {
         let mut book = OrderBook::new(spec());
         // original quantity of every currently-parked stop, by assigned id
-        let mut parked: HashMap<ExchangeId, u64> = HashMap::new();
+        let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
 
         for order in stream {
             let original = order.original_quantity;
@@ -191,7 +199,7 @@ proptest! {
             let consumed_later = fills_by_maker(&report);
 
             for trade in all_reports(&report).flat_map(|r| &r.trades) {
-                prop_assert!(trade.quantity > 0, "zero-quantity trade");
+                prop_assert!(!trade.quantity.is_zero(), "zero-quantity trade");
             }
 
             // an order that rested during this submit can afterwards be
@@ -202,9 +210,9 @@ proptest! {
             };
 
             // -- the submitted order itself --
-            let filled: u64 = report.trades.iter().map(|t| t.quantity).sum();
+            let filled: Qty = report.trades.iter().map(|t| t.quantity).sum();
             let rested = rested_remaining(&book, &report.order_id);
-            let eaten = consumed_later.get(&report.order_id).copied().unwrap_or(0);
+            let eaten = consumed_later.get(&report.order_id).copied().unwrap_or(Qty::ZERO);
             let cancelled_later = stp_cancelled(&report.order_id);
             match report.outcome {
                 SubmitOutcome::Filled => {
@@ -216,15 +224,15 @@ proptest! {
                     if cancelled_later {
                         prop_assert_eq!(rested, None);
                     } else {
-                        prop_assert_eq!(rested.unwrap_or(0) + eaten, original);
+                        prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, original);
                     }
                 }
                 SubmitOutcome::PartiallyFilledAndRested => {
-                    prop_assert!(filled > 0 && filled < original);
+                    prop_assert!(!filled.is_zero() && filled < original);
                     if cancelled_later {
                         prop_assert_eq!(rested, None);
                     } else {
-                        prop_assert_eq!(rested.unwrap_or(0) + eaten, original - filled);
+                        prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, original - filled);
                     }
                 }
                 SubmitOutcome::Killed => {
@@ -233,7 +241,7 @@ proptest! {
                     if is_fok {
                         // all-or-nothing: a killed FOK executed NOTHING —
                         // no fills and no self-trade cancellations
-                        prop_assert_eq!(filled, 0, "FOK partially filled");
+                        prop_assert_eq!(filled, Qty::ZERO, "FOK partially filled");
                         prop_assert!(report.cancelled.is_empty());
                     }
                     prop_assert_eq!(rested, None);
@@ -252,18 +260,18 @@ proptest! {
 
             // -- every stop this submit triggered --
             for r in &report.triggered {
-                let qty = parked
+                let parked_original = parked
                     .remove(&r.order_id)
                     .expect("triggered stop must have been parked earlier");
                 prop_assert!(r.triggered.is_empty(), "cascade reports must be flat");
 
-                let filled: u64 = r.trades.iter().map(|t| t.quantity).sum();
+                let filled: Qty = r.trades.iter().map(|t| t.quantity).sum();
                 let rested = rested_remaining(&book, &r.order_id);
-                let eaten = consumed_later.get(&r.order_id).copied().unwrap_or(0);
+                let eaten = consumed_later.get(&r.order_id).copied().unwrap_or(Qty::ZERO);
                 let cancelled_later = stp_cancelled(&r.order_id);
                 match r.outcome {
                     SubmitOutcome::Filled => {
-                        prop_assert_eq!(filled, qty);
+                        prop_assert_eq!(filled, parked_original);
                         prop_assert_eq!(rested, None);
                     }
                     SubmitOutcome::Rested => {
@@ -271,19 +279,19 @@ proptest! {
                         if cancelled_later {
                             prop_assert_eq!(rested, None);
                         } else {
-                            prop_assert_eq!(rested.unwrap_or(0) + eaten, qty);
+                            prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, parked_original);
                         }
                     }
                     SubmitOutcome::PartiallyFilledAndRested => {
-                        prop_assert!(filled > 0 && filled < qty);
+                        prop_assert!(!filled.is_zero() && filled < parked_original);
                         if cancelled_later {
                             prop_assert_eq!(rested, None);
                         } else {
-                            prop_assert_eq!(rested.unwrap_or(0) + eaten, qty - filled);
+                            prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, parked_original - filled);
                         }
                     }
                     SubmitOutcome::Killed => {
-                        prop_assert!(filled < qty);
+                        prop_assert!(filled < parked_original);
                         prop_assert_eq!(rested, None);
                     }
                     SubmitOutcome::StopPending => {
@@ -301,7 +309,7 @@ proptest! {
     #[test]
     fn book_depth_accounting(stream in arb_stream()) {
         let mut book = OrderBook::new(spec());
-        let mut parked: HashMap<ExchangeId, u64> = HashMap::new();
+        let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
 
         for order in stream {
             let original = order.original_quantity;
@@ -311,11 +319,11 @@ proptest! {
             let report = book.submit(order).unwrap();
             let fills = fills_by_maker(&report);
 
-            let mut filled_total: u64 = 0;
-            let mut rested_total: u64 = 0; // at rest time
-            let mut cancelled_total: u64 = 0; // remaining at cancel time
+            let mut filled_total = Qty::ZERO;
+            let mut rested_total = Qty::ZERO; // at rest time
+            let mut cancelled_total = Qty::ZERO; // remaining at cancel time
             // rest-time quantity per order that rested during THIS submit
-            let mut rest_qty: HashMap<ExchangeId, u64> = HashMap::new();
+            let mut rest_qty: HashMap<ExchangeId, Qty> = HashMap::new();
 
             for (i, r) in all_reports(&report).enumerate() {
                 let exec_original = if i == 0 {
@@ -323,7 +331,7 @@ proptest! {
                 } else {
                     *parked.get(&r.order_id).expect("triggered stop was parked")
                 };
-                let filled: u64 = r.trades.iter().map(|t| t.quantity).sum();
+                let filled: Qty = r.trades.iter().map(|t| t.quantity).sum();
                 filled_total += filled;
 
                 if matches!(
@@ -343,7 +351,7 @@ proptest! {
                         .map(|(_, _, remaining)| *remaining)
                         .or_else(|| rest_qty.get(id).copied())
                         .expect("cancelled order rested before or during this submit");
-                    cancelled_total += start - fills.get(id).copied().unwrap_or(0);
+                    cancelled_total += start - fills.get(id).copied().unwrap_or(Qty::ZERO);
                 }
             }
             for r in &report.triggered {
@@ -354,10 +362,10 @@ proptest! {
             }
 
             prop_assert_eq!(
-                i128::from(total_depth(&book)),
-                i128::from(depth_before) + i128::from(rested_total)
-                    - i128::from(filled_total)
-                    - i128::from(cancelled_total)
+                i128::from(total_depth(&book).base()),
+                i128::from(depth_before.base()) + i128::from(rested_total.base())
+                    - i128::from(filled_total.base())
+                    - i128::from(cancelled_total.base())
             );
         }
     }
@@ -495,7 +503,7 @@ proptest! {
             prop_assert_eq!(&level.price, key);
             for o in &level.orders {
                 live_orders += 1;
-                prop_assert!(o.remaining_quantity > 0);
+                prop_assert!(!o.remaining_quantity.is_zero());
                 // everything resting must be a limit at its level's price
                 prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
                 let expected = OrderLocation::Book { side: Side::Ask, price: level.price };
@@ -508,7 +516,7 @@ proptest! {
             prop_assert_eq!(level.price, key.0);
             for o in &level.orders {
                 live_orders += 1;
-                prop_assert!(o.remaining_quantity > 0);
+                prop_assert!(!o.remaining_quantity.is_zero());
                 prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
                 let expected = OrderLocation::Book { side: Side::Bid, price: level.price };
                 prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
@@ -520,7 +528,7 @@ proptest! {
                 for o in queue {
                     live_orders += 1;
                     prop_assert_eq!(o.side, side);
-                    prop_assert!(o.remaining_quantity > 0);
+                    prop_assert!(!o.remaining_quantity.is_zero());
                     let is_stop = matches!(
                         o.order_type,
                         OrderType::StopMarket { .. } | OrderType::StopLimit { .. }

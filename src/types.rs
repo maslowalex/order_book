@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// type itself lives in [`crate::instrument`], with the tick grid that gives it
 /// meaning — a price is not a standalone number, it is a point on an
 /// instrument's lattice.
-pub use crate::instrument::Price;
+pub use crate::instrument::{Price, Qty};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExchangeId(pub String);
@@ -122,8 +122,8 @@ pub struct Order {
     /// `Limit`, and its price is its level's price.
     pub order_type: OrderType,
     pub side: Side,
-    pub original_quantity: u64,
-    pub remaining_quantity: u64,
+    pub original_quantity: Qty,
+    pub remaining_quantity: Qty,
     pub timestamp: u128, // matters, because of the FIFO processing we need to know the time of the order
     pub lifecycle: OrderLifecycle,
 }
@@ -134,8 +134,8 @@ pub struct OrderBuilder {
     client_id: Option<ClientId>,
     order_type: Option<OrderType>,
     side: Option<Side>,
-    original_quantity: Option<u64>,
-    remaining_quantity: Option<u64>,
+    original_quantity: Option<Qty>,
+    remaining_quantity: Option<Qty>,
     timestamp: Option<u128>,
     lifecycle: Option<OrderLifecycle>,
 }
@@ -208,12 +208,12 @@ impl OrderBuilder {
         self
     }
 
-    pub fn quantity(mut self, quantity: u64) -> Self {
+    pub fn quantity(mut self, quantity: Qty) -> Self {
         self.original_quantity = Some(quantity);
         self
     }
 
-    pub fn remaining_quantity(mut self, remaining_quantity: u64) -> Self {
+    pub fn remaining_quantity(mut self, remaining_quantity: Qty) -> Self {
         self.remaining_quantity = Some(remaining_quantity);
         self
     }
@@ -274,17 +274,18 @@ impl PriceLevel {
         Some(self.orders.remove(idx))
     }
 
-    pub fn total_quantity(&self) -> u64 {
+    pub fn total_quantity(&self) -> Qty {
         self.orders
             .iter()
-            .fold(0, |acc, order| acc + order.remaining_quantity)
+            .map(|order| order.remaining_quantity)
+            .sum()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{order, price_level, px};
+    use crate::test_helpers::{order, price_level, px, qty};
 
     #[test]
     fn price_level_constructor_works() {
@@ -361,7 +362,7 @@ mod tests {
             .add_order(order(Side::Bid, 100, 35, None, "order_2"))
             .expect("order 2 should be added");
 
-        assert_eq!(level.total_quantity(), 45);
+        assert_eq!(level.total_quantity(), qty(45));
     }
 
     #[test]
@@ -376,6 +377,6 @@ mod tests {
             .add_order(order(Side::Bid, 100, 35, None, "order_2"))
             .expect("order 2 should be added");
 
-        assert_eq!(level.total_quantity(), 40);
+        assert_eq!(level.total_quantity(), qty(40));
     }
 }

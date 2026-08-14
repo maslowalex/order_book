@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::instrument::{InstrumentSpec, Ticks};
+use crate::instrument::{InstrumentSpec, Qty, Ticks};
 use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
 
 /// Where a live order physically is — needed by `cancel_order`/`get_order`
@@ -197,7 +197,7 @@ impl OrderBook {
 
     /// Aggregated market depth: the top `levels` price levels of `side`,
     /// best price first, as `(price, total resting quantity)`.
-    pub fn depth(&self, side: Side, levels: usize) -> Vec<(Price, u64)> {
+    pub fn depth(&self, side: Side, levels: usize) -> Vec<(Price, Qty)> {
         let aggregate = |level: &PriceLevel| (level.price, level.total_quantity());
         match side {
             Side::Bid => self.bids.values().take(levels).map(aggregate).collect(),
@@ -254,7 +254,7 @@ A: At any moment when a LIMIT order arrives, we must check if it crosses the spr
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::test_helpers::{book, order, px};
+    use crate::test_helpers::{book, order, px, qty};
 
     /// A non-crossed book: bids 99/98/97, asks 100/101/102.
     /// best_bid = 99, best_ask = 100, spread = 1.
@@ -328,7 +328,7 @@ mod test {
         assert_eq!(orderbook.bids.len(), 0);
 
         let level = orderbook.asks.get(&px(100)).unwrap();
-        assert_eq!(level.total_quantity(), 15); // 10 + 5
+        assert_eq!(level.total_quantity(), qty(15)); // 10 + 5
     }
 
     #[test]
@@ -416,7 +416,7 @@ mod test {
         // price level still exists with remaining order
         let level = orderbook.asks.get(&px(100)).unwrap();
         assert_eq!(level.orders.len(), 1);
-        assert_eq!(level.total_quantity(), 5);
+        assert_eq!(level.total_quantity(), qty(5));
 
         // index only has the remaining order
         assert_eq!(orderbook.index.len(), 1);
@@ -488,11 +488,11 @@ mod test {
 
         let bid_level = orderbook.best_bid_level().unwrap();
         assert_eq!(bid_level.price, px(99));
-        assert_eq!(bid_level.total_quantity(), 110);
+        assert_eq!(bid_level.total_quantity(), qty(110));
 
         let ask_level = orderbook.best_ask_level().unwrap();
         assert_eq!(ask_level.price, px(100));
-        assert_eq!(ask_level.total_quantity(), 100);
+        assert_eq!(ask_level.total_quantity(), qty(100));
     }
 
     #[test]
@@ -510,11 +510,11 @@ mod test {
 
         assert_eq!(
             orderbook.depth(Side::Bid, 2),
-            vec![(px(99), 110), (px(98), 500)]
+            vec![(px(99), qty(110)), (px(98), qty(500))]
         );
         assert_eq!(
             orderbook.depth(Side::Ask, 2),
-            vec![(px(100), 100), (px(101), 200)]
+            vec![(px(100), qty(100)), (px(101), qty(200))]
         );
     }
 
@@ -536,7 +536,7 @@ mod test {
             .add_order(order(Side::Ask, 100, 5, None, "ex_2"))
             .unwrap();
 
-        assert_eq!(orderbook.depth(Side::Ask, 1), vec![(px(100), 15)]);
+        assert_eq!(orderbook.depth(Side::Ask, 1), vec![(px(100), qty(15))]);
     }
 
     #[test]
@@ -547,7 +547,7 @@ mod test {
             .get_order(&ExchangeId("ask_101".to_owned()))
             .unwrap();
         assert_eq!(found.side, Side::Ask);
-        assert_eq!(found.remaining_quantity, 200);
+        assert_eq!(found.remaining_quantity, qty(200));
     }
 
     #[test]

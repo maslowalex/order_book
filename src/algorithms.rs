@@ -11,6 +11,7 @@
 *
 */
 
+use crate::instrument::Qty;
 use crate::types::Order;
 use std::cmp;
 
@@ -22,26 +23,26 @@ use std::cmp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fill {
     pub order_index: usize,
-    pub quantity: u64,
+    pub quantity: Qty,
 }
 
 pub trait MatchingAlgorithm {
-    fn allocate(&self, available: u64, orders: &[Order]) -> Vec<Fill>;
+    fn allocate(&self, available: Qty, orders: &[Order]) -> Vec<Fill>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FifoMatcher;
 
 impl MatchingAlgorithm for FifoMatcher {
-    fn allocate(&self, available: u64, orders: &[Order]) -> Vec<Fill> {
+    fn allocate(&self, available: Qty, orders: &[Order]) -> Vec<Fill> {
         let mut fills: Vec<Fill> = vec![];
-        let mut left: u64 = available;
+        let mut left: Qty = available;
 
         for (i, order) in orders.iter().enumerate() {
-            if left == 0 {
+            if left.is_zero() {
                 break;
             }
-            if order.remaining_quantity == 0 {
+            if order.remaining_quantity.is_zero() {
                 continue;
             }
 
@@ -68,10 +69,17 @@ impl MatchingAlgorithm for FifoMatcher {
 pub struct ProRataMatcher;
 
 impl MatchingAlgorithm for ProRataMatcher {
-    fn allocate(&self, available: u64, orders: &[Order]) -> Vec<Fill> {
+    fn allocate(&self, available: Qty, orders: &[Order]) -> Vec<Fill> {
+        // Unlike FIFO, which only ever compares and subtracts quantities, this
+        // allocator genuinely multiplies and divides them — so it drops to raw
+        // base units for the duration and puts the `Qty` wrapper back on at
+        // the end. Widening is the whole point here, and `Qty` is a u64: doing
+        // the arithmetic through the type would hide exactly the overflow this
+        // code exists to avoid.
+        let available = available.base();
         let total: u128 = orders
             .iter()
-            .map(|o| u128::from(o.remaining_quantity))
+            .map(|o| u128::from(o.remaining_quantity.base()))
             .sum();
 
         // Nothing to apportion: the taker swallows the level whole and every
@@ -82,7 +90,7 @@ impl MatchingAlgorithm for ProRataMatcher {
             return orders
                 .iter()
                 .enumerate()
-                .filter(|(_, o)| o.remaining_quantity > 0)
+                .filter(|(_, o)| !o.remaining_quantity.is_zero())
                 .map(|(i, o)| Fill {
                     order_index: i,
                     quantity: o.remaining_quantity,
@@ -101,7 +109,9 @@ impl MatchingAlgorithm for ProRataMatcher {
         // happens, from two makers alone.
         let mut shares: Vec<u64> = orders
             .iter()
-            .map(|o| (u128::from(available) * u128::from(o.remaining_quantity) / total) as u64)
+            .map(|o| {
+                (u128::from(available) * u128::from(o.remaining_quantity.base()) / total) as u64
+            })
             .collect();
 
         // Remainder pass. Each floor above discarded strictly less than one
@@ -116,7 +126,7 @@ impl MatchingAlgorithm for ProRataMatcher {
             if left == 0 {
                 break;
             }
-            if shares[i] < order.remaining_quantity {
+            if shares[i] < order.remaining_quantity.base() {
                 shares[i] += 1;
                 left -= 1;
             }
@@ -131,7 +141,7 @@ impl MatchingAlgorithm for ProRataMatcher {
             .filter(|&(_, &quantity)| quantity > 0)
             .map(|(i, &quantity)| Fill {
                 order_index: i,
-                quantity,
+                quantity: Qty::from_base_unchecked(quantity),
             })
             .collect()
     }
@@ -144,6 +154,20 @@ mod tests {
     use crate::types::Side;
     use proptest::prelude::*;
     use std::collections::HashMap;
+
+    /// Base units as a `Qty`. The allocator's unit is whatever the instrument
+    /// says a lot is; these tests run on a unit lot, so base units and lots
+    /// coincide and the numbers below read the same as they always did.
+    fn qty(n: u64) -> Qty {
+        Qty::from_base_unchecked(n)
+    }
+
+    fn fill(order_index: usize, quantity: u64) -> Fill {
+        Fill {
+            order_index,
+            quantity: qty(quantity),
+        }
+    }
 
     /// A price level's queue described only by what an allocator can see: each
     /// order's remaining quantity, in FIFO order. Side and price are arbitrary
@@ -160,10 +184,10 @@ mod tests {
     /// `debug_assert_fills` in `matching.rs` once the engine allocates through
     /// the trait, so it is not throwaway — and it will police `ProRataMatcher`
     /// unchanged in step 2.
-    fn assert_contract(fills: &[Fill], available: u64, orders: &[Order]) {
+    fn assert_contract(fills: &[Fill], available: Qty, orders: &[Order]) {
         let total: u128 = orders
             .iter()
-            .map(|o| u128::from(o.remaining_quantity))
+            .map(|o| u128::from(o.remaining_quantity.base()))
             .sum();
 
         let mut previous: Option<usize> = None;
@@ -180,22 +204,25 @@ mod tests {
                 fill.order_index,
                 orders.len()
             );
-            assert!(fill.quantity > 0, "(2) zero-quantity fill in {fills:?}");
+            assert!(
+                !fill.quantity.is_zero(),
+                "(2) zero-quantity fill in {fills:?}"
+            );
             assert!(
                 fill.quantity <= orders[fill.order_index].remaining_quantity,
-                "(3) fill of {} over-fills maker {}, which has {} left",
+                "(3) fill of {:?} over-fills maker {}, which has {:?} left",
                 fill.quantity,
                 fill.order_index,
                 orders[fill.order_index].remaining_quantity
             );
 
             previous = Some(fill.order_index);
-            allocated += u128::from(fill.quantity);
+            allocated += u128::from(fill.quantity.base());
         }
 
         assert_eq!(
             allocated,
-            u128::from(available).min(total),
+            u128::from(available.base()).min(total),
             "(4) allocation must be exactly min(available, level total)"
         );
     }
@@ -206,10 +233,11 @@ mod tests {
     /// A maker whose share is zero and who gets no crumb is ABSENT from
     /// `fills` rather than present with quantity 0, which the lookup default
     /// accounts for.
-    fn assert_proportional(fills: &[Fill], available: u64, orders: &[Order]) {
+    fn assert_proportional(fills: &[Fill], available: Qty, orders: &[Order]) {
+        let available = available.base();
         let total: u128 = orders
             .iter()
-            .map(|o| u128::from(o.remaining_quantity))
+            .map(|o| u128::from(o.remaining_quantity.base()))
             .sum();
 
         // `available >= total` is the take-everything branch — no proportional
@@ -218,17 +246,19 @@ mod tests {
             return;
         }
 
-        let allocated: HashMap<usize, u64> =
-            fills.iter().map(|f| (f.order_index, f.quantity)).collect();
+        let allocated: HashMap<usize, u64> = fills
+            .iter()
+            .map(|f| (f.order_index, f.quantity.base()))
+            .collect();
 
         for (i, order) in orders.iter().enumerate() {
-            let floor_share =
-                (u128::from(available) * u128::from(order.remaining_quantity) / total) as u64;
+            let floor_share = (u128::from(available) * u128::from(order.remaining_quantity.base())
+                / total) as u64;
             let got = allocated.get(&i).copied().unwrap_or(0);
 
             assert!(
                 got == floor_share || got == floor_share + 1,
-                "maker {i} (qty {}) got {got}, expected its floor share {floor_share} or one crumb more",
+                "maker {i} (qty {:?}) got {got}, expected its floor share {floor_share} or one crumb more",
                 order.remaining_quantity
             );
         }
@@ -239,34 +269,28 @@ mod tests {
     #[test]
     fn empty_level_yields_no_fills() {
         let orders = level_of(&[]);
-        let fills = FifoMatcher.allocate(100, &orders);
+        let fills = FifoMatcher.allocate(qty(100), &orders);
 
         assert!(fills.is_empty());
-        assert_contract(&fills, 100, &orders);
+        assert_contract(&fills, qty(100), &orders);
     }
 
     #[test]
     fn nothing_available_yields_no_fills() {
         let orders = level_of(&[10, 10]);
-        let fills = FifoMatcher.allocate(0, &orders);
+        let fills = FifoMatcher.allocate(qty(0), &orders);
 
         assert!(fills.is_empty());
-        assert_contract(&fills, 0, &orders);
+        assert_contract(&fills, qty(0), &orders);
     }
 
     #[test]
     fn partial_fill_of_the_front_order() {
         let orders = level_of(&[10]);
-        let fills = FifoMatcher.allocate(4, &orders);
+        let fills = FifoMatcher.allocate(qty(4), &orders);
 
-        assert_eq!(
-            fills,
-            vec![Fill {
-                order_index: 0,
-                quantity: 4
-            }]
-        );
-        assert_contract(&fills, 4, &orders);
+        assert_eq!(fills, vec![fill(0, 4)]);
+        assert_contract(&fills, qty(4), &orders);
     }
 
     /// Contract (2): consuming the front order EXACTLY must not emit a
@@ -276,41 +300,19 @@ mod tests {
     #[test]
     fn exact_boundary_does_not_emit_a_zero_fill() {
         let orders = level_of(&[10, 10]);
-        let fills = FifoMatcher.allocate(10, &orders);
+        let fills = FifoMatcher.allocate(qty(10), &orders);
 
-        assert_eq!(
-            fills,
-            vec![Fill {
-                order_index: 0,
-                quantity: 10
-            }]
-        );
-        assert_contract(&fills, 10, &orders);
+        assert_eq!(fills, vec![fill(0, 10)]);
+        assert_contract(&fills, qty(10), &orders);
     }
 
     #[test]
     fn walks_the_queue_front_to_back() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = FifoMatcher.allocate(25, &orders);
+        let fills = FifoMatcher.allocate(qty(25), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 10
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 10
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 5
-                },
-            ]
-        );
-        assert_contract(&fills, 25, &orders);
+        assert_eq!(fills, vec![fill(0, 10), fill(1, 10), fill(2, 5),]);
+        assert_contract(&fills, qty(25), &orders);
     }
 
     /// Uneven sizes: the countdown must track what is actually left rather
@@ -319,26 +321,10 @@ mod tests {
     #[test]
     fn uneven_quantities_drain_in_order() {
         let orders = level_of(&[5, 3, 7]);
-        let fills = FifoMatcher.allocate(12, &orders);
+        let fills = FifoMatcher.allocate(qty(12), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 5
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 3
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 4
-                },
-            ]
-        );
-        assert_contract(&fills, 12, &orders);
+        assert_eq!(fills, vec![fill(0, 5), fill(1, 3), fill(2, 4),]);
+        assert_contract(&fills, qty(12), &orders);
     }
 
     /// Contract (4) caps at the level total: a taker bigger than the level
@@ -347,11 +333,11 @@ mod tests {
     #[test]
     fn taker_larger_than_the_level_takes_everything() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = FifoMatcher.allocate(100, &orders);
+        let fills = FifoMatcher.allocate(qty(100), &orders);
 
         assert_eq!(fills.len(), 3);
-        assert_eq!(fills.iter().map(|f| f.quantity).sum::<u64>(), 30);
-        assert_contract(&fills, 100, &orders);
+        assert_eq!(fills.iter().map(|f| f.quantity.base()).sum::<u64>(), 30);
+        assert_contract(&fills, qty(100), &orders);
     }
 
     /// The case that separates the two zeros. At index 1 the maker is empty
@@ -362,22 +348,10 @@ mod tests {
     #[test]
     fn skips_a_zero_remaining_order_in_the_middle() {
         let orders = level_of(&[10, 0, 10]);
-        let fills = FifoMatcher.allocate(15, &orders);
+        let fills = FifoMatcher.allocate(qty(15), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 10
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 5
-                },
-            ]
-        );
-        assert_contract(&fills, 15, &orders);
+        assert_eq!(fills, vec![fill(0, 10), fill(2, 5),]);
+        assert_contract(&fills, qty(15), &orders);
     }
 
     /// Both zeros at once: the taker is full AND the trailing maker is empty.
@@ -385,16 +359,10 @@ mod tests {
     #[test]
     fn skips_a_trailing_zero_remaining_order() {
         let orders = level_of(&[10, 0]);
-        let fills = FifoMatcher.allocate(10, &orders);
+        let fills = FifoMatcher.allocate(qty(10), &orders);
 
-        assert_eq!(
-            fills,
-            vec![Fill {
-                order_index: 0,
-                quantity: 10
-            }]
-        );
-        assert_contract(&fills, 10, &orders);
+        assert_eq!(fills, vec![fill(0, 10)]);
+        assert_contract(&fills, qty(10), &orders);
     }
 
     // ------------------------------------------------------------ PRO-RATA
@@ -406,52 +374,20 @@ mod tests {
     #[test]
     fn pro_rata_splits_the_textbook_example_evenly() {
         let orders = level_of(&[100, 200, 300]);
-        let fills = ProRataMatcher.allocate(300, &orders);
+        let fills = ProRataMatcher.allocate(qty(300), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 50
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 100
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 150
-                },
-            ]
-        );
-        assert_contract(&fills, 300, &orders);
-        assert_proportional(&fills, 300, &orders);
+        assert_eq!(fills, vec![fill(0, 50), fill(1, 100), fill(2, 150),]);
+        assert_contract(&fills, qty(300), &orders);
+        assert_proportional(&fills, qty(300), &orders);
     }
 
     #[test]
     fn pro_rata_taker_larger_than_the_level_takes_everything() {
         let orders = level_of(&[10, 20, 30]);
-        let fills = ProRataMatcher.allocate(1000, &orders);
+        let fills = ProRataMatcher.allocate(qty(1000), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 10
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 20
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 30
-                },
-            ]
-        );
-        assert_contract(&fills, 1000, &orders);
+        assert_eq!(fills, vec![fill(0, 10), fill(1, 20), fill(2, 30),]);
+        assert_contract(&fills, qty(1000), &orders);
     }
 
     /// `available == total` is the boundary of the take-everything branch:
@@ -459,11 +395,11 @@ mod tests {
     #[test]
     fn pro_rata_taker_exactly_the_level_takes_everything() {
         let orders = level_of(&[10, 20, 30]);
-        let fills = ProRataMatcher.allocate(60, &orders);
+        let fills = ProRataMatcher.allocate(qty(60), &orders);
 
-        assert_eq!(fills.iter().map(|f| f.quantity).sum::<u64>(), 60);
+        assert_eq!(fills.iter().map(|f| f.quantity.base()).sum::<u64>(), 60);
         assert_eq!(fills.len(), 3);
-        assert_contract(&fills, 60, &orders);
+        assert_contract(&fills, qty(60), &orders);
     }
 
     /// Ten across three equal makers: each share floors to 3, totalling 9, so
@@ -471,27 +407,11 @@ mod tests {
     #[test]
     fn pro_rata_hands_a_single_crumb_to_the_front() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = ProRataMatcher.allocate(10, &orders);
+        let fills = ProRataMatcher.allocate(qty(10), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 4
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 3
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 3
-                },
-            ]
-        );
-        assert_contract(&fills, 10, &orders);
-        assert_proportional(&fills, 10, &orders);
+        assert_eq!(fills, vec![fill(0, 4), fill(1, 3), fill(2, 3),]);
+        assert_contract(&fills, qty(10), &orders);
+        assert_proportional(&fills, qty(10), &orders);
     }
 
     /// Eleven across the same three: floors to 3 each again, but now there are
@@ -500,27 +420,11 @@ mod tests {
     #[test]
     fn pro_rata_walks_the_queue_placing_every_crumb() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = ProRataMatcher.allocate(11, &orders);
+        let fills = ProRataMatcher.allocate(qty(11), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 4
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 4
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 3
-                },
-            ]
-        );
-        assert_contract(&fills, 11, &orders);
-        assert_proportional(&fills, 11, &orders);
+        assert_eq!(fills, vec![fill(0, 4), fill(1, 4), fill(2, 3),]);
+        assert_contract(&fills, qty(11), &orders);
+        assert_proportional(&fills, qty(11), &orders);
     }
 
     /// The counterexample to keep: `[3, 4]` taking 3 floors to `[1, 1]`, and
@@ -531,23 +435,11 @@ mod tests {
     #[test]
     fn pro_rata_is_not_monotone_in_size() {
         let orders = level_of(&[3, 4]);
-        let fills = ProRataMatcher.allocate(3, &orders);
+        let fills = ProRataMatcher.allocate(qty(3), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 2
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 1
-                },
-            ]
-        );
-        assert_contract(&fills, 3, &orders);
-        assert_proportional(&fills, 3, &orders);
+        assert_eq!(fills, vec![fill(0, 2), fill(1, 1),]);
+        assert_contract(&fills, qty(3), &orders);
+        assert_proportional(&fills, qty(3), &orders);
     }
 
     /// A taker too small to give anyone a proportional unit: every share
@@ -558,17 +450,11 @@ mod tests {
     #[test]
     fn pro_rata_degenerates_to_fifo_for_a_tiny_taker() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = ProRataMatcher.allocate(1, &orders);
+        let fills = ProRataMatcher.allocate(qty(1), &orders);
 
-        assert_eq!(
-            fills,
-            vec![Fill {
-                order_index: 0,
-                quantity: 1
-            }]
-        );
-        assert_contract(&fills, 1, &orders);
-        assert_proportional(&fills, 1, &orders);
+        assert_eq!(fills, vec![fill(0, 1)]);
+        assert_contract(&fills, qty(1), &orders);
+        assert_proportional(&fills, qty(1), &orders);
     }
 
     /// Every share floors to zero and the crumbs alone decide the outcome:
@@ -577,27 +463,11 @@ mod tests {
     #[test]
     fn pro_rata_allocates_purely_from_the_remainder_pass() {
         let orders = level_of(&[1, 1, 1, 1]);
-        let fills = ProRataMatcher.allocate(3, &orders);
+        let fills = ProRataMatcher.allocate(qty(3), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 1
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 1
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 1
-                },
-            ]
-        );
-        assert_contract(&fills, 3, &orders);
-        assert_proportional(&fills, 3, &orders);
+        assert_eq!(fills, vec![fill(0, 1), fill(1, 1), fill(2, 1),]);
+        assert_contract(&fills, qty(3), &orders);
+        assert_proportional(&fills, qty(3), &orders);
     }
 
     /// A zero-quantity maker adds nothing to `total`, floors to zero, has no
@@ -607,32 +477,20 @@ mod tests {
     #[test]
     fn pro_rata_skips_a_zero_remaining_order() {
         let orders = level_of(&[10, 0, 10]);
-        let fills = ProRataMatcher.allocate(15, &orders);
+        let fills = ProRataMatcher.allocate(qty(15), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 8
-                },
-                Fill {
-                    order_index: 2,
-                    quantity: 7
-                },
-            ]
-        );
-        assert_contract(&fills, 15, &orders);
-        assert_proportional(&fills, 15, &orders);
+        assert_eq!(fills, vec![fill(0, 8), fill(2, 7),]);
+        assert_contract(&fills, qty(15), &orders);
+        assert_proportional(&fills, qty(15), &orders);
     }
 
     #[test]
     fn pro_rata_empty_level_yields_no_fills() {
         let orders = level_of(&[]);
-        let fills = ProRataMatcher.allocate(100, &orders);
+        let fills = ProRataMatcher.allocate(qty(100), &orders);
 
         assert!(fills.is_empty());
-        assert_contract(&fills, 100, &orders);
+        assert_contract(&fills, qty(100), &orders);
     }
 
     /// `available == 0` is NOT the take-everything branch (0 < total), so this
@@ -641,10 +499,10 @@ mod tests {
     #[test]
     fn pro_rata_nothing_available_yields_no_fills() {
         let orders = level_of(&[10, 10]);
-        let fills = ProRataMatcher.allocate(0, &orders);
+        let fills = ProRataMatcher.allocate(qty(0), &orders);
 
         assert!(fills.is_empty());
-        assert_contract(&fills, 0, &orders);
+        assert_contract(&fills, qty(0), &orders);
     }
 
     /// `available * qty` overflows `u64` long before the numbers get silly:
@@ -655,22 +513,16 @@ mod tests {
     #[test]
     fn pro_rata_survives_products_that_overflow_u64() {
         let orders = level_of(&[10_000_000_000_000_000_000, 8_000_000_000_000_000_000]);
-        let fills = ProRataMatcher.allocate(9_000_000_000_000_000_000, &orders);
+        let fills = ProRataMatcher.allocate(qty(9_000_000_000_000_000_000), &orders);
 
         assert_eq!(
             fills,
             vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 5_000_000_000_000_000_000
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 4_000_000_000_000_000_000
-                },
+                fill(0, 5_000_000_000_000_000_000),
+                fill(1, 4_000_000_000_000_000_000),
             ]
         );
-        assert_contract(&fills, 9_000_000_000_000_000_000, &orders);
+        assert_contract(&fills, qty(9_000_000_000_000_000_000), &orders);
     }
 
     /// `total` itself overflows `u64`: two makers at `u64::MAX` sum past the
@@ -679,22 +531,10 @@ mod tests {
     #[test]
     fn pro_rata_survives_a_level_total_that_overflows_u64() {
         let orders = level_of(&[u64::MAX, u64::MAX]);
-        let fills = ProRataMatcher.allocate(100, &orders);
+        let fills = ProRataMatcher.allocate(qty(100), &orders);
 
-        assert_eq!(
-            fills,
-            vec![
-                Fill {
-                    order_index: 0,
-                    quantity: 50
-                },
-                Fill {
-                    order_index: 1,
-                    quantity: 50
-                },
-            ]
-        );
-        assert_contract(&fills, 100, &orders);
+        assert_eq!(fills, vec![fill(0, 50), fill(1, 50),]);
+        assert_contract(&fills, qty(100), &orders);
     }
 
     // ------------------------------------------------------ BOTH MATCHERS
@@ -714,6 +554,8 @@ mod tests {
             quantities in prop::collection::vec(0u64..10_000, 0..24),
         ) {
             let orders = level_of(&quantities);
+
+            let available = qty(available);
 
             let fifo = FifoMatcher.allocate(available, &orders);
             assert_contract(&fifo, available, &orders);

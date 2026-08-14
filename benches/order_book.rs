@@ -43,7 +43,7 @@ use criterion::{
 /// `src/test_helpers.rs` is `#[cfg(test)]`-private and invisible to bench
 /// targets (benches link the lib as an external crate).
 mod generators {
-    use order_book::instrument::InstrumentSpec;
+    use order_book::instrument::{InstrumentSpec, Qty};
     use order_book::orderbook::OrderBook;
     use order_book::types::{ExchangeId, Order, OrderType, Price, Side};
     use rand::rngs::StdRng;
@@ -70,6 +70,15 @@ mod generators {
 
     /// The quarter-tick grid the matching ladder is built on, shared by
     /// `matching_book` and every taker generator that has to land on it.
+    /// Base units as a `Qty`. Every bench spec uses a unit lot, so any of
+    /// them converts identically; named `base_qty` only to avoid shadowing the
+    /// `qty` locals the generators already use.
+    pub fn base_qty(n: u64) -> Qty {
+        quarter_tick()
+            .qty_from_base(n)
+            .expect("unit lot accepts any count")
+    }
+
     pub fn quarter_tick() -> InstrumentSpec {
         InstrumentSpec::new(2, 0, 25, 1).expect("2/0/25/1 is a valid spec")
     }
@@ -117,7 +126,7 @@ mod generators {
             .client_id(client)
             .order_type(OrderType::limit_gtc(price))
             .side(side)
-            .quantity(qty)
+            .quantity(base_qty(qty))
             .timestamp(ts)
             .build()
     }
@@ -205,7 +214,7 @@ mod generators {
                     .client_id(format!("burst-{i}"))
                     .order_type(order_type)
                     .side(side)
-                    .quantity(qty)
+                    .quantity(base_qty(qty))
                     .timestamp(2_000_000 + i as u128)
                     .build()
             })
@@ -271,7 +280,7 @@ mod generators {
                     .client_id(format!("taker-{j}"))
                     .order_type(OrderType::Market)
                     .side(Side::Bid)
-                    .quantity(levels_each as u64 * level_depth)
+                    .quantity(base_qty(levels_each as u64 * level_depth))
                     .timestamp(3_000_000 + j as u128)
                     .build()
             })

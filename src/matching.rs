@@ -1,6 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
+use crate::instrument::Qty;
 use crate::orderbook::{OrderBook, OrderBookError, OrderLocation};
 use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, PriceLevel, Side, TimeInForce};
 
@@ -12,7 +13,7 @@ use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, PriceLevel, Si
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trade {
     pub price: Price,
-    pub quantity: u64,
+    pub quantity: Qty,
     pub maker_order_id: ExchangeId,
     pub taker_order_id: ExchangeId,
     pub maker_client: ClientId,
@@ -201,7 +202,7 @@ impl OrderBook {
             Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, Some(limit)),
         };
 
-        if order.remaining_quantity == 0 {
+        if order.remaining_quantity.is_zero() {
             return Ok(MatchingResult {
                 trades,
                 cancelled,
@@ -260,8 +261,8 @@ impl OrderBook {
             Side::Bid => fill_against(&mut self.asks, &mut self.index, &mut order, Some(limit)),
             Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, Some(limit)),
         };
-        debug_assert_eq!(
-            order.remaining_quantity, 0,
+        debug_assert!(
+            order.remaining_quantity.is_zero(),
             "FOK dry-run promised a full fill"
         );
 
@@ -280,7 +281,7 @@ impl OrderBook {
         };
 
         // IOC: anything left unfilled is discarded, not rested.
-        let outcome = if order.remaining_quantity == 0 {
+        let outcome = if order.remaining_quantity.is_zero() {
             SubmitOutcome::Filled
         } else {
             SubmitOutcome::Killed
@@ -313,9 +314,9 @@ fn activate(mut order: Order) -> Order {
 /// taker's client are EXCLUDED: self-trade prevention cancels them instead of
 /// trading, so counting them would overpromise and let a "fill or kill"
 /// partially fill. Returns early once `taker.remaining_quantity` is reachable.
-fn fillable_quantity<K: Ord>(side: &BTreeMap<K, PriceLevel>, taker: &Order, limit: Price) -> u64 {
+fn fillable_quantity<K: Ord>(side: &BTreeMap<K, PriceLevel>, taker: &Order, limit: Price) -> Qty {
     let needed = taker.remaining_quantity;
-    let mut available: u64 = 0;
+    let mut available: Qty = Qty::ZERO;
 
     for level in side.values() {
         let crosses = match taker.side {
@@ -361,7 +362,7 @@ fn fill_against<K: Ord>(
     let mut trades: Vec<Trade> = vec![];
     let mut cancelled: Vec<ExchangeId> = vec![];
 
-    while taker.remaining_quantity > 0 {
+    while !taker.remaining_quantity.is_zero() {
         // best opposing level, or stop — this side of the book is dry
         let Some(mut level_entry) = side.first_entry() else {
             break;
@@ -380,7 +381,7 @@ fn fill_against<K: Ord>(
         }
 
         // consume FIFO from the front of this level
-        while taker.remaining_quantity > 0 {
+        while !taker.remaining_quantity.is_zero() {
             let Some(front) = level.orders.first_mut() else {
                 break;
             };
@@ -408,7 +409,7 @@ fn fill_against<K: Ord>(
             front.remaining_quantity -= fill;
             taker.remaining_quantity -= fill;
 
-            if front.remaining_quantity == 0 {
+            if front.remaining_quantity.is_zero() {
                 let done = level.orders.remove(0);
                 index.remove(&done.exchange_id);
             }
@@ -427,65 +428,65 @@ fn fill_against<K: Ord>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{book, order, px};
+    use crate::test_helpers::{book, order, px, qty};
 
     // The `order()` helper builds a resting GTC limit maker with
     // client_id == exchange_id == id; the incoming taker controls its own
     // type, so these build it explicitly.
-    fn limit_order(side: Side, price: i64, qty: u64, id: &str) -> Order {
+    fn limit_order(side: Side, price: i64, quantity: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .quantity(qty)
+            .quantity(qty(quantity))
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::limit_gtc(px(price)))
             .build()
     }
 
-    fn market_order(side: Side, qty: u64, id: &str) -> Order {
+    fn market_order(side: Side, quantity: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .quantity(qty)
+            .quantity(qty(quantity))
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::Market)
             .build()
     }
 
-    fn ioc_order(side: Side, price: i64, qty: u64, id: &str) -> Order {
+    fn ioc_order(side: Side, price: i64, quantity: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .quantity(qty)
+            .quantity(qty(quantity))
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::limit_ioc(px(price)))
             .build()
     }
 
-    fn fok_order(side: Side, price: i64, qty: u64, id: &str) -> Order {
+    fn fok_order(side: Side, price: i64, quantity: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .quantity(qty)
+            .quantity(qty(quantity))
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::limit_fok(px(price)))
             .build()
     }
 
-    fn stop_market(side: Side, trigger: i64, qty: u64, id: &str) -> Order {
+    fn stop_market(side: Side, trigger: i64, quantity: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .quantity(qty)
+            .quantity(qty(quantity))
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::stop_market(px(trigger)))
             .build()
     }
 
-    fn stop_limit(side: Side, trigger: i64, price: i64, qty: u64, id: &str) -> Order {
+    fn stop_limit(side: Side, trigger: i64, price: i64, quantity: u64, id: &str) -> Order {
         Order::builder()
             .side(side)
-            .quantity(qty)
+            .quantity(qty(quantity))
             .client_id(id)
             .exchange_id(id)
             .order_type(OrderType::stop_limit(px(trigger), px(price)))
@@ -510,7 +511,7 @@ mod tests {
 
         let trade = &report.trades[0];
         assert_eq!(trade.price, px(100)); // maker's price
-        assert_eq!(trade.quantity, 10);
+        assert_eq!(trade.quantity, qty(10));
         assert_eq!(trade.maker_order_id, id("a1"));
         assert_eq!(trade.taker_order_id, report.order_id); // the exchange-assigned id
         assert_eq!(trade.maker_client, ClientId("a1".to_owned()));
@@ -532,10 +533,10 @@ mod tests {
 
         assert_eq!(report.outcome, SubmitOutcome::Filled);
         assert_eq!(report.trades.len(), 1);
-        assert_eq!(report.trades[0].quantity, 4);
+        assert_eq!(report.trades[0].quantity, qty(4));
 
         assert_eq!(ob.best_ask(), Some(px(100)));
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 6); // 10 - 4
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(6)); // 10 - 4
         assert!(ob.index.contains_key(&id("a1")));
     }
 
@@ -553,17 +554,17 @@ mod tests {
         assert_eq!(report.trades.len(), 2);
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
         assert_eq!(
             (report.trades[1].price, report.trades[1].quantity),
-            (px(101), 3)
+            (px(101), qty(3))
         );
 
         // a1 fully consumed, a2 left with 2, a3 untouched
         assert!(!ob.index.contains_key(&id("a1")));
         assert_eq!(ob.best_ask(), Some(px(101)));
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 2);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(2));
         assert!(ob.asks.contains_key(&px(102)));
     }
 
@@ -580,7 +581,7 @@ mod tests {
         assert_eq!(report.trades[0].maker_order_id, id("a1")); // oldest first
         assert!(!ob.index.contains_key(&id("a1")));
         assert!(ob.index.contains_key(&id("a2")));
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 5); // only a2 remains
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(5)); // only a2 remains
     }
 
     #[test]
@@ -603,7 +604,7 @@ mod tests {
         // takes all 3, discards the unfilled 7 (IOC)
         assert_eq!(report.outcome, SubmitOutcome::Killed);
         assert_eq!(report.trades.len(), 1);
-        assert_eq!(report.trades[0].quantity, 3);
+        assert_eq!(report.trades[0].quantity, qty(3));
         assert_eq!(ob.best_ask(), None);
         assert!(ob.index.is_empty());
     }
@@ -623,16 +624,16 @@ mod tests {
         // highest bid first: 5 @ 99 then 3 @ 98
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(99), 5)
+            (px(99), qty(5))
         );
         assert_eq!(
             (report.trades[1].price, report.trades[1].quantity),
-            (px(98), 3)
+            (px(98), qty(3))
         );
         assert_eq!(report.trades[0].taker_side, Side::Ask);
 
         assert_eq!(ob.best_bid(), Some(px(98)));
-        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), 2);
+        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), qty(2));
     }
 
     // ---- limit orders: rest when they don't cross, match the marketable prefix when they do ----
@@ -649,7 +650,7 @@ mod tests {
         assert!(report.trades.is_empty());
         assert!(report.cancelled.is_empty());
         assert_eq!(ob.best_bid(), Some(px(99)));
-        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), qty(5));
         assert!(ob.index.contains_key(&report.order_id)); // rests under the assigned id
     }
 
@@ -662,10 +663,10 @@ mod tests {
 
         assert_eq!(report.outcome, SubmitOutcome::Filled);
         assert_eq!(report.trades.len(), 1);
-        assert_eq!(report.trades[0].quantity, 5);
+        assert_eq!(report.trades[0].quantity, qty(5));
         // nothing rests for the taker; maker shrinks to 5
         assert!(!ob.index.contains_key(&report.order_id));
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(5));
     }
 
     #[test]
@@ -678,11 +679,11 @@ mod tests {
 
         assert_eq!(report.outcome, SubmitOutcome::PartiallyFilledAndRested);
         assert_eq!(report.trades.len(), 1);
-        assert_eq!(report.trades[0].quantity, 5);
+        assert_eq!(report.trades[0].quantity, qty(5));
 
         assert_eq!(ob.best_ask(), None); // a1 fully consumed
         assert_eq!(ob.best_bid(), Some(px(100))); // remainder rests as a bid
-        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), 3);
+        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), qty(3));
         assert!(ob.index.contains_key(&report.order_id)); // rests under the assigned id
     }
 
@@ -699,12 +700,12 @@ mod tests {
         assert_eq!(report.trades.len(), 1);
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
 
         assert!(ob.asks.contains_key(&px(102))); // a2 untouched
         assert_eq!(ob.best_bid(), Some(px(100))); // remainder 5 rests
-        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), qty(5));
     }
 
     #[test]
@@ -732,17 +733,17 @@ mod tests {
         assert_eq!(report.trades.len(), 2);
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
         assert_eq!(
             (report.trades[1].price, report.trades[1].quantity),
-            (px(101), 3)
+            (px(101), qty(3))
         );
 
         assert!(!ob.index.contains_key(&id("a1"))); // a1 fully consumed
         assert!(!ob.index.contains_key(&report.order_id)); // taker fully filled — nothing rests
         assert_eq!(ob.best_ask(), Some(px(101))); // a2 left with 2
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 2);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(2));
     }
 
     #[test]
@@ -760,22 +761,22 @@ mod tests {
         assert_eq!(report.trades.len(), 2);
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
         assert_eq!(
             (report.trades[1].price, report.trades[1].quantity),
-            (px(101), 5)
+            (px(101), qty(5))
         );
 
         // both crossed makers gone, a3 untouched
         assert!(!ob.index.contains_key(&id("a1")));
         assert!(!ob.index.contains_key(&id("a2")));
         assert_eq!(ob.best_ask(), Some(px(103)));
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(5));
 
         // remainder rests on the bid side
         assert_eq!(ob.best_bid(), Some(px(101)));
-        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), 2);
+        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), qty(2));
         assert!(ob.index.contains_key(&report.order_id)); // rests under the assigned id
     }
 
@@ -793,7 +794,7 @@ mod tests {
         assert!(report.trades.is_empty());
         assert!(report.cancelled.is_empty());
         assert_eq!(ob.best_ask(), Some(px(100)));
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(5));
         assert!(ob.index.contains_key(&report.order_id));
     }
 
@@ -808,12 +809,12 @@ mod tests {
         assert_eq!(report.trades.len(), 1);
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
         assert_eq!(report.trades[0].taker_side, Side::Ask);
         // nothing rests; b1 shrinks to 5
         assert!(!ob.index.contains_key(&report.order_id));
-        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_bid_level().unwrap().total_quantity(), qty(5));
     }
 
     #[test]
@@ -826,11 +827,11 @@ mod tests {
 
         assert_eq!(report.outcome, SubmitOutcome::PartiallyFilledAndRested);
         assert_eq!(report.trades.len(), 1);
-        assert_eq!(report.trades[0].quantity, 5);
+        assert_eq!(report.trades[0].quantity, qty(5));
 
         assert_eq!(ob.best_bid(), None); // b1 fully consumed
         assert_eq!(ob.best_ask(), Some(px(100))); // remainder rests as an ask
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 3);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(3));
         assert!(ob.index.contains_key(&report.order_id));
     }
 
@@ -847,12 +848,12 @@ mod tests {
         assert_eq!(report.trades.len(), 1);
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
 
         assert_eq!(ob.best_bid(), Some(px(98))); // b2 untouched, now best bid
         assert_eq!(ob.best_ask(), Some(px(100))); // remainder 5 rests
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(5));
     }
 
     #[test]
@@ -871,16 +872,16 @@ mod tests {
         // best (highest) bid first: 5 @ 100 then 5 @ 99
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
         assert_eq!(
             (report.trades[1].price, report.trades[1].quantity),
-            (px(99), 5)
+            (px(99), qty(5))
         );
 
         assert_eq!(ob.best_bid(), Some(px(97))); // only b3 remains
         assert_eq!(ob.best_ask(), Some(px(99))); // remainder rests
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 2);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(2));
     }
 
     // ---- IOC: fill what crosses now, never rest ----
@@ -894,7 +895,7 @@ mod tests {
 
         assert_eq!(report.outcome, SubmitOutcome::Filled);
         assert_eq!(report.trades.len(), 1);
-        assert_eq!(report.trades[0].quantity, 10);
+        assert_eq!(report.trades[0].quantity, qty(10));
         assert_eq!(ob.best_ask(), None);
     }
 
@@ -908,7 +909,7 @@ mod tests {
 
         assert_eq!(report.outcome, SubmitOutcome::Killed);
         assert_eq!(report.trades.len(), 1);
-        assert_eq!(report.trades[0].quantity, 10);
+        assert_eq!(report.trades[0].quantity, qty(10));
 
         // nothing rested: no bid side, taker not in the index
         assert_eq!(ob.best_bid(), None);
@@ -945,7 +946,7 @@ mod tests {
         assert_eq!(report.trades.len(), 1);
         assert_eq!(
             (report.trades[0].price, report.trades[0].quantity),
-            (px(100), 5)
+            (px(100), qty(5))
         );
         // the 101 level is untouched, and nothing rested
         assert_eq!(ob.best_ask(), Some(px(101)));
@@ -964,8 +965,8 @@ mod tests {
 
         assert_eq!(report.outcome, SubmitOutcome::Filled);
         assert_eq!(report.trades.len(), 2);
-        let filled: u64 = report.trades.iter().map(|t| t.quantity).sum();
-        assert_eq!(filled, 10);
+        let filled: Qty = report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, qty(10));
         assert_eq!(ob.best_ask(), None);
     }
 
@@ -983,7 +984,7 @@ mod tests {
 
         // a1 still resting, untouched
         assert_eq!(ob.best_ask(), Some(px(100)));
-        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), 5);
+        assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(5));
         assert!(ob.index.contains_key(&id("a1")));
     }
 
@@ -1033,8 +1034,8 @@ mod tests {
         let report = ob.submit(fok_order(Side::Bid, 100, 10, "alice")).unwrap();
 
         assert_eq!(report.outcome, SubmitOutcome::Filled);
-        let filled: u64 = report.trades.iter().map(|t| t.quantity).sum();
-        assert_eq!(filled, 10);
+        let filled: Qty = report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, qty(10));
         assert_eq!(report.cancelled, vec![id("alice")]);
         assert_eq!(ob.best_ask(), None); // level fully drained
     }
@@ -1101,8 +1102,8 @@ mod tests {
         let stop_report = &report.triggered[0];
         assert_eq!(stop_report.outcome, SubmitOutcome::Filled);
         // fills the rest of 99 (5 left), then 5 more at 98
-        let filled: u64 = stop_report.trades.iter().map(|t| t.quantity).sum();
-        assert_eq!(filled, 10);
+        let filled: Qty = stop_report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, qty(10));
         assert_eq!(stop_report.trades.last().unwrap().price, px(98));
     }
 
@@ -1162,13 +1163,13 @@ mod tests {
 
         let stop_report = &report.triggered[0];
         assert_eq!(stop_report.outcome, SubmitOutcome::PartiallyFilledAndRested);
-        let filled: u64 = stop_report.trades.iter().map(|t| t.quantity).sum();
-        assert_eq!(filled, 20); // all of a2
+        let filled: Qty = stop_report.trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(filled, qty(20)); // all of a2
 
         // the unfilled 10 rests as a normal limit bid at 102
         assert_eq!(ob.best_bid(), Some(px(102)));
         let rested = ob.get_order(&stop_report.order_id).unwrap();
-        assert_eq!(rested.remaining_quantity, 10);
+        assert_eq!(rested.remaining_quantity, qty(10));
         assert_eq!(rested.order_type.limit_price(), Some(px(102)));
     }
 
@@ -1245,7 +1246,7 @@ mod tests {
         let mut ob = book();
         let maker = Order::builder()
             .side(Side::Ask)
-            .quantity(10)
+            .quantity(qty(10))
             .client_id("alice")
             .exchange_id("a1")
             .order_type(OrderType::limit_gtc(px(100)))
@@ -1254,7 +1255,7 @@ mod tests {
 
         let taker = Order::builder()
             .side(Side::Bid)
-            .quantity(5)
+            .quantity(qty(5))
             .client_id("alice") // same client as the resting order
             .exchange_id("t1")
             .order_type(OrderType::Market)

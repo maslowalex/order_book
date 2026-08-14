@@ -1,4 +1,4 @@
-use crate::instrument::InstrumentSpec;
+use crate::instrument::{InstrumentSpec, Qty};
 use crate::orderbook::OrderBook;
 use crate::types::{Order, OrderType, Price, PriceLevel, Side};
 
@@ -20,17 +20,23 @@ pub fn px(cents: i64) -> Price {
     Price::from_minor_unchecked(u64::try_from(cents).expect("test prices are non-negative"))
 }
 
+/// Base units as a `Qty`. The suite runs on a unit lot, so base units and
+/// lots coincide and every quantity literal in the tests reads unchanged.
+pub fn qty(n: u64) -> Qty {
+    Qty::from_base_unchecked(n)
+}
+
 /// A resting GTC limit maker (the only kind of order that can rest).
-pub fn order(side: Side, price: i64, qty: u64, remaining: Option<u64>, id: &str) -> Order {
+pub fn order(side: Side, price: i64, quantity: u64, remaining: Option<u64>, id: &str) -> Order {
     let mut builder = Order::builder()
         .side(side)
         .order_type(OrderType::limit_gtc(px(price)))
         .client_id(id)
         .exchange_id(id)
-        .quantity(qty);
+        .quantity(qty(quantity));
 
     if let Some(remaining) = remaining {
-        builder = builder.remaining_quantity(remaining);
+        builder = builder.remaining_quantity(qty(remaining));
     }
 
     builder.build()
