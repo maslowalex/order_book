@@ -74,6 +74,14 @@ impl OrderBook {
     /// limit orders) can never add one. The cascade's reports are collected
     /// flat into the returned report's `triggered`.
     pub fn submit(&mut self, mut order: Order) -> Result<ExecutionReport, OrderBookError> {
+        // Admission runs BEFORE the id is minted, so a rejected order consumes
+        // no sequence number and leaves the book bit-identical. `next_seq` is
+        // an order-id generator, not a message counter, and an order that was
+        // never accepted never became an order. (Real venues often burn an id
+        // instead, so the reject is addressable by id; that trade is worth
+        // knowing about — this choice buys a testable "nothing moved".)
+        self.admit(&order)?;
+
         // The exchange assigns the order's id on receipt — ignoring whatever id
         // the caller put on it — and advances the sequence for the next order.
         // Stamping it onto `order` before matching keeps the trades, any rested

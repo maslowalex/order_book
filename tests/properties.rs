@@ -16,6 +16,11 @@
 //!    exactly, and everything drains by cancelling every live id
 //! 7. Stop discipline: no pending stop whose trigger the market has already
 //!    reached survives a submit
+//! 8. Lattice closure: every price and quantity the book holds is still on
+//!    the instrument's tick/lot grid, checked where it is falsifiable — at
+//!    the `Decimal` boundary, not in the integers
+//! 9. Rejection is a no-op: an order outside the instrument's bounds leaves
+//!    the book bit-identical, sequence number included
 //!
 //! Prices and triggers are drawn from a tight tick grid (95.00–105.00, 0.25
 //! steps) so that random streams actually cross and stops actually fire;
@@ -25,9 +30,10 @@ use std::collections::HashMap;
 
 use order_book::instrument::{InstrumentSpec, Qty};
 use order_book::matching::{ExecutionReport, SubmitOutcome};
-use order_book::orderbook::{OrderBook, OrderLocation};
+use order_book::orderbook::{OrderBook, OrderBookError, OrderLocation};
 use order_book::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
+use rust_decimal::Decimal;
 
 // --- strategies ---------------------------------------------------------
 
@@ -59,6 +65,15 @@ fn arb_limit_price() -> impl Strategy<Value = Price> {
             .price_from_minor(ticks * 25)
             .expect("drawn on the tick grid")
     })
+}
+
+/// The same grid with size limits that bite: 5..=1000. `arb_order` draws
+/// 1..=50, so a stream against this spec is a realistic mix of accepted and
+/// rejected orders rather than a uniformly happy path.
+fn bounded_spec() -> InstrumentSpec {
+    spec()
+        .with_qty_range(qty(5), Some(qty(1000)))
+        .expect("5 and 1000 are whole lots")
 }
 
 fn arb_order_type() -> impl Strategy<Value = OrderType> {
@@ -166,417 +181,518 @@ fn fills_by_maker(report: &ExecutionReport) -> HashMap<ExchangeId, Qty> {
 // --- properties ---------------------------------------------------------
 
 proptest! {
-    /// Invariant 1 — conservation: for every execution (the submitted order
-    /// and each triggered stop), the original quantity is fully accounted for
-    /// by fills + rested remainder + killed remainder, and the reported
-    /// outcome agrees with where the quantity went. "Rested" is checked
-    /// net of any quantity that later executions in the same cascade already
-    /// consumed from it.
-    #[test]
-    fn conservation_per_submit(stream in arb_stream()) {
-        let mut book = OrderBook::new(spec());
-        // original quantity of every currently-parked stop, by assigned id
-        let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
+/// Invariant 1 — conservation: for every execution (the submitted order
+/// and each triggered stop), the original quantity is fully accounted for
+/// by fills + rested remainder + killed remainder, and the reported
+/// outcome agrees with where the quantity went. "Rested" is checked
+/// net of any quantity that later executions in the same cascade already
+/// consumed from it.
+#[test]
+fn conservation_per_submit(stream in arb_stream()) {
+    let mut book = OrderBook::new(spec());
+    // original quantity of every currently-parked stop, by assigned id
+    let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
 
-        for order in stream {
-            let original = order.original_quantity;
-            let order_type = order.order_type;
-            // order types whose unfilled remainder is discarded, not rested
-            let can_kill = matches!(
-                order.order_type,
-                OrderType::Market
-                    | OrderType::Limit { tif: TimeInForce::IOC | TimeInForce::FOK, .. }
-                    // an already-triggered stop activates immediately as market/limit
-                    | OrderType::StopMarket { .. }
-                    | OrderType::StopLimit { tif: TimeInForce::IOC | TimeInForce::FOK, .. }
-            );
-            let is_fok = matches!(
-                order.order_type,
-                OrderType::Limit { tif: TimeInForce::FOK, .. }
-            );
+    for order in stream {
+        let original = order.original_quantity;
+        let order_type = order.order_type;
+        // order types whose unfilled remainder is discarded, not rested
+        let can_kill = matches!(
+            order.order_type,
+            OrderType::Market
+                | OrderType::Limit { tif: TimeInForce::IOC | TimeInForce::FOK, .. }
+                // an already-triggered stop activates immediately as market/limit
+                | OrderType::StopMarket { .. }
+                | OrderType::StopLimit { tif: TimeInForce::IOC | TimeInForce::FOK, .. }
+        );
+        let is_fok = matches!(
+            order.order_type,
+            OrderType::Limit { tif: TimeInForce::FOK, .. }
+        );
 
-            let report = book.submit(order).unwrap();
-            let consumed_later = fills_by_maker(&report);
+        let report = book.submit(order).unwrap();
+        let consumed_later = fills_by_maker(&report);
 
-            for trade in all_reports(&report).flat_map(|r| &r.trades) {
-                prop_assert!(!trade.quantity.is_zero(), "zero-quantity trade");
+        for trade in all_reports(&report).flat_map(|r| &r.trades) {
+            prop_assert!(!trade.quantity.is_zero(), "zero-quantity trade");
+        }
+
+        // an order that rested during this submit can afterwards be
+        // self-trade-CANCELLED (not traded) by a same-client triggered
+        // stop; its remainder then vanishes without a fill to count
+        let stp_cancelled = |id: &ExchangeId| {
+            all_reports(&report).any(|r| r.cancelled.contains(id))
+        };
+
+        // -- the submitted order itself --
+        let filled: Qty = report.trades.iter().map(|t| t.quantity).sum();
+        let rested = rested_remaining(&book, &report.order_id);
+        let eaten = consumed_later.get(&report.order_id).copied().unwrap_or(Qty::ZERO);
+        let cancelled_later = stp_cancelled(&report.order_id);
+        match report.outcome {
+            SubmitOutcome::Filled => {
+                prop_assert_eq!(filled, original);
+                prop_assert_eq!(rested, None);
             }
+            SubmitOutcome::Rested => {
+                prop_assert!(report.trades.is_empty());
+                if cancelled_later {
+                    prop_assert_eq!(rested, None);
+                } else {
+                    prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, original);
+                }
+            }
+            SubmitOutcome::PartiallyFilledAndRested => {
+                prop_assert!(!filled.is_zero() && filled < original);
+                if cancelled_later {
+                    prop_assert_eq!(rested, None);
+                } else {
+                    prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, original - filled);
+                }
+            }
+            SubmitOutcome::Killed => {
+                prop_assert!(can_kill, "only market/IOC/FOK remainders are killed");
+                prop_assert!(filled < original);
+                if is_fok {
+                    // all-or-nothing: a killed FOK executed NOTHING —
+                    // no fills and no self-trade cancellations
+                    prop_assert_eq!(filled, Qty::ZERO, "FOK partially filled");
+                    prop_assert!(report.cancelled.is_empty());
+                }
+                prop_assert_eq!(rested, None);
+            }
+            SubmitOutcome::StopPending => {
+                let was_stop = matches!(
+                    order_type,
+                    OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+                );
+                prop_assert!(was_stop, "only stops can park");
+                prop_assert!(report.trades.is_empty());
+                prop_assert_eq!(parked_remaining(&book, &report.order_id), Some(original));
+                parked.insert(report.order_id.clone(), original);
+            }
+        }
 
-            // an order that rested during this submit can afterwards be
-            // self-trade-CANCELLED (not traded) by a same-client triggered
-            // stop; its remainder then vanishes without a fill to count
-            let stp_cancelled = |id: &ExchangeId| {
-                all_reports(&report).any(|r| r.cancelled.contains(id))
-            };
+        // -- every stop this submit triggered --
+        for r in &report.triggered {
+            let parked_original = parked
+                .remove(&r.order_id)
+                .expect("triggered stop must have been parked earlier");
+            prop_assert!(r.triggered.is_empty(), "cascade reports must be flat");
 
-            // -- the submitted order itself --
-            let filled: Qty = report.trades.iter().map(|t| t.quantity).sum();
-            let rested = rested_remaining(&book, &report.order_id);
-            let eaten = consumed_later.get(&report.order_id).copied().unwrap_or(Qty::ZERO);
-            let cancelled_later = stp_cancelled(&report.order_id);
-            match report.outcome {
+            let filled: Qty = r.trades.iter().map(|t| t.quantity).sum();
+            let rested = rested_remaining(&book, &r.order_id);
+            let eaten = consumed_later.get(&r.order_id).copied().unwrap_or(Qty::ZERO);
+            let cancelled_later = stp_cancelled(&r.order_id);
+            match r.outcome {
                 SubmitOutcome::Filled => {
-                    prop_assert_eq!(filled, original);
+                    prop_assert_eq!(filled, parked_original);
                     prop_assert_eq!(rested, None);
                 }
                 SubmitOutcome::Rested => {
-                    prop_assert!(report.trades.is_empty());
+                    prop_assert!(r.trades.is_empty());
                     if cancelled_later {
                         prop_assert_eq!(rested, None);
                     } else {
-                        prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, original);
+                        prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, parked_original);
                     }
                 }
                 SubmitOutcome::PartiallyFilledAndRested => {
-                    prop_assert!(!filled.is_zero() && filled < original);
+                    prop_assert!(!filled.is_zero() && filled < parked_original);
                     if cancelled_later {
                         prop_assert_eq!(rested, None);
                     } else {
-                        prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, original - filled);
+                        prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, parked_original - filled);
                     }
                 }
                 SubmitOutcome::Killed => {
-                    prop_assert!(can_kill, "only market/IOC/FOK remainders are killed");
-                    prop_assert!(filled < original);
-                    if is_fok {
-                        // all-or-nothing: a killed FOK executed NOTHING —
-                        // no fills and no self-trade cancellations
-                        prop_assert_eq!(filled, Qty::ZERO, "FOK partially filled");
-                        prop_assert!(report.cancelled.is_empty());
-                    }
+                    prop_assert!(filled < parked_original);
                     prop_assert_eq!(rested, None);
                 }
                 SubmitOutcome::StopPending => {
-                    let was_stop = matches!(
-                        order_type,
-                        OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
-                    );
-                    prop_assert!(was_stop, "only stops can park");
-                    prop_assert!(report.trades.is_empty());
-                    prop_assert_eq!(parked_remaining(&book, &report.order_id), Some(original));
-                    parked.insert(report.order_id.clone(), original);
-                }
-            }
-
-            // -- every stop this submit triggered --
-            for r in &report.triggered {
-                let parked_original = parked
-                    .remove(&r.order_id)
-                    .expect("triggered stop must have been parked earlier");
-                prop_assert!(r.triggered.is_empty(), "cascade reports must be flat");
-
-                let filled: Qty = r.trades.iter().map(|t| t.quantity).sum();
-                let rested = rested_remaining(&book, &r.order_id);
-                let eaten = consumed_later.get(&r.order_id).copied().unwrap_or(Qty::ZERO);
-                let cancelled_later = stp_cancelled(&r.order_id);
-                match r.outcome {
-                    SubmitOutcome::Filled => {
-                        prop_assert_eq!(filled, parked_original);
-                        prop_assert_eq!(rested, None);
-                    }
-                    SubmitOutcome::Rested => {
-                        prop_assert!(r.trades.is_empty());
-                        if cancelled_later {
-                            prop_assert_eq!(rested, None);
-                        } else {
-                            prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, parked_original);
-                        }
-                    }
-                    SubmitOutcome::PartiallyFilledAndRested => {
-                        prop_assert!(!filled.is_zero() && filled < parked_original);
-                        if cancelled_later {
-                            prop_assert_eq!(rested, None);
-                        } else {
-                            prop_assert_eq!(rested.unwrap_or(Qty::ZERO) + eaten, parked_original - filled);
-                        }
-                    }
-                    SubmitOutcome::Killed => {
-                        prop_assert!(filled < parked_original);
-                        prop_assert_eq!(rested, None);
-                    }
-                    SubmitOutcome::StopPending => {
-                        prop_assert!(false, "an activated stop can never re-park");
-                    }
+                    prop_assert!(false, "an activated stop can never re-park");
                 }
             }
         }
     }
+}
 
-    /// Invariant 2 — depth accounting: each submit (cascade included) changes
-    /// total book depth by exactly (quantity that came to rest) − (quantity
-    /// filled) − (quantity self-trade-cancelled). Rest-time quantities are
-    /// used, so intra-cascade consumption of freshly rested orders balances.
-    #[test]
-    fn book_depth_accounting(stream in arb_stream()) {
-        let mut book = OrderBook::new(spec());
-        let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
+/// Invariant 2 — depth accounting: each submit (cascade included) changes
+/// total book depth by exactly (quantity that came to rest) − (quantity
+/// filled) − (quantity self-trade-cancelled). Rest-time quantities are
+/// used, so intra-cascade consumption of freshly rested orders balances.
+#[test]
+fn book_depth_accounting(stream in arb_stream()) {
+    let mut book = OrderBook::new(spec());
+    let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
 
-        for order in stream {
-            let original = order.original_quantity;
-            let before = resting_snapshot(&book);
-            let depth_before = total_depth(&book);
+    for order in stream {
+        let original = order.original_quantity;
+        let before = resting_snapshot(&book);
+        let depth_before = total_depth(&book);
 
-            let report = book.submit(order).unwrap();
-            let fills = fills_by_maker(&report);
+        let report = book.submit(order).unwrap();
+        let fills = fills_by_maker(&report);
 
-            let mut filled_total = Qty::ZERO;
-            let mut rested_total = Qty::ZERO; // at rest time
-            let mut cancelled_total = Qty::ZERO; // remaining at cancel time
-            // rest-time quantity per order that rested during THIS submit
-            let mut rest_qty: HashMap<ExchangeId, Qty> = HashMap::new();
+        let mut filled_total = Qty::ZERO;
+        let mut rested_total = Qty::ZERO; // at rest time
+        let mut cancelled_total = Qty::ZERO; // remaining at cancel time
+        // rest-time quantity per order that rested during THIS submit
+        let mut rest_qty: HashMap<ExchangeId, Qty> = HashMap::new();
 
-            for (i, r) in all_reports(&report).enumerate() {
-                let exec_original = if i == 0 {
-                    original
-                } else {
-                    *parked.get(&r.order_id).expect("triggered stop was parked")
-                };
-                let filled: Qty = r.trades.iter().map(|t| t.quantity).sum();
-                filled_total += filled;
-
-                if matches!(
-                    r.outcome,
-                    SubmitOutcome::Rested | SubmitOutcome::PartiallyFilledAndRested
-                ) {
-                    let at_rest = exec_original - filled;
-                    rested_total += at_rest;
-                    rest_qty.insert(r.order_id.clone(), at_rest);
-                }
-
-                for id in &r.cancelled {
-                    // remaining at cancel = what it had when it (last) rested
-                    // minus everything traded against it this submit
-                    let start = before
-                        .get(id)
-                        .map(|(_, _, remaining)| *remaining)
-                        .or_else(|| rest_qty.get(id).copied())
-                        .expect("cancelled order rested before or during this submit");
-                    cancelled_total += start - fills.get(id).copied().unwrap_or(Qty::ZERO);
-                }
-            }
-            for r in &report.triggered {
-                parked.remove(&r.order_id);
-            }
-            if report.outcome == SubmitOutcome::StopPending {
-                parked.insert(report.order_id.clone(), original);
-            }
-
-            prop_assert_eq!(
-                i128::from(total_depth(&book).base()),
-                i128::from(depth_before.base()) + i128::from(rested_total.base())
-                    - i128::from(filled_total.base())
-                    - i128::from(cancelled_total.base())
-            );
-        }
-    }
-
-    /// Invariant 3 — price validity: every trade prints at the maker's resting
-    /// price, on the opposite side, never worse than a limit taker's price,
-    /// and each execution sweeps prices best-first (monotonically).
-    #[test]
-    fn trades_at_maker_price_within_taker_limit(stream in arb_stream()) {
-        let mut book = OrderBook::new(spec());
-
-        for order in stream {
-            let taker_side = order.side;
-            // Some(price) for limit takers, None for market takers; a stop's
-            // limit applies to the order it becomes, checked via `triggered`
-            let limit = match order.order_type {
-                OrderType::Limit { price, .. } => Some(price),
-                _ => None,
+        for (i, r) in all_reports(&report).enumerate() {
+            let exec_original = if i == 0 {
+                original
+            } else {
+                *parked.get(&r.order_id).expect("triggered stop was parked")
             };
+            let filled: Qty = r.trades.iter().map(|t| t.quantity).sum();
+            filled_total += filled;
 
-            let before = resting_snapshot(&book);
-            let report = book.submit(order).unwrap();
+            if matches!(
+                r.outcome,
+                SubmitOutcome::Rested | SubmitOutcome::PartiallyFilledAndRested
+            ) {
+                let at_rest = exec_original - filled;
+                rested_total += at_rest;
+                rest_qty.insert(r.order_id.clone(), at_rest);
+            }
 
-            for (i, r) in all_reports(&report).enumerate() {
-                let mut prev_price: Option<Price> = None;
-                for trade in &r.trades {
-                    // makers that rested before this submit must print at
-                    // their snapshot price; makers that rested mid-cascade
-                    // are covered by invariant 6's level==order price check
-                    if let Some((maker_side, maker_price, _)) = before.get(&trade.maker_order_id) {
-                        prop_assert_eq!(trade.price, *maker_price, "trade must print at maker's price");
-                        prop_assert_eq!(*maker_side, opposite(trade.taker_side));
-                    }
-                    prop_assert_eq!(&trade.taker_order_id, &r.order_id);
+            for id in &r.cancelled {
+                // remaining at cancel = what it had when it (last) rested
+                // minus everything traded against it this submit
+                let start = before
+                    .get(id)
+                    .map(|(_, _, remaining)| *remaining)
+                    .or_else(|| rest_qty.get(id).copied())
+                    .expect("cancelled order rested before or during this submit");
+                cancelled_total += start - fills.get(id).copied().unwrap_or(Qty::ZERO);
+            }
+        }
+        for r in &report.triggered {
+            parked.remove(&r.order_id);
+        }
+        if report.outcome == SubmitOutcome::StopPending {
+            parked.insert(report.order_id.clone(), original);
+        }
 
-                    if i == 0 {
-                        prop_assert_eq!(trade.taker_side, taker_side);
-                        if let Some(limit) = limit {
-                            match taker_side {
-                                Side::Bid => prop_assert!(trade.price <= limit),
-                                Side::Ask => prop_assert!(trade.price >= limit),
-                            }
+        prop_assert_eq!(
+            i128::from(total_depth(&book).base()),
+            i128::from(depth_before.base()) + i128::from(rested_total.base())
+                - i128::from(filled_total.base())
+                - i128::from(cancelled_total.base())
+        );
+    }
+}
+
+/// Invariant 3 — price validity: every trade prints at the maker's resting
+/// price, on the opposite side, never worse than a limit taker's price,
+/// and each execution sweeps prices best-first (monotonically).
+#[test]
+fn trades_at_maker_price_within_taker_limit(stream in arb_stream()) {
+    let mut book = OrderBook::new(spec());
+
+    for order in stream {
+        let taker_side = order.side;
+        // Some(price) for limit takers, None for market takers; a stop's
+        // limit applies to the order it becomes, checked via `triggered`
+        let limit = match order.order_type {
+            OrderType::Limit { price, .. } => Some(price),
+            _ => None,
+        };
+
+        let before = resting_snapshot(&book);
+        let report = book.submit(order).unwrap();
+
+        for (i, r) in all_reports(&report).enumerate() {
+            let mut prev_price: Option<Price> = None;
+            for trade in &r.trades {
+                // makers that rested before this submit must print at
+                // their snapshot price; makers that rested mid-cascade
+                // are covered by invariant 6's level==order price check
+                if let Some((maker_side, maker_price, _)) = before.get(&trade.maker_order_id) {
+                    prop_assert_eq!(trade.price, *maker_price, "trade must print at maker's price");
+                    prop_assert_eq!(*maker_side, opposite(trade.taker_side));
+                }
+                prop_assert_eq!(&trade.taker_order_id, &r.order_id);
+
+                if i == 0 {
+                    prop_assert_eq!(trade.taker_side, taker_side);
+                    if let Some(limit) = limit {
+                        match taker_side {
+                            Side::Bid => prop_assert!(trade.price <= limit),
+                            Side::Ask => prop_assert!(trade.price >= limit),
                         }
                     }
+                }
 
-                    // best price first within one execution's sweep
-                    if let Some(prev) = prev_price {
-                        match trade.taker_side {
-                            Side::Bid => prop_assert!(trade.price >= prev),
-                            Side::Ask => prop_assert!(trade.price <= prev),
-                        }
+                // best price first within one execution's sweep
+                if let Some(prev) = prev_price {
+                    match trade.taker_side {
+                        Side::Bid => prop_assert!(trade.price >= prev),
+                        Side::Ask => prop_assert!(trade.price <= prev),
                     }
-                    prev_price = Some(trade.price);
                 }
+                prev_price = Some(trade.price);
             }
         }
     }
+}
 
-    /// Invariant 4 — time priority: at any given price (and maker side),
-    /// makers are consumed in the order they RESTED there. Submission
-    /// sequence is not the right proxy once stops exist — a stop submitted
-    /// early (low sequence) can trigger and rest late, and correctly queues
-    /// behind orders already at its level. So the test stamps every order at
-    /// the moment it rests and checks stamps never decrease per level.
-    #[test]
-    fn same_price_fifo_priority(stream in arb_stream()) {
-        let mut book = OrderBook::new(spec());
-        let mut next_stamp: u64 = 0;
-        // order id → when it (last) came to rest in the book
-        let mut rest_stamp: HashMap<ExchangeId, u64> = HashMap::new();
-        // (maker side is Bid?, price) → stamp of the last maker traded there
-        let mut last_traded: HashMap<(bool, Price), u64> = HashMap::new();
+/// Invariant 4 — time priority: at any given price (and maker side),
+/// makers are consumed in the order they RESTED there. Submission
+/// sequence is not the right proxy once stops exist — a stop submitted
+/// early (low sequence) can trigger and rest late, and correctly queues
+/// behind orders already at its level. So the test stamps every order at
+/// the moment it rests and checks stamps never decrease per level.
+#[test]
+fn same_price_fifo_priority(stream in arb_stream()) {
+    let mut book = OrderBook::new(spec());
+    let mut next_stamp: u64 = 0;
+    // order id → when it (last) came to rest in the book
+    let mut rest_stamp: HashMap<ExchangeId, u64> = HashMap::new();
+    // (maker side is Bid?, price) → stamp of the last maker traded there
+    let mut last_traded: HashMap<(bool, Price), u64> = HashMap::new();
 
-        for order in stream {
-            let report = book.submit(order).unwrap();
+    for order in stream {
+        let report = book.submit(order).unwrap();
 
-            // walk executions in order: an execution can only consume orders
-            // that rested strictly before it, so stamps are always assigned
-            // before they're needed
-            for r in all_reports(&report) {
-                for trade in &r.trades {
-                    let maker_is_bid = opposite(trade.taker_side) == Side::Bid;
-                    let stamp = *rest_stamp
-                        .get(&trade.maker_order_id)
-                        .expect("maker must have rested before trading");
-                    let key = (maker_is_bid, trade.price);
-                    if let Some(&prev) = last_traded.get(&key) {
-                        prop_assert!(
-                            stamp >= prev,
-                            "FIFO violated at {:?}: maker stamped {} traded after {}",
-                            trade.price, stamp, prev
-                        );
-                    }
-                    last_traded.insert(key, stamp);
+        // walk executions in order: an execution can only consume orders
+        // that rested strictly before it, so stamps are always assigned
+        // before they're needed
+        for r in all_reports(&report) {
+            for trade in &r.trades {
+                let maker_is_bid = opposite(trade.taker_side) == Side::Bid;
+                let stamp = *rest_stamp
+                    .get(&trade.maker_order_id)
+                    .expect("maker must have rested before trading");
+                let key = (maker_is_bid, trade.price);
+                if let Some(&prev) = last_traded.get(&key) {
+                    prop_assert!(
+                        stamp >= prev,
+                        "FIFO violated at {:?}: maker stamped {} traded after {}",
+                        trade.price, stamp, prev
+                    );
                 }
-                if matches!(
-                    r.outcome,
-                    SubmitOutcome::Rested | SubmitOutcome::PartiallyFilledAndRested
-                ) {
-                    rest_stamp.insert(r.order_id.clone(), next_stamp);
-                    next_stamp += 1;
-                }
+                last_traded.insert(key, stamp);
+            }
+            if matches!(
+                r.outcome,
+                SubmitOutcome::Rested | SubmitOutcome::PartiallyFilledAndRested
+            ) {
+                rest_stamp.insert(r.order_id.clone(), next_stamp);
+                next_stamp += 1;
             }
         }
     }
+}
 
-    /// Invariant 5 — no crossing: after every submit the book is uncrossed.
-    #[test]
-    fn book_never_crossed_after_submit(stream in arb_stream()) {
-        let mut book = OrderBook::new(spec());
+/// Invariant 5 — no crossing: after every submit the book is uncrossed.
+#[test]
+fn book_never_crossed_after_submit(stream in arb_stream()) {
+    let mut book = OrderBook::new(spec());
 
-        for order in stream {
-            book.submit(order).unwrap();
-            if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
-                prop_assert!(bid < ask, "book crossed: bid {bid:?} >= ask {ask:?}");
-            }
+    for order in stream {
+        book.submit(order).unwrap();
+        if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+            prop_assert!(bid < ask, "book crossed: bid {bid:?} >= ask {ask:?}");
         }
     }
+}
 
-    /// Invariant 6 — index consistency: after any stream, `index`, the price
-    /// levels, AND the stop books describe exactly the same set of live
-    /// orders; every level/queue is non-empty and internally consistent; and
-    /// cancelling every indexed id drains everything to empty.
-    #[test]
-    fn index_matches_levels_and_book_drains(stream in arb_stream()) {
-        let mut book = OrderBook::new(spec());
-        for order in stream {
-            book.submit(order).unwrap();
+/// Invariant 6 — index consistency: after any stream, `index`, the price
+/// levels, AND the stop books describe exactly the same set of live
+/// orders; every level/queue is non-empty and internally consistent; and
+/// cancelling every indexed id drains everything to empty.
+#[test]
+fn index_matches_levels_and_book_drains(stream in arb_stream()) {
+    let mut book = OrderBook::new(spec());
+    for order in stream {
+        book.submit(order).unwrap();
+    }
+
+    let mut live_orders = 0usize;
+    for (key, level) in &book.asks {
+        prop_assert!(!level.orders.is_empty(), "empty level left in asks");
+        prop_assert_eq!(level.side, Side::Ask);
+        prop_assert_eq!(&level.price, key);
+        for o in &level.orders {
+            live_orders += 1;
+            prop_assert!(!o.remaining_quantity.is_zero());
+            // everything resting must be a limit at its level's price
+            prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
+            let expected = OrderLocation::Book { side: Side::Ask, price: level.price };
+            prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
         }
-
-        let mut live_orders = 0usize;
-        for (key, level) in &book.asks {
-            prop_assert!(!level.orders.is_empty(), "empty level left in asks");
-            prop_assert_eq!(level.side, Side::Ask);
-            prop_assert_eq!(&level.price, key);
-            for o in &level.orders {
+    }
+    for (key, level) in &book.bids {
+        prop_assert!(!level.orders.is_empty(), "empty level left in bids");
+        prop_assert_eq!(level.side, Side::Bid);
+        prop_assert_eq!(level.price, key.0);
+        for o in &level.orders {
+            live_orders += 1;
+            prop_assert!(!o.remaining_quantity.is_zero());
+            prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
+            let expected = OrderLocation::Book { side: Side::Bid, price: level.price };
+            prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
+        }
+    }
+    for (side, stops) in [(Side::Bid, &book.stop_bids), (Side::Ask, &book.stop_asks)] {
+        for (trigger, queue) in stops {
+            prop_assert!(!queue.is_empty(), "empty stop queue left behind");
+            for o in queue {
                 live_orders += 1;
+                prop_assert_eq!(o.side, side);
                 prop_assert!(!o.remaining_quantity.is_zero());
-                // everything resting must be a limit at its level's price
-                prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
-                let expected = OrderLocation::Book { side: Side::Ask, price: level.price };
+                let is_stop = matches!(
+                    o.order_type,
+                    OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+                );
+                prop_assert!(is_stop, "non-stop order parked in the stop book");
+                let expected = OrderLocation::StopBook { side, trigger: *trigger };
                 prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
             }
         }
-        for (key, level) in &book.bids {
-            prop_assert!(!level.orders.is_empty(), "empty level left in bids");
-            prop_assert_eq!(level.side, Side::Bid);
-            prop_assert_eq!(level.price, key.0);
-            for o in &level.orders {
-                live_orders += 1;
-                prop_assert!(!o.remaining_quantity.is_zero());
-                prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
-                let expected = OrderLocation::Book { side: Side::Bid, price: level.price };
-                prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
-            }
-        }
-        for (side, stops) in [(Side::Bid, &book.stop_bids), (Side::Ask, &book.stop_asks)] {
-            for (trigger, queue) in stops {
-                prop_assert!(!queue.is_empty(), "empty stop queue left behind");
-                for o in queue {
-                    live_orders += 1;
-                    prop_assert_eq!(o.side, side);
-                    prop_assert!(!o.remaining_quantity.is_zero());
-                    let is_stop = matches!(
-                        o.order_type,
-                        OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
-                    );
-                    prop_assert!(is_stop, "non-stop order parked in the stop book");
-                    let expected = OrderLocation::StopBook { side, trigger: *trigger };
-                    prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
-                }
-            }
-        }
-        prop_assert_eq!(live_orders, book.index.len(), "index and structures disagree");
+    }
+    prop_assert_eq!(live_orders, book.index.len(), "index and structures disagree");
 
-        let ids: Vec<ExchangeId> = book.index.keys().cloned().collect();
-        for id in ids {
-            prop_assert!(book.cancel_order(id).is_ok());
+    let ids: Vec<ExchangeId> = book.index.keys().cloned().collect();
+    for id in ids {
+        prop_assert!(book.cancel_order(id).is_ok());
+    }
+    prop_assert!(book.bids.is_empty());
+    prop_assert!(book.asks.is_empty());
+    prop_assert!(book.stop_bids.is_empty());
+    prop_assert!(book.stop_asks.is_empty());
+    prop_assert!(book.index.is_empty());
+}
+
+/// Invariant 7 — stop discipline: after every submit, every still-pending
+/// stop's trigger is strictly beyond the last trade price. If it weren't,
+/// the cascade failed to fire it.
+#[test]
+fn no_satisfied_stop_left_pending(stream in arb_stream()) {
+    let mut book = OrderBook::new(spec());
+
+    for order in stream {
+        book.submit(order).unwrap();
+        if let Some(last) = book.last_trade_price {
+            for trigger in book.stop_bids.keys() {
+                prop_assert!(
+                    *trigger > last,
+                    "pending buy stop at {:?} but market already traded {:?}",
+                    trigger, last
+                );
+            }
+            for trigger in book.stop_asks.keys() {
+                prop_assert!(
+                    *trigger < last,
+                    "pending sell stop at {:?} but market already traded {:?}",
+                    trigger, last
+                );
+            }
         }
-        prop_assert!(book.bids.is_empty());
-        prop_assert!(book.asks.is_empty());
-        prop_assert!(book.stop_bids.is_empty());
-        prop_assert!(book.stop_asks.is_empty());
-        prop_assert!(book.index.is_empty());
+    }
+}
+
+    /// Invariant 8 — lattice closure.
+    ///
+    /// Note where this is asserted: on the `Decimal` the spec renders, not
+    /// on the integer it stores. Asking whether `price.minor()` is a tick
+    /// multiple would be unfalsifiable — `Price` cannot hold anything else,
+    /// which is the entire point of the type — so the interesting question
+    /// is whether the *conversion* still agrees. A `to_decimal` that
+    /// dropped a digit, or a scale that drifted, shows up here and nowhere
+    /// else.
+    ///
+    /// Matching is what makes this worth checking rather than obvious:
+    /// fills subtract from resting quantities on every trade, so a level
+    /// that started on the grid has been arithmetic'd many times by the
+    /// end of a 60-order stream.
+    #[test]
+    fn everything_the_book_holds_stays_on_the_lattice(
+        orders in prop::collection::vec(arb_order(), 1..60)
+    ) {
+        let spec = spec();
+        let tick = spec.tick_decimal();
+        let lot = spec.lot_decimal();
+        let mut book = OrderBook::new(spec);
+
+        for order in orders {
+            let report = book.submit(order).unwrap();
+
+            for trade in all_reports(&report).flat_map(|r| &r.trades) {
+                let q = spec.qty_to_decimal(trade.quantity);
+                prop_assert_eq!(q % lot, Decimal::ZERO, "trade quantity off the lot grid");
+                let p = spec.to_decimal(trade.price);
+                prop_assert_eq!(p % tick, Decimal::ZERO, "trade price off the tick grid");
+            }
+        }
+
+        let levels = book.bids.values().chain(book.asks.values());
+        for level in levels {
+            let p = spec.to_decimal(level.price);
+            prop_assert_eq!(p % tick, Decimal::ZERO, "level price off the tick grid");
+            prop_assert_eq!(spec.price(p).unwrap(), level.price, "price lost in conversion");
+
+            for o in &level.orders {
+                let q = spec.qty_to_decimal(o.remaining_quantity);
+                prop_assert_eq!(q % lot, Decimal::ZERO, "resting quantity off the lot grid");
+                prop_assert_eq!(spec.qty(q).unwrap(), o.remaining_quantity,
+                    "quantity lost in conversion");
+            }
+        }
+
+        let parked = book.stop_bids.iter().chain(book.stop_asks.iter());
+        for (trigger, queue) in parked {
+            let t = spec.to_decimal(*trigger);
+            prop_assert_eq!(t % tick, Decimal::ZERO, "stop trigger off the tick grid");
+            for o in queue {
+                let q = spec.qty_to_decimal(o.remaining_quantity);
+                prop_assert_eq!(q % lot, Decimal::ZERO, "parked quantity off the lot grid");
+            }
+        }
     }
 
-    /// Invariant 7 — stop discipline: after every submit, every still-pending
-    /// stop's trigger is strictly beyond the last trade price. If it weren't,
-    /// the cascade failed to fire it.
+    /// Invariant 9 — a rejected order is not an order.
+    ///
+    /// Admission runs before the exchange id is minted, so a reject must
+    /// leave *everything* as it was, `next_seq` included. Burning a
+    /// sequence number on something that never became an order would punch
+    /// a hole in the id space; asserting on `next_seq` is what makes that
+    /// choice a checked property rather than a comment.
     #[test]
-    fn no_satisfied_stop_left_pending(stream in arb_stream()) {
-        let mut book = OrderBook::new(spec());
-
+    fn a_rejected_order_leaves_the_book_untouched(
+        stream in prop::collection::vec(arb_order(), 0..30),
+        too_small in 1u64..5,
+        side in arb_side(),
+        price in arb_limit_price(),
+    ) {
+        let mut book = OrderBook::new(bounded_spec());
         for order in stream {
-            book.submit(order).unwrap();
-            if let Some(last) = book.last_trade_price {
-                for trigger in book.stop_bids.keys() {
-                    prop_assert!(
-                        *trigger > last,
-                        "pending buy stop at {:?} but market already traded {:?}",
-                        trigger, last
-                    );
-                }
-                for trigger in book.stop_asks.keys() {
-                    prop_assert!(
-                        *trigger < last,
-                        "pending sell stop at {:?} but market already traded {:?}",
-                        trigger, last
-                    );
-                }
-            }
+            // some of these are themselves rejected — that is the point
+            let _ = book.submit(order);
         }
+
+        let resting_before = resting_snapshot(&book);
+        let depth_before = total_depth(&book);
+        let seq_before = book.next_seq;
+        let stops_before = book.stop_bids.len() + book.stop_asks.len();
+
+        let bad = Order::builder()
+            .side(side)
+            .order_type(OrderType::limit_gtc(price))
+            .quantity(qty(too_small))
+            .client_id("rejected")
+            .exchange_id("rejected")
+            .build();
+
+        let err = book.submit(bad).expect_err("below the size minimum");
+        prop_assert!(matches!(err, OrderBookError::Rejected(_)), "got {err:?}");
+
+        prop_assert_eq!(book.next_seq, seq_before, "a reject must not burn an id");
+        prop_assert_eq!(total_depth(&book), depth_before);
+        prop_assert_eq!(resting_snapshot(&book), resting_before);
+        prop_assert_eq!(book.stop_bids.len() + book.stop_asks.len(), stops_before);
     }
 }

@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::instrument::{InstrumentSpec, Qty, Ticks};
+use crate::instrument::{InstrumentSpec, Qty, RejectReason, Ticks};
 use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
 
 /// Where a live order physically is — needed by `cancel_order`/`get_order`
@@ -54,6 +54,10 @@ pub enum OrderBookError {
     /// stops park in the stop book until triggered. Before `OrderType` carried
     /// its price, `add_order` would silently rest a market order at 0.00.
     NotRestable,
+    /// Well-formed, on the lattice, and outside what this instrument accepts.
+    /// Note what is NOT here: an off-tick price or an off-lot quantity, which
+    /// no longer have a way to reach the engine at all.
+    Rejected(RejectReason),
 }
 
 impl OrderBook {
@@ -81,10 +85,52 @@ impl OrderBook {
         self.spec
     }
 
+    /// The instrument's admission policy, applied to one order.
+    ///
+    /// Both doors call this — `submit` and `add_order` — because `add_order`
+    /// is public and rests orders without matching, so leaving it ungated
+    /// would reopen the exact hole this work closed: a way into the book that
+    /// skips the checks.
+    ///
+    /// Only bounds are checked. Tick and lot alignment cannot be violated by
+    /// anything that reached this far, because `Price` and `Qty` cannot hold
+    /// an off-grid value.
+    pub(crate) fn admit(&self, order: &Order) -> Result<(), OrderBookError> {
+        for price in order.order_type.prices().into_iter().flatten() {
+            self.spec
+                .admits_price(price)
+                .map_err(OrderBookError::Rejected)?;
+        }
+        self.spec
+            .admits_qty(order.original_quantity)
+            .map_err(OrderBookError::Rejected)?;
+
+        // Min-notional only applies where a price is known at ingress.
+        // `Market` and `StopMarket` carry none — `limit_price()` returns
+        // `None` for both — so their value is genuinely unknowable here.
+        // Real venues substitute a reference price; this one skips, and says
+        // so rather than pretending the rule was applied.
+        //
+        // Note also what is NOT enforced: a partial fill can leave a resting
+        // remainder worth less than the floor. That dust is allowed to rest.
+        // Cancelling it would make quantity vanish without a corresponding
+        // fill, which is precisely what the conservation and depth-accounting
+        // properties forbid — so it would be a much larger change than it
+        // looks, and it belongs with a deliberate dust policy, not here.
+        if let Some(price) = order.order_type.limit_price() {
+            self.spec
+                .admits_notional(price, order.original_quantity)
+                .map_err(OrderBookError::Rejected)?;
+        }
+
+        Ok(())
+    }
+
     pub fn add_order(&mut self, order: Order) -> Result<(), OrderBookError> {
         let OrderType::Limit { price, .. } = order.order_type else {
             return Err(OrderBookError::NotRestable);
         };
+        self.admit(&order)?;
         let side = order.side;
         let exchange_id = order.exchange_id.clone();
 
@@ -254,7 +300,9 @@ A: At any moment when a LIMIT order arrives, we must check if it crosses the spr
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::instrument::{RejectReason, SpecError};
     use crate::test_helpers::{book, order, px, qty};
+    use rust_decimal::Decimal;
 
     /// A non-crossed book: bids 99/98/97, asks 100/101/102.
     /// best_bid = 99, best_ask = 100, spread = 1.
@@ -607,5 +655,170 @@ mod test {
                 "crosses({side:?}, {price}) should be {expected}",
             );
         }
+    }
+
+    // ---------------------------------------------------------- admission
+
+    /// Cents, a one-cent tick, and bounds that actually bite: prices in
+    /// 1.00..=200.00, sizes in 5..=1000.
+    fn bounded_spec() -> InstrumentSpec {
+        InstrumentSpec::cents()
+            .with_price_range(
+                Price::from_minor_unchecked(100),
+                Some(Price::from_minor_unchecked(20_000)),
+            )
+            .unwrap()
+            .with_qty_range(qty(5), Some(qty(1000)))
+            .unwrap()
+    }
+
+    #[test]
+    fn submit_rejects_a_quantity_below_the_minimum() {
+        let mut ob = OrderBook::new(bounded_spec());
+        let result = ob.submit(order(Side::Bid, 5000, 4, None, "small"));
+
+        assert_eq!(
+            result,
+            Err(OrderBookError::Rejected(
+                RejectReason::QuantityBelowMinimum {
+                    qty: qty(4),
+                    min: qty(5),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn submit_rejects_a_price_outside_the_band() {
+        let mut ob = OrderBook::new(bounded_spec());
+
+        assert!(matches!(
+            ob.submit(order(Side::Bid, 50, 10, None, "cheap")),
+            Err(OrderBookError::Rejected(
+                RejectReason::PriceBelowMinimum { .. }
+            ))
+        ));
+        assert!(matches!(
+            ob.submit(order(Side::Ask, 30_000, 10, None, "dear")),
+            Err(OrderBookError::Rejected(
+                RejectReason::PriceAboveMaximum { .. }
+            ))
+        ));
+    }
+
+    /// A rejected order is not an order: it consumes no sequence number, rests
+    /// nothing, and indexes nothing. `next_seq` is an id generator, so burning
+    /// one on something that never became an order would leave a hole.
+    #[test]
+    fn a_rejected_submit_leaves_the_book_bit_identical() {
+        let mut ob = OrderBook::new(bounded_spec());
+        ob.submit(order(Side::Bid, 5000, 10, None, "good"))
+            .expect("within bounds");
+
+        let seq_before = ob.next_seq;
+        let depth_before = ob.depth(Side::Bid, 10);
+        let index_before = ob.index.len();
+
+        assert!(ob.submit(order(Side::Bid, 5000, 4, None, "small")).is_err());
+
+        assert_eq!(ob.next_seq, seq_before, "a reject must not burn an id");
+        assert_eq!(ob.depth(Side::Bid, 10), depth_before);
+        assert_eq!(ob.index.len(), index_before);
+    }
+
+    /// `add_order` is public and rests without matching, so it is a second
+    /// door into the book and gets the same lock.
+    #[test]
+    fn add_order_is_gated_too() {
+        let mut ob = OrderBook::new(bounded_spec());
+        let result = ob.add_order(order(Side::Bid, 5000, 4, None, "small"));
+
+        assert!(matches!(
+            result,
+            Err(OrderBookError::Rejected(
+                RejectReason::QuantityBelowMinimum { .. }
+            ))
+        ));
+        assert!(ob.bids.is_empty());
+        assert!(ob.index.is_empty());
+    }
+
+    /// A stop's trigger is a price on the same grid as any other, so the band
+    /// applies to it — `limit_price()` alone would have missed this one, since
+    /// a StopMarket has no limit price at all.
+    #[test]
+    fn a_stop_trigger_is_checked_against_the_band() {
+        let mut ob = OrderBook::new(bounded_spec());
+        let stop = Order::builder()
+            .side(Side::Bid)
+            .quantity(qty(10))
+            .client_id("s")
+            .exchange_id("s")
+            .order_type(OrderType::stop_market(px(50)))
+            .build();
+
+        assert!(matches!(
+            ob.submit(stop),
+            Err(OrderBookError::Rejected(
+                RejectReason::PriceBelowMinimum { .. }
+            ))
+        ));
+    }
+
+    /// $10 floor, cents, unit lot — so the notional lattice is hundredths and
+    /// the threshold is 1000 raw units.
+    fn min_notional_spec() -> InstrumentSpec {
+        InstrumentSpec::cents()
+            .with_min_notional(Decimal::new(10, 0))
+            .unwrap()
+    }
+
+    #[test]
+    fn submit_rejects_an_order_worth_less_than_the_floor() {
+        let mut ob = OrderBook::new(min_notional_spec());
+
+        // $0.10 x 99 == $9.90
+        assert!(matches!(
+            ob.submit(order(Side::Bid, 10, 99, None, "dust")),
+            Err(OrderBookError::Rejected(
+                RejectReason::NotionalBelowMinimum { .. }
+            ))
+        ));
+
+        // $0.10 x 100 == $10.00 exactly, which clears the floor
+        assert!(ob.submit(order(Side::Bid, 10, 100, None, "exact")).is_ok());
+    }
+
+    /// A market order has no price at ingress, so its notional is unknowable
+    /// and the rule cannot apply. It must pass, not fail closed — the book
+    /// says so out loud rather than pretending the check ran.
+    #[test]
+    fn a_market_order_skips_the_notional_floor() {
+        let mut ob = OrderBook::new(min_notional_spec());
+        ob.add_order(order(Side::Ask, 10, 100, None, "maker"))
+            .expect("clears the floor");
+
+        let taker = Order::builder()
+            .side(Side::Bid)
+            .quantity(qty(1))
+            .client_id("t")
+            .exchange_id("t")
+            .order_type(OrderType::Market)
+            .build();
+
+        assert!(ob.submit(taker).is_ok());
+    }
+
+    /// The other half of the story: an off-tick price never reaches admission,
+    /// because it cannot be built. This is the difference between a rule the
+    /// book enforces and a rule the type system discharges.
+    #[test]
+    fn an_off_tick_price_cannot_even_be_constructed() {
+        let spec = InstrumentSpec::new(2, 0, 25, 1).unwrap();
+
+        assert!(matches!(
+            spec.price_from_minor(10_003),
+            Err(SpecError::PriceOffTick { .. })
+        ));
     }
 }

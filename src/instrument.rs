@@ -255,6 +255,24 @@ pub enum SpecError {
     InvalidSpec(&'static str),
 }
 
+/// Why an otherwise well-formed order was not admitted.
+///
+/// Distinct from [`SpecError`], and the distinction is the point. A `SpecError`
+/// says the value is not on the lattice — a property of the value, settled at
+/// the boundary, and unrepresentable once past it. A `RejectReason` says the
+/// value is a perfectly good point that this instrument declines to accept:
+/// admission *policy*, which depends on the spec's bounds rather than on the
+/// number. Only the second kind can reach the engine, which is why only the
+/// second kind appears in `OrderBookError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    PriceBelowMinimum { price: Price, min: Price },
+    PriceAboveMaximum { price: Price, max: Price },
+    QuantityBelowMinimum { qty: Qty, min: Qty },
+    QuantityAboveMaximum { qty: Qty, max: Qty },
+    NotionalBelowMinimum { notional: Notional, min: Notional },
+}
+
 /// The contract specification: what a legal price and a legal quantity look
 /// like for one instrument.
 ///
@@ -348,6 +366,29 @@ impl InstrumentSpec {
         }
         self.min_price = min;
         self.max_price = max;
+        Ok(self)
+    }
+
+    /// A floor on price × quantity, given in the quote currency.
+    ///
+    /// Converted to lattice units **once, here, rounded UP**. "At least X"
+    /// means that if X lands 3.2 lattice units above zero, 3 units is below the
+    /// stated minimum and 4 is the smallest admissible value; rounding down
+    /// would quietly admit orders under the floor the venue published.
+    pub fn with_min_notional(mut self, min_notional: Decimal) -> Result<Self, SpecError> {
+        // The notional lattice is finer than either input lattice: one unit is
+        // one minor price unit times one base quantity unit, so the scale is
+        // the sum.
+        let scale = self
+            .price_scale
+            .checked_add(self.qty_scale)
+            .ok_or(SpecError::InvalidSpec("price_scale + qty_scale overflows"))?;
+
+        let raw = ceil_scaled(min_notional, scale).ok_or(SpecError::InvalidSpec(
+            "min_notional is negative or too large for the notional lattice",
+        ))?;
+
+        self.min_notional = Some(Notional(raw));
         Ok(self)
     }
 
@@ -540,6 +581,99 @@ impl InstrumentSpec {
     /// the right width.
     pub fn notional(&self, price: Price, qty: Qty) -> Notional {
         Notional(u128::from(price.0) * u128::from(qty.0))
+    }
+
+    // ------------------------------------------------------------- admission
+
+    /// Is this price within the instrument's band?
+    ///
+    /// Separate from [`InstrumentSpec::price`] on purpose: tick alignment is a
+    /// property of the value and is discharged by the type, while a band is
+    /// policy the venue can change without any existing `Price` becoming
+    /// malformed. Folding the two together would mean a perfectly well-formed
+    /// price could not be named in a test that does not care about bands.
+    pub fn admits_price(&self, price: Price) -> Result<(), RejectReason> {
+        if price < self.min_price {
+            return Err(RejectReason::PriceBelowMinimum {
+                price,
+                min: self.min_price,
+            });
+        }
+        if let Some(max) = self.max_price
+            && price > max
+        {
+            return Err(RejectReason::PriceAboveMaximum { price, max });
+        }
+        Ok(())
+    }
+
+    /// Is this quantity within the instrument's size limits? The default
+    /// `min_qty` of one lot is what makes a zero-quantity order impossible
+    /// without anyone writing a `qty > 0` check.
+    pub fn admits_qty(&self, qty: Qty) -> Result<(), RejectReason> {
+        if qty < self.min_qty {
+            return Err(RejectReason::QuantityBelowMinimum {
+                qty,
+                min: self.min_qty,
+            });
+        }
+        if let Some(max) = self.max_qty
+            && qty > max
+        {
+            return Err(RejectReason::QuantityAboveMaximum { qty, max });
+        }
+        Ok(())
+    }
+
+    /// Is this order worth enough to be worth matching?
+    ///
+    /// The only rule here that needs price and quantity at the same time, and
+    /// so the only one that multiplies across the two lattices. Both sides are
+    /// integers and the product is exact, so "just above the floor" and "just
+    /// below it" are decided without a rounding step anywhere.
+    pub fn admits_notional(&self, price: Price, qty: Qty) -> Result<(), RejectReason> {
+        let Some(min) = self.min_notional else {
+            return Ok(());
+        };
+        let notional = self.notional(price, qty);
+        if notional < min {
+            return Err(RejectReason::NotionalBelowMinimum { notional, min });
+        }
+        Ok(())
+    }
+
+    pub fn notional_to_decimal(&self, notional: Notional) -> Decimal {
+        Decimal::from_i128_with_scale(notional.0 as i128, self.price_scale + self.qty_scale)
+    }
+}
+
+/// `ceil(d · 10^scale)` as a `u128`, or `None` if `d` is negative or the result
+/// does not fit.
+///
+/// Mantissa arithmetic for the same reason [`split_minor`] uses it — `Decimal`
+/// multiplication can round at the 28th digit, and a threshold that rounds is
+/// not a threshold. Unlike `split_minor` this returns `u128`, because the
+/// notional lattice is the product of two `u64` lattices and does not fit in
+/// either.
+fn ceil_scaled(d: Decimal, scale: u32) -> Option<u128> {
+    let mantissa = d.mantissa();
+    if mantissa < 0 {
+        return None;
+    }
+    let m = mantissa as u128;
+    let value_scale = d.scale();
+
+    if scale >= value_scale {
+        let shift = 10u128.checked_pow(scale - value_scale)?;
+        m.checked_mul(shift)
+    } else {
+        let shift = 10u128.checked_pow(value_scale - scale)?;
+        let (quotient, remainder) = (m / shift, m % shift);
+        if remainder > 0 {
+            quotient.checked_add(1)
+        } else {
+            Some(quotient)
+        }
     }
 }
 
@@ -840,6 +974,71 @@ mod tests {
         let qty = spec.qty(dec("3")).unwrap();
 
         assert_eq!(spec.notional(price, qty).raw(), 10025 * 3);
+    }
+
+    // -------------------------------------------------------- min notional
+
+    /// "At least X" rounds UP into lattice units. With cents and whole
+    /// quantities the notional lattice is hundredths, so a floor of $10.005 is
+    /// 1000.5 units — and 1000 would be below the published minimum, so the
+    /// admissible threshold is 1001.
+    #[test]
+    fn a_min_notional_that_lands_between_units_rounds_up() {
+        let spec = InstrumentSpec::cents()
+            .with_min_notional(dec("10.005"))
+            .unwrap();
+
+        assert_eq!(spec.min_notional().unwrap().raw(), 1001);
+    }
+
+    #[test]
+    fn a_min_notional_on_a_unit_boundary_is_exact() {
+        let spec = InstrumentSpec::cents()
+            .with_min_notional(dec("10"))
+            .unwrap();
+
+        assert_eq!(spec.min_notional().unwrap().raw(), 1000);
+    }
+
+    #[test]
+    fn notional_admission_compares_without_rounding() {
+        let spec = InstrumentSpec::cents()
+            .with_min_notional(dec("10"))
+            .unwrap();
+
+        // $0.10 x 100 == $10.00 exactly: admitted, and the comparison is
+        // integer 1000 >= 1000 with no epsilon anywhere.
+        let price = spec.price(dec("0.10")).unwrap();
+        assert!(
+            spec.admits_notional(price, spec.qty(dec("100")).unwrap())
+                .is_ok()
+        );
+
+        // one unit short
+        assert!(matches!(
+            spec.admits_notional(price, spec.qty(dec("99")).unwrap()),
+            Err(RejectReason::NotionalBelowMinimum { .. })
+        ));
+    }
+
+    #[test]
+    fn a_negative_min_notional_is_not_a_spec() {
+        assert!(matches!(
+            InstrumentSpec::cents().with_min_notional(dec("-1")),
+            Err(SpecError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn notional_renders_back_to_the_quote_currency() {
+        let spec = InstrumentSpec::cents();
+        let price = spec.price(dec("100.25")).unwrap();
+        let qty = spec.qty(dec("3")).unwrap();
+
+        assert_eq!(
+            spec.notional_to_decimal(spec.notional(price, qty)),
+            dec("300.75")
+        );
     }
 
     /// The widest product two `u64`s can make still fits, with one bit to

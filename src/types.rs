@@ -98,6 +98,24 @@ impl OrderType {
             OrderType::Market | OrderType::StopMarket { .. } => None,
         }
     }
+
+    /// Every price this order carries — a limit price, a trigger, or both.
+    ///
+    /// A fixed-size array rather than a `Vec` or a boxed iterator: this runs
+    /// once per submitted order on the ingress path, and a heap allocation to
+    /// hand back at most two `u64`s would be absurd. Callers `.flatten()` it.
+    ///
+    /// A trigger is as much a price as a limit is — it is quoted on the same
+    /// grid and compared against the same last-trade price — so admission has
+    /// to see both, which is why `limit_price()` alone is not enough here.
+    pub fn prices(&self) -> [Option<Price>; 2] {
+        match self {
+            OrderType::Limit { price, .. } => [Some(*price), None],
+            OrderType::Market => [None, None],
+            OrderType::StopMarket { trigger } => [Some(*trigger), None],
+            OrderType::StopLimit { trigger, price, .. } => [Some(*trigger), Some(*price)],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

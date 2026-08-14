@@ -1,6 +1,8 @@
 # Benchmark Results
 
-Two full runs of the Criterion suite in `benches/order_book.rs`, side by side:
+Three full runs of the Criterion suite in `benches/order_book.rs`. The first two are compared
+side by side below; the third — the tick/lot migration — is its own A/B at the end of this file,
+because it was measured against its own immediate parent rather than against `phase62`.
 
 - **`phase62`** — 2026-08-05, the **Tier 0 baseline** the 6.2a storage bake-off is measured
   against (saved as criterion baseline `phase62`).
@@ -111,6 +113,9 @@ mildly worse", not as a measured 13%.
    *unchanged* at 88.5 µs, because there the cost is ~2.5k orders × 2 heap String allocations,
    and a wider struct body is invisible next to that. Same operation, opposite sensitivity to
    the same change — which of the two you benchmark decides what you conclude.
+   **Partly superseded** — the 2026-08-14 run shrank `Order` by 16 bytes and this benchmark did
+   not improve, so the +20% is probably not per-`Order` copy cost after all. See observation 6
+   of the tick/lot section.
 4. **An enum pays for its widest variant, on every value.** `OrderType` (`src/types.rs:40`) is
    sized by `StopLimit { trigger, price, tif }` — two `Decimal`s — so every *plain limit* resting
    in the book carries stop-shaped padding it will never use. That is the running cost of making
@@ -147,3 +152,147 @@ mildly worse", not as a measured 13%.
 Two criterion warnings ("Unable to complete 20 samples in 2.0s") fired again on the slowest 100k
 configs (`add_order/wide/100000`, `cancel_order/wide/100000`); sample counts were still ≥10, so
 estimates stand. Raise that group's `measurement_time` if re-runs look noisy.
+
+---
+
+# Tick/lot migration (2026-08-14)
+
+`Price` stopped being an alias for `rust_decimal::Decimal` and became a `u64` count of the
+instrument's minor units; quantity became `Qty(u64)`; the book gained an `InstrumentSpec` and
+admission checks on `submit`/`add_order`.
+
+- **`pre-ticks`** — criterion baseline saved at `d39cac3` (`Price = Decimal`, `instrument`
+  module present but unused by the engine). Its absolute numbers land within run-to-run
+  variance of the "now" column above, so it stands in for the post-Phase-4 state.
+- **`post`** — the migration, *including* the new ingress admission checks. Every figure below
+  is therefore **net of work that was added**, not just work that was removed.
+
+Same machine and toolchain as the runs above. Reproduce with
+`cargo bench --bench order_book -- --baseline pre-ticks`. Note the `--bench order_book`: plain
+`cargo bench` also runs the lib's default test harness, which rejects criterion's flags.
+
+**Predictions were written down before the comparison run** (`scratchpad/predictions.md`), per
+the Phase 6.2 methodology note. They are scored in observation 5.
+
+## Core operations (per op)
+
+| Benchmark | pre-ticks | post | Δ |
+|---|---:|---:|---:|
+| `add_order/tight/100` | 106 ns | 85 ns | **−18%** |
+| `add_order/tight/1000` | 94 ns | 76 ns | **−19%** |
+| `add_order/tight/10000` | 84 ns | 68 ns | **−20%** |
+| `add_order/tight/100000` | 99 ns | 85 ns | **−14%** |
+| `add_order/wide/100` | 94 ns | 71 ns | **−23%** |
+| `add_order/wide/1000` | 114 ns | 78 ns | **−32%** |
+| `add_order/wide/10000` | 152 ns | 97 ns | **−37%** |
+| `add_order/wide/100000` | 366 ns | 263 ns | **−26%** |
+| `cancel_order/tight/100` | 109 ns | 91 ns | **−18%** |
+| `cancel_order/tight/1000` | 143 ns | 127 ns | **−11%** |
+| `cancel_order/tight/10000` | 541 ns | 494 ns | **−9%** |
+| `cancel_order/tight/100000` | 4.76 µs | 4.51 µs | **−5%** |
+| `cancel_order/wide/100` | 163 ns | 119 ns | **−27%** |
+| `cancel_order/wide/1000` | 194 ns | 120 ns | **−37%** |
+| `cancel_order/wide/10000` | 224 ns | 157 ns | **−31%** |
+| `cancel_order/wide/100000` | 401 ns | 370 ns | **−11%** |
+
+## Top-of-book reads (single op)
+
+| Benchmark | pre-ticks | post | Δ |
+|---|---:|---:|---:|
+| `best_bid` (tight/100) | 1.3268 ns | 1.3310 ns | — |
+| `best_bid` (tight/100k) | 1.3304 ns | 1.3332 ns | — |
+| `best_bid` (wide/100) | 1.3274 ns | 1.3295 ns | — |
+| `best_bid` (wide/100k) | 2.6549 ns | 2.6591 ns | — |
+| `spread` (tight/100k) | 2.6608 ns | 1.8582 ns | **−30%** |
+| `best_bid_level_clone` (tight/100k) | 89.6 µs | 87.3 µs | −3% |
+| `best_bid_level_clone` (wide/100k) | 190 ns | 193 ns | +3% |
+
+## Matching path (`submit`, per op)
+
+| Benchmark | pre-ticks | post | Δ |
+|---|---:|---:|---:|
+| `rest_limit/tight/10000` | 344 ns | 296 ns | **−15%** |
+| `rest_limit/wide/10000` | 217 ns | 177 ns | **−18%** |
+| `cross_limit/levels/1` | 1.66 µs | 1.63 µs | −1% |
+| `cross_limit/levels/5` | 7.44 µs | 7.27 µs | −3% |
+| `cross_limit/levels/20` | 28.59 µs | 27.76 µs | −3% |
+| `market/levels/1` | 1.66 µs | 1.63 µs | −1% |
+| `market/levels/20` | 28.30 µs | 27.54 µs | −2% |
+
+## Scenarios (per op)
+
+| Benchmark | pre-ticks | post | Δ |
+|---|---:|---:|---:|
+| `burst_1000/tight` | 373 ns | 346 ns | **−7%** |
+| `burst_1000/wide` | 311 ns | 285 ns | **−8%** |
+| `cancel_storm/tight/10000` | 333 ns | 308 ns | **−8%** |
+| `cancel_storm/tight/100000` | 2.60 µs | 2.36 µs | **−9%** |
+| `cancel_storm/wide/10000` | 226 ns | 169 ns | **−25%** |
+| `cancel_storm/wide/100000` | 365 ns | 268 ns | **−27%** |
+
+## Observations
+
+1. **Two changes landed together and cannot be separated by this measurement.** `Decimal`'s
+   `Ord` goes through `cmp_impl`, which aligns two scales before it can answer; `u64`'s is one
+   instruction, and every `BTreeMap` probe pays it at every level of the descent. But `Order`
+   also shrank — measured, not assumed: `OrderType` **36 → 24 bytes**, `Order` **128 → 112**,
+   because `StopLimit { trigger, price, tif }` stopped carrying two 16-byte `Decimal`s. Both
+   effects push the same direction on the same benchmarks. Splitting them needs an artificial
+   intermediate commit; nothing here should be attributed wholly to comparison cost.
+
+2. **The distribution split predicted by "comparison-bound vs scan-bound" held, and it is the
+   strongest result in the run.** `add_order` improves 14–20% tight but 23–37% wide;
+   `cancel_order` 5–18% tight but 11–37% wide; `cancel_storm` 8–9% tight but 25–27% wide. Wide
+   at N=100k spreads orders over ~20k levels, so the tree is deep and the work really is key
+   comparison. Tight packs ~2.5k orders into ~40 levels, so time goes into the `Vec` scan inside
+   a level — which no key type can help, and which is still the 6.2a Tier 2 motivation.
+
+3. **`spread()` got 30% faster while doing strictly more work.** It went from one `Decimal`
+   subtraction to an integer `abs_diff` **plus a division** (it now returns `Ticks`, so it
+   converts a currency difference into a tick count). Finishing ahead anyway is the cleanest
+   single illustration of what `Decimal` arithmetic was costing.
+
+4. **The matching path is flat, again.** `cross_limit` and `market` move −1…−3%, which is where
+   they sat when stops were added too. The fill loop's cost is `Vec` manipulation, `String`
+   clones for trade ids, and quantity arithmetic — the price key never enters it. Two
+   consecutive changes to the price representation have now both failed to move this group,
+   which is a fact about where the time is, not about either change.
+
+5. **Scoring the predictions.** Four of five held; one failed outright.
+   - *Held:* wide beats tight on `add_order`/`cancel_order` (the headline call, and the stated
+     falsification test — if wide had not improved, the whole `Decimal`-cost premise was wrong).
+   - *Held:* `best_bid` unchanged at 1.33 ns; the fill loop flat; `cancel_storm/tight` barely
+     moving relative to wide.
+   - *Too pessimistic:* `submit/rest_limit` was predicted to be "a small win, possibly a wash on
+     tight" because of the new admission checks. It came in at −15%/−18%, the same order as
+     `add_order`. The per-order bounds check and the one `u128` multiply for min-notional are
+     not measurable next to what the key change bought.
+   - **Failed: `best_bid_level_clone` was predicted to be the cleanest exhibit of the `Order`
+     shrink, and it is not.** Tight/100k moved −3%, wide/100k **+3%** — the wrong direction,
+     against a struct that verifiably lost 16 bytes per element.
+
+6. **Why that failure matters: observation 3 of the Phase 4 run needs revising.** That
+   observation read `best_bid_level_clone/wide/100k` **+20%** as "per-`Order` copy cost almost
+   neat" because the level holds only ~5 orders. Running the same benchmark against a 16-byte
+   *reduction* produced no gain at all. Cloning 5 `Order`s means **10 heap allocations** —
+   `ExchangeId` and `ClientId` are both `String` — and at 190 ns those allocations dominate a
+   16-byte-per-element copy difference completely. The earlier +20% is more likely attributable
+   to something else in Phase 4, or to noise at this scale, than to struct width. The lesson the
+   old observation drew (same operation, opposite sensitivity depending on N) survives; the
+   specific attribution does not. Deciding it properly is a Phase 6.3 profiling job.
+
+7. **The `String` ids are now the visible ceiling.** They were always the plan's known cost, but
+   with `Decimal` gone they are what is left holding up `best_bid_level_clone` (observation 6),
+   `PriceLevel::remove_order`'s scan (String compares, `src/types.rs`), and the trade-id clones
+   in the fill loop. 6.2a Tier 2's `u32` handles address all three at once.
+
+8. **Ballpark throughput today**: ~2.9M mixed orders/sec tight, ~3.5M wide (burst scenario),
+   single-threaded — up from ~2.7M/~3.3M, and now above the `phase62` figures the Phase 4 work
+   had dipped below. Cancel at tight/100k remains the tail problem at 4.51 µs; it improved 5%,
+   which is the smallest gain in the whole table and exactly where the linear scan lives.
+
+9. **What this did not buy.** The migration's case was never only speed: `100.0` and `100.00`
+   were `Ord`-equal but distinct `Decimal`s, so they collided onto one level while the level kept
+   whichever scale created it first — making the scale a trade printed at depend on arrival
+   order. That bug is gone by construction, as is any off-tick price or off-lot quantity. Had the
+   wide-distribution numbers come back flat, that would still have been the result worth keeping.

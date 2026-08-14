@@ -8,7 +8,14 @@
 * 2. quantity > 0 — no zero fills ("allocated" means "touched", and STP keys off exactly that)
 * 3. quantity <= orders[order_index].remaining_quantity
 * 4. Σ quantity == min(available, total)
+* 5. every quantity is a whole number of lots
 *
+* (5) needs no runtime check and gets none. Every input is a lot multiple
+* because `Qty` cannot hold anything else, and both allocators preserve that:
+* FIFO because the minimum of two multiples is a multiple, pro-rata because it
+* is told the lot and floors to it. The clause is written down anyway, because
+* the one algorithm that could break it looks correct without it — see the
+* counterexample on `ProRataMatcher`.
 */
 
 use crate::instrument::Qty;
@@ -62,11 +69,66 @@ impl MatchingAlgorithm for FifoMatcher {
 }
 
 /// Proportional allocation: each resting order gets `available * qty / total`
-/// rounded DOWN, and the leftover crumbs go by time priority — front of the
-/// queue first. The floor pass alone always under-allocates, so the remainder
-/// pass is not a refinement, it is what makes contract (4) reachable at all.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ProRataMatcher;
+/// rounded DOWN to a whole number of lots, and the leftover lots go by time
+/// priority — front of the queue first. The floor pass alone always
+/// under-allocates, so the remainder pass is not a refinement, it is what
+/// makes contract (4) reachable at all.
+///
+/// # Why this one has to know the lot size
+///
+/// Floor division does not preserve divisibility, and the consequence is not a
+/// rounding nicety — it is state corruption. Lot size `10`, makers holding
+/// `[10, 20]`, taker bringing `10`:
+///
+/// ```text
+/// f₁ = ⌊10·10/30⌋ = 3     f₂ = ⌊10·20/30⌋ = 6     Σ = 9
+/// remainder 1 → front by time priority → fills [4, 6]
+/// ```
+///
+/// Neither `4` nor `6` is a whole lot. Worse than a bad print: the engine
+/// subtracts those fills from the makers, which are left resting at `6` and
+/// `14` — permanently off-lot, sitting in the book, visible in `depth()`, and
+/// available to be matched again. The lattice would leak, one partial fill at
+/// a time, and no amount of care in the remainder pass repairs a floor pass
+/// that already left the grid.
+///
+/// This is specific to pro-rata. FIFO takes `min(left, remaining)`, and the
+/// minimum of two lot multiples is a lot multiple — FIFO is closed under the
+/// lattice for free and needs to know nothing about lots. Pro-rata is the only
+/// allocator in this crate that can leave the grid, so it is the only one that
+/// has to be told where the grid is.
+///
+/// # Why the fix is exact rather than approximate
+///
+/// Write `available = L·a`, `qᵢ = L·cᵢ`, `total = L·C`, and floor each share to
+/// a lot multiple: `fᵢ = L·⌊a·cᵢ/C⌋`. Then:
+///
+/// - every `fᵢ` is a lot multiple by construction;
+/// - the shortfall `R = available − Σfᵢ` is a non-negative lot multiple, and is
+///   smaller than `n·L` because each floor discards strictly less than one lot;
+/// - every maker still holding something has at least one lot of headroom,
+///   because `available < total` puts its share strictly below its own
+///   remaining.
+///
+/// So a single front-to-back sweep handing out one lot at a time places exactly
+/// `R`, needs no second pass, and leaves `Σ = min(available, total)` — in whole
+/// lots. The `available ≥ total` branch gives every maker its full remaining,
+/// which is a lot multiple already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProRataMatcher {
+    lot_size: u64,
+}
+
+impl ProRataMatcher {
+    /// Takes the lot in base units — `InstrumentSpec::lot_size()`. There is no
+    /// `Default`: a matcher that guessed `1` would silently produce off-lot
+    /// fills on every instrument that is not unit-lot, and it would look right
+    /// in every unit-lot test.
+    pub fn new(lot_size: u64) -> Self {
+        assert!(lot_size > 0, "lot_size must be non-zero");
+        ProRataMatcher { lot_size }
+    }
+}
 
 impl MatchingAlgorithm for ProRataMatcher {
     fn allocate(&self, available: Qty, orders: &[Order]) -> Vec<Fill> {
@@ -77,6 +139,10 @@ impl MatchingAlgorithm for ProRataMatcher {
         // the arithmetic through the type would hide exactly the overflow this
         // code exists to avoid.
         let available = available.base();
+        debug_assert!(
+            available.is_multiple_of(self.lot_size),
+            "a taker's quantity is a lot multiple by construction"
+        );
         let total: u128 = orders
             .iter()
             .map(|o| u128::from(o.remaining_quantity.base()))
@@ -101,36 +167,52 @@ impl MatchingAlgorithm for ProRataMatcher {
         // Floor pass. Below this line `available < total`, so every maker with
         // anything left floors STRICTLY below its own remaining — which is
         // what guarantees the remainder pass always has somewhere to put a
-        // crumb, and why the two passes cannot be reordered.
+        // lot, and why the two passes cannot be reordered.
         //
         // The product needs 128 bits. `available` and `remaining_quantity` are
         // both u64, so `available * qty` overflows u64 at sizes an exchange
         // sees routinely; `total` can overflow it before any multiply even
         // happens, from two makers alone.
+        //
+        // The second division is the lot floor. Nesting the two is exact —
+        // ⌊⌊x/m⌋/n⌋ == ⌊x/(m·n)⌋ over the non-negative integers — so this is
+        // the `L·⌊a·cᵢ/C⌋` of the doc comment, written the way it reads.
+        let lot = u128::from(self.lot_size);
         let mut shares: Vec<u64> = orders
             .iter()
             .map(|o| {
-                (u128::from(available) * u128::from(o.remaining_quantity.base()) / total) as u64
+                let exact = u128::from(available) * u128::from(o.remaining_quantity.base()) / total;
+                ((exact / lot) * lot) as u64
             })
             .collect();
 
         // Remainder pass. Each floor above discarded strictly less than one
-        // unit, and only makers holding something discard anything at all, so
-        // `left` is strictly smaller than the number of such makers — a single
-        // front-to-back sweep handing out one unit each places all of it, with
-        // no need to wrap around. Time priority decides who eats the crumbs,
-        // which is the whole reason pro-rata is not monotone in size.
+        // LOT, and only makers holding something discard anything at all, so
+        // `left` is under one lot per such maker — a single front-to-back
+        // sweep handing out one lot each places all of it, with no need to
+        // wrap around. Time priority decides who eats the crumbs, which is the
+        // whole reason pro-rata is not monotone in size.
+        //
+        // Headroom is tested by subtraction rather than by `shares[i] + lot <=
+        // remaining`: `shares[i]` can sit within a lot of `u64::MAX` on a level
+        // that large, and the addition would overflow before the comparison
+        // could reject it.
         let mut left: u64 = available - shares.iter().sum::<u64>();
 
         for (i, order) in orders.iter().enumerate() {
             if left == 0 {
                 break;
             }
-            if shares[i] < order.remaining_quantity.base() {
-                shares[i] += 1;
-                left -= 1;
+            if order.remaining_quantity.base() - shares[i] >= self.lot_size {
+                shares[i] += self.lot_size;
+                left -= self.lot_size;
             }
         }
+
+        debug_assert_eq!(
+            left, 0,
+            "one sweep must place every leftover lot — see the headroom argument above"
+        );
 
         // Contract (2): a maker allocated nothing is ABSENT from the result,
         // not present with quantity 0 — downstream reads "appears in fills" as
@@ -160,6 +242,12 @@ mod tests {
     /// coincide and the numbers below read the same as they always did.
     fn qty(n: u64) -> Qty {
         Qty::from_base_unchecked(n)
+    }
+
+    /// The matcher the pre-lot cases run against. Unit lot, so every
+    /// quantity is a whole lot and the numbers read exactly as before.
+    fn pro_rata() -> ProRataMatcher {
+        ProRataMatcher::new(1)
     }
 
     fn fill(order_index: usize, quantity: u64) -> Fill {
@@ -233,7 +321,7 @@ mod tests {
     /// A maker whose share is zero and who gets no crumb is ABSENT from
     /// `fills` rather than present with quantity 0, which the lookup default
     /// accounts for.
-    fn assert_proportional(fills: &[Fill], available: Qty, orders: &[Order]) {
+    fn assert_proportional(fills: &[Fill], available: Qty, orders: &[Order], lot: u64) {
         let available = available.base();
         let total: u128 = orders
             .iter()
@@ -252,14 +340,18 @@ mod tests {
             .collect();
 
         for (i, order) in orders.iter().enumerate() {
-            let floor_share = (u128::from(available) * u128::from(order.remaining_quantity.base())
-                / total) as u64;
+            let exact = u128::from(available) * u128::from(order.remaining_quantity.base()) / total;
+            let floor_share = ((exact / u128::from(lot)) * u128::from(lot)) as u64;
             let got = allocated.get(&i).copied().unwrap_or(0);
 
             assert!(
-                got == floor_share || got == floor_share + 1,
-                "maker {i} (qty {:?}) got {got}, expected its floor share {floor_share} or one crumb more",
+                got == floor_share || got == floor_share + lot,
+                "maker {i} (qty {:?}) got {got}, expected its lot-floored share {floor_share} or one lot more",
                 order.remaining_quantity
+            );
+            assert!(
+                got.is_multiple_of(lot),
+                "(5) maker {i} got {got}, which is not a whole number of {lot}-unit lots"
             );
         }
     }
@@ -374,17 +466,17 @@ mod tests {
     #[test]
     fn pro_rata_splits_the_textbook_example_evenly() {
         let orders = level_of(&[100, 200, 300]);
-        let fills = ProRataMatcher.allocate(qty(300), &orders);
+        let fills = pro_rata().allocate(qty(300), &orders);
 
         assert_eq!(fills, vec![fill(0, 50), fill(1, 100), fill(2, 150),]);
         assert_contract(&fills, qty(300), &orders);
-        assert_proportional(&fills, qty(300), &orders);
+        assert_proportional(&fills, qty(300), &orders, 1);
     }
 
     #[test]
     fn pro_rata_taker_larger_than_the_level_takes_everything() {
         let orders = level_of(&[10, 20, 30]);
-        let fills = ProRataMatcher.allocate(qty(1000), &orders);
+        let fills = pro_rata().allocate(qty(1000), &orders);
 
         assert_eq!(fills, vec![fill(0, 10), fill(1, 20), fill(2, 30),]);
         assert_contract(&fills, qty(1000), &orders);
@@ -395,7 +487,7 @@ mod tests {
     #[test]
     fn pro_rata_taker_exactly_the_level_takes_everything() {
         let orders = level_of(&[10, 20, 30]);
-        let fills = ProRataMatcher.allocate(qty(60), &orders);
+        let fills = pro_rata().allocate(qty(60), &orders);
 
         assert_eq!(fills.iter().map(|f| f.quantity.base()).sum::<u64>(), 60);
         assert_eq!(fills.len(), 3);
@@ -407,11 +499,11 @@ mod tests {
     #[test]
     fn pro_rata_hands_a_single_crumb_to_the_front() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = ProRataMatcher.allocate(qty(10), &orders);
+        let fills = pro_rata().allocate(qty(10), &orders);
 
         assert_eq!(fills, vec![fill(0, 4), fill(1, 3), fill(2, 3),]);
         assert_contract(&fills, qty(10), &orders);
-        assert_proportional(&fills, qty(10), &orders);
+        assert_proportional(&fills, qty(10), &orders, 1);
     }
 
     /// Eleven across the same three: floors to 3 each again, but now there are
@@ -420,11 +512,11 @@ mod tests {
     #[test]
     fn pro_rata_walks_the_queue_placing_every_crumb() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = ProRataMatcher.allocate(qty(11), &orders);
+        let fills = pro_rata().allocate(qty(11), &orders);
 
         assert_eq!(fills, vec![fill(0, 4), fill(1, 4), fill(2, 3),]);
         assert_contract(&fills, qty(11), &orders);
-        assert_proportional(&fills, qty(11), &orders);
+        assert_proportional(&fills, qty(11), &orders, 1);
     }
 
     /// The counterexample to keep: `[3, 4]` taking 3 floors to `[1, 1]`, and
@@ -435,11 +527,11 @@ mod tests {
     #[test]
     fn pro_rata_is_not_monotone_in_size() {
         let orders = level_of(&[3, 4]);
-        let fills = ProRataMatcher.allocate(qty(3), &orders);
+        let fills = pro_rata().allocate(qty(3), &orders);
 
         assert_eq!(fills, vec![fill(0, 2), fill(1, 1),]);
         assert_contract(&fills, qty(3), &orders);
-        assert_proportional(&fills, qty(3), &orders);
+        assert_proportional(&fills, qty(3), &orders, 1);
     }
 
     /// A taker too small to give anyone a proportional unit: every share
@@ -450,11 +542,11 @@ mod tests {
     #[test]
     fn pro_rata_degenerates_to_fifo_for_a_tiny_taker() {
         let orders = level_of(&[10, 10, 10]);
-        let fills = ProRataMatcher.allocate(qty(1), &orders);
+        let fills = pro_rata().allocate(qty(1), &orders);
 
         assert_eq!(fills, vec![fill(0, 1)]);
         assert_contract(&fills, qty(1), &orders);
-        assert_proportional(&fills, qty(1), &orders);
+        assert_proportional(&fills, qty(1), &orders, 1);
     }
 
     /// Every share floors to zero and the crumbs alone decide the outcome:
@@ -463,11 +555,11 @@ mod tests {
     #[test]
     fn pro_rata_allocates_purely_from_the_remainder_pass() {
         let orders = level_of(&[1, 1, 1, 1]);
-        let fills = ProRataMatcher.allocate(qty(3), &orders);
+        let fills = pro_rata().allocate(qty(3), &orders);
 
         assert_eq!(fills, vec![fill(0, 1), fill(1, 1), fill(2, 1),]);
         assert_contract(&fills, qty(3), &orders);
-        assert_proportional(&fills, qty(3), &orders);
+        assert_proportional(&fills, qty(3), &orders, 1);
     }
 
     /// A zero-quantity maker adds nothing to `total`, floors to zero, has no
@@ -477,17 +569,17 @@ mod tests {
     #[test]
     fn pro_rata_skips_a_zero_remaining_order() {
         let orders = level_of(&[10, 0, 10]);
-        let fills = ProRataMatcher.allocate(qty(15), &orders);
+        let fills = pro_rata().allocate(qty(15), &orders);
 
         assert_eq!(fills, vec![fill(0, 8), fill(2, 7),]);
         assert_contract(&fills, qty(15), &orders);
-        assert_proportional(&fills, qty(15), &orders);
+        assert_proportional(&fills, qty(15), &orders, 1);
     }
 
     #[test]
     fn pro_rata_empty_level_yields_no_fills() {
         let orders = level_of(&[]);
-        let fills = ProRataMatcher.allocate(qty(100), &orders);
+        let fills = pro_rata().allocate(qty(100), &orders);
 
         assert!(fills.is_empty());
         assert_contract(&fills, qty(100), &orders);
@@ -499,7 +591,7 @@ mod tests {
     #[test]
     fn pro_rata_nothing_available_yields_no_fills() {
         let orders = level_of(&[10, 10]);
-        let fills = ProRataMatcher.allocate(qty(0), &orders);
+        let fills = pro_rata().allocate(qty(0), &orders);
 
         assert!(fills.is_empty());
         assert_contract(&fills, qty(0), &orders);
@@ -513,7 +605,7 @@ mod tests {
     #[test]
     fn pro_rata_survives_products_that_overflow_u64() {
         let orders = level_of(&[10_000_000_000_000_000_000, 8_000_000_000_000_000_000]);
-        let fills = ProRataMatcher.allocate(qty(9_000_000_000_000_000_000), &orders);
+        let fills = pro_rata().allocate(qty(9_000_000_000_000_000_000), &orders);
 
         assert_eq!(
             fills,
@@ -531,10 +623,88 @@ mod tests {
     #[test]
     fn pro_rata_survives_a_level_total_that_overflows_u64() {
         let orders = level_of(&[u64::MAX, u64::MAX]);
-        let fills = ProRataMatcher.allocate(qty(100), &orders);
+        let fills = pro_rata().allocate(qty(100), &orders);
 
         assert_eq!(fills, vec![fill(0, 50), fill(1, 50),]);
         assert_contract(&fills, qty(100), &orders);
+    }
+
+    // -------------------------------------------------------- PRO-RATA LOTS
+
+    /// The counterexample from `ProRataMatcher`'s doc comment, executable.
+    ///
+    /// A lot-blind allocator produces `[4, 6]` here — the naive floor shares
+    /// are 3 and 6, and the single leftover unit goes to the front. Both are
+    /// off-lot, and the engine would then leave the makers resting at 6 and 14,
+    /// off-lot too. The lot-aware answer floors both shares to zero and hands
+    /// the whole leftover lot to the front by time priority.
+    #[test]
+    fn pro_rata_never_splits_a_lot() {
+        let orders = level_of(&[10, 20]);
+        let fills = ProRataMatcher::new(10).allocate(qty(10), &orders);
+
+        assert_eq!(fills, vec![fill(0, 10)]);
+        assert_contract(&fills, qty(10), &orders);
+        assert_proportional(&fills, qty(10), &orders, 10);
+    }
+
+    /// The lot floor bites before the crumbs do: 5 lots of 10 across makers of
+    /// 10/20/30 gives exact shares 8.3/16.6/25, which floor to 0/10/20 — so 20
+    /// of the 50 is still unplaced and the sweep walks the queue handing out
+    /// one lot each.
+    #[test]
+    fn pro_rata_walks_the_queue_placing_whole_lots() {
+        let orders = level_of(&[10, 20, 30]);
+        let fills = ProRataMatcher::new(10).allocate(qty(50), &orders);
+
+        assert_eq!(
+            fills,
+            vec![fill(0, 10), fill(1, 20), fill(2, 20)],
+            "shares floor to 0/10/20, then one lot each to the front three"
+        );
+        assert_contract(&fills, qty(50), &orders);
+        assert_proportional(&fills, qty(50), &orders, 10);
+    }
+
+    /// A taker smaller than one lot cannot exist — `Qty` cannot hold it — so
+    /// the smallest real case is exactly one lot, and pro-rata degenerates to
+    /// giving it to the front of the queue.
+    #[test]
+    fn pro_rata_gives_a_lone_lot_to_the_front() {
+        let orders = level_of(&[100, 100, 100]);
+        let fills = ProRataMatcher::new(100).allocate(qty(100), &orders);
+
+        assert_eq!(fills, vec![fill(0, 100)]);
+        assert_contract(&fills, qty(100), &orders);
+    }
+
+    /// Taking everything needs no lot arithmetic at all: each maker's full
+    /// remaining is already a whole number of lots.
+    #[test]
+    fn pro_rata_takes_the_whole_level_in_lots() {
+        let orders = level_of(&[10, 20, 30]);
+        let fills = ProRataMatcher::new(10).allocate(qty(1000), &orders);
+
+        assert_eq!(fills, vec![fill(0, 10), fill(1, 20), fill(2, 30)]);
+        assert_contract(&fills, qty(1000), &orders);
+    }
+
+    /// A lot big enough to swallow every proportional share leaves the
+    /// remainder sweep as the only mechanism that allocates anything — the
+    /// lot-scale echo of `pro_rata_allocates_purely_from_the_remainder_pass`.
+    #[test]
+    fn pro_rata_allocates_purely_from_the_lot_sweep() {
+        let orders = level_of(&[500, 500, 500, 500]);
+        let fills = ProRataMatcher::new(500).allocate(qty(1500), &orders);
+
+        assert_eq!(fills, vec![fill(0, 500), fill(1, 500), fill(2, 500)]);
+        assert_contract(&fills, qty(1500), &orders);
+    }
+
+    #[test]
+    #[should_panic(expected = "lot_size must be non-zero")]
+    fn a_zero_lot_matcher_is_rejected_loudly() {
+        ProRataMatcher::new(0);
     }
 
     // ------------------------------------------------------ BOTH MATCHERS
@@ -560,9 +730,54 @@ mod tests {
             let fifo = FifoMatcher.allocate(available, &orders);
             assert_contract(&fifo, available, &orders);
 
-            let pro_rata = ProRataMatcher.allocate(available, &orders);
+            let pro_rata = pro_rata().allocate(available, &orders);
             assert_contract(&pro_rata, available, &orders);
-            assert_proportional(&pro_rata, available, &orders);
+            assert_proportional(&pro_rata, available, &orders, 1);
+        }
+
+        /// The same contract on a level where lots actually bind. Every input
+        /// is scaled to a multiple of `lot`, exactly as an `InstrumentSpec`
+        /// would have produced it — so a fill that is not a whole lot is a
+        /// real defect and not an artefact of the generator.
+        ///
+        /// Running only the unit-lot case above would have made clause (5)
+        /// vacuous: with `lot == 1` every integer is a whole lot, and a
+        /// pro-rata that ignored lots entirely would pass.
+        #[test]
+        fn pro_rata_honours_the_contract_on_a_non_unit_lot(
+            available_lots in 0u64..100_000,
+            lots in prop::collection::vec(0u64..1_000, 0..24),
+            lot in prop::sample::select(vec![2u64, 5, 10, 100]),
+        ) {
+            let quantities: Vec<u64> = lots.iter().map(|c| c * lot).collect();
+            let orders = level_of(&quantities);
+            let available = qty(available_lots * lot);
+
+            let fills = ProRataMatcher::new(lot).allocate(available, &orders);
+
+            assert_contract(&fills, available, &orders);
+            assert_proportional(&fills, available, &orders, lot);
+        }
+
+        /// FIFO needs no lot parameter, and this is why: `min(left, remaining)`
+        /// of two lot multiples is a lot multiple, so the grid survives without
+        /// the allocator knowing it exists.
+        #[test]
+        fn fifo_stays_on_the_lot_grid_without_being_told_about_it(
+            available_lots in 0u64..100_000,
+            lots in prop::collection::vec(0u64..1_000, 0..24),
+            lot in prop::sample::select(vec![2u64, 5, 10, 100]),
+        ) {
+            let quantities: Vec<u64> = lots.iter().map(|c| c * lot).collect();
+            let orders = level_of(&quantities);
+            let available = qty(available_lots * lot);
+
+            let fills = FifoMatcher.allocate(available, &orders);
+
+            assert_contract(&fills, available, &orders);
+            for f in &fills {
+                prop_assert!(f.quantity.base().is_multiple_of(lot));
+            }
         }
     }
 }
