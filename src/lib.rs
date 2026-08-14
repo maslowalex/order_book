@@ -1,4 +1,4 @@
-pub mod algorithms;
+pub mod allocation;
 pub mod instrument;
 pub mod matching;
 pub mod orderbook;
