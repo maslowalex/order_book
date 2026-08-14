@@ -1,3 +1,4 @@
+use crate::allocation::{FifoMatcher, MatchingAlgorithm};
 use crate::instrument::{InstrumentSpec, Qty};
 use crate::orderbook::OrderBook;
 use crate::types::{Order, OrderType, Price, PriceLevel, Side};
@@ -8,8 +9,15 @@ pub fn spec() -> InstrumentSpec {
     InstrumentSpec::cents()
 }
 
-pub fn book() -> OrderBook {
-    OrderBook::new(spec())
+/// The default book for the unit suite: price-time priority, which is what
+/// every assertion about *which* maker filled was written against.
+pub fn book() -> OrderBook<FifoMatcher> {
+    OrderBook::new(spec(), FifoMatcher)
+}
+
+/// The same grid under a different allocation policy.
+pub fn book_with<M: MatchingAlgorithm>(matcher: M) -> OrderBook<M> {
+    OrderBook::new(spec(), matcher)
 }
 
 /// A price from a whole number of cents. The signature is unchanged from when

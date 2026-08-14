@@ -1,5 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::allocation::Maker;
+
 /// Re-exported so the ~70 `use crate::types::Price` sites keep working. The
 /// type itself lives in [`crate::instrument`], with the tick grid that gives it
 /// meaning — a price is not a standalone number, it is a point on an
@@ -143,6 +145,37 @@ pub struct Order {
     pub original_quantity: Qty,
     pub remaining_quantity: Qty,
     pub timestamp: u128, // matters, because of the FIFO processing we need to know the time of the order
+    /// When this order joined its price level, on the exchange's own counter —
+    /// see [`crate::orderbook::OrderBook::next_arrival`].
+    ///
+    /// Not a second `timestamp`. `timestamp` is whatever the *client* put on
+    /// the message and is never re-stamped on receipt, so an allocator that
+    /// weighted by it would let a sender backdate its way to the front of the
+    /// queue. This one the exchange assigns, at the moment the order actually
+    /// comes to rest — which is also why it is not the submission order: a stop
+    /// submitted early can trigger late, and it queues where it landed, not
+    /// where it was sent from.
+    ///
+    /// Zero until the book stamps it. An order that never rested never had an
+    /// arrival, and `0` says so.
+    ///
+    /// # Why `u32`, and what it costs
+    ///
+    /// Measured, not guessed. `timestamp` is a `u128`, so `Order` aligns to 16
+    /// — and at 106 bytes of content it had 6 bytes of tail padding going
+    /// spare. A `u32` lands in that padding and `Order` stays **112 bytes**; a
+    /// `u64` does not fit and pushes it to **128**. That 14% is paid on every
+    /// byte the engine memmoves in `PriceLevel::remove_order` and every byte it
+    /// walks scanning a level, and it showed up as +25–35% on the tight-
+    /// distribution benchmarks — for a field only `TimeProRataMatcher` reads.
+    ///
+    /// The price is a ceiling of ~4.29 billion rests per book, enforced below
+    /// rather than left to wrap: a wrapped counter would make the newest order
+    /// at a level look like the oldest, silently inverting time priority — the
+    /// one thing this field exists to get right. A real venue would either
+    /// spend the 16 bytes or renumber at a session boundary; this book is
+    /// explicit about which it chose.
+    pub arrival: u32,
     pub lifecycle: OrderLifecycle,
 }
 
@@ -155,6 +188,7 @@ pub struct OrderBuilder {
     original_quantity: Option<Qty>,
     remaining_quantity: Option<Qty>,
     timestamp: Option<u128>,
+    arrival: Option<u32>,
     lifecycle: Option<OrderLifecycle>,
 }
 
@@ -168,6 +202,11 @@ impl Default for OrderBuilder {
         OrderBuilder {
             lifecycle: Some(OrderLifecycle::New),
             timestamp: Some(timestamp_ns),
+            // Not stamped here, and deliberately not defaulted from a clock the
+            // way `timestamp` is: only the book can say when an order joined a
+            // level, so a builder that guessed would be guessing about the one
+            // thing this field exists to be authoritative about.
+            arrival: Some(0),
             // no order_type default: `Market` silently standing in for a
             // forgotten `.order_type(...)` hid intent — now it's a loud panic
             order_type: None,
@@ -192,6 +231,9 @@ impl OrderBuilder {
             timestamp: self
                 .timestamp
                 .expect("somehow timetamp is not provided and default doesn't applied"),
+            arrival: self
+                .arrival
+                .expect("somehow arrival is not provided and default doesn't applied"),
             side: self.side.expect("side doesn't provided"),
             // a fresh order has nothing filled yet, so remaining == original unless
             // a test explicitly seeds a pre-filled resting order via .remaining_quantity()
@@ -203,6 +245,14 @@ impl OrderBuilder {
 
     pub fn timestamp(mut self, timestamp: u128) -> Self {
         self.timestamp = Some(timestamp);
+        self
+    }
+
+    /// Seeds the arrival stamp directly. For tests that need a level with a
+    /// known age profile without submitting orders one at a time — the book
+    /// overwrites this the moment the order actually rests.
+    pub fn arrival(mut self, arrival: u32) -> Self {
+        self.arrival = Some(arrival);
         self
     }
 
@@ -297,6 +347,24 @@ impl PriceLevel {
             .iter()
             .map(|order| order.remaining_quantity)
             .sum()
+    }
+
+    /// This level's queue as an allocation policy sees it: remaining size and
+    /// arrival, oldest first — which is the ordering
+    /// [`MatchingAlgorithm::allocate`](crate::allocation::MatchingAlgorithm::allocate)
+    /// requires of its caller, and which `orders` already carries because
+    /// `add_order` pushes to the back.
+    ///
+    /// This is the seam. Everything the matcher is allowed to know about a
+    /// resting order passes through here — no prices, no ids, no order types —
+    /// so a storage layout that holds nothing resembling an `Order` can still
+    /// serve a matcher by yielding these. That is what makes the storage
+    /// bake-off possible without touching a line of allocation logic.
+    pub fn makers(&self) -> impl Iterator<Item = Maker> + '_ {
+        self.orders.iter().map(|order| Maker {
+            remaining_quantity: order.remaining_quantity,
+            arrival: u128::from(order.arrival),
+        })
     }
 }
 

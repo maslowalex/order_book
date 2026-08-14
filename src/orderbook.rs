@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
+use crate::allocation::MatchingAlgorithm;
 use crate::instrument::{InstrumentSpec, Qty, RejectReason, Ticks};
 use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
 
@@ -17,8 +18,20 @@ pub enum OrderLocation {
     StopBook { side: Side, trigger: Price },
 }
 
+/// The book, parameterised by the policy it allocates with.
+///
+/// `M` is the *allocation* axis — who at a price level gets filled, and by how
+/// much. It is deliberately the only axis here: the storage layout (how levels
+/// and queues are physically held) is a separate one, and nothing in matching
+/// may depend on it. The seam that keeps them apart is
+/// [`PriceLevel::makers`](crate::types::PriceLevel::makers) — a matcher sees a
+/// slice of sizes and arrivals, never an `Order` and never this struct.
+///
+/// Note the `Clone` derive quietly adds `M: Clone` (and `Debug` adds
+/// `M: Debug`). Free today — every matcher in the crate is `Copy` — but it is a
+/// real bound on anyone writing a new one.
 #[derive(Debug, Clone)]
-pub struct OrderBook {
+pub struct OrderBook<M: MatchingAlgorithm> {
     pub bids: BTreeMap<Reverse<Price>, PriceLevel>, // descending: best (highest) bid first
     pub asks: BTreeMap<Price, PriceLevel>,          // ascending: best (lowest) ask first
     /// Buy stops keyed by trigger, FIFO within one trigger price. A buy stop
@@ -32,6 +45,22 @@ pub struct OrderBook {
     pub last_trade_price: Option<Price>,
     pub index: HashMap<ExchangeId, OrderLocation>,
     pub next_seq: u64,
+    /// The stamp the next order to come to rest will carry — the exchange's
+    /// answer to "who was here first", handed out by `add_order`.
+    ///
+    /// Kept separate from `next_seq` on purpose, even though both are monotone
+    /// counters the book hands out. `next_seq` is an *id generator*: every
+    /// value it emits becomes an `ExchangeId` somebody can address. Bumping it
+    /// here would punch holes in the id space — one hole per rest, which is
+    /// most orders — and make the ids stop being a sequence. They also count
+    /// different things: an order can be submitted and never rest (market,
+    /// IOC, a killed FOK), and an order can rest twice (a stop that parks,
+    /// triggers, and comes back as a limit).
+    ///
+    /// `u32` to match [`Order::arrival`], which is `u32` for a measured layout
+    /// reason documented there. Saturating at ~4.29 billion rests; `add_order`
+    /// panics rather than wrap.
+    pub next_arrival: u32,
     /// The instrument's tick and lot grid.
     ///
     /// This field replaces a comment. The book used to carry a note saying that
@@ -41,6 +70,13 @@ pub struct OrderBook {
     /// nothing could. Every price and quantity in this book is now a point on
     /// this spec's lattice, and the type system knows it.
     spec: InstrumentSpec,
+    /// How this book apportions a taker across one price level.
+    ///
+    /// `pub(crate)` rather than private because `matching.rs` needs to borrow
+    /// it *as a field*, alongside `&mut self.asks` and `&mut self.index` — the
+    /// same disjoint-borrow trick `fill_against`'s signature is built around.
+    /// Going through `matcher()` would borrow all of `self` and lose that.
+    pub(crate) matcher: M,
 }
 
 #[derive(Debug, PartialEq)]
@@ -60,15 +96,32 @@ pub enum OrderBookError {
     Rejected(RejectReason),
 }
 
-impl OrderBook {
-    /// A book must be told what instrument it trades before it can hold a
-    /// single order — there is no `Default`, deliberately. A *default* lattice
-    /// would be the "someone upstream normalized this" assumption sneaking back
-    /// in through a derive, which is the exact failure this spec exists to end.
-    /// Callers should be able to point at the line where they chose a grid;
-    /// [`InstrumentSpec::cents`] is the named one-cent-tick default.
-    #[allow(clippy::new_without_default)]
-    pub fn new(spec: InstrumentSpec) -> Self {
+impl<M: MatchingAlgorithm> OrderBook<M> {
+    /// A book must be told what instrument it trades AND what policy it
+    /// allocates by before it can hold a single order.
+    ///
+    /// There is no `Default` and no default type parameter, deliberately, and
+    /// for one reason twice over. A *default* lattice would be the "someone
+    /// upstream normalized this" assumption sneaking back in through a derive,
+    /// which is the exact failure the spec exists to end; a *default* matcher
+    /// would be the same move on the other axis — FIFO quietly standing in for
+    /// a decision nobody made. Callers should be able to point at the line
+    /// where they chose each. [`InstrumentSpec::cents`] is the named
+    /// one-cent-tick grid; [`FifoMatcher`](crate::allocation::FifoMatcher) is
+    /// the named price-time policy.
+    pub fn new(spec: InstrumentSpec, matcher: M) -> Self {
+        // A matcher that floors to a lot must floor to THIS instrument's lot.
+        // Get this wrong and the damage is not a bad print: off-lot fills are
+        // subtracted into the makers, which stay resting, off-grid, and
+        // matchable — the lattice leaks one partial fill at a time. See the
+        // worked counterexample on `ProRataMatcher`.
+        assert!(
+            matcher.lot_size().is_none_or(|lot| lot == spec.lot_size()),
+            "matcher floors to lot {:?}, but this instrument's lot is {}",
+            matcher.lot_size(),
+            spec.lot_size()
+        );
+
         OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
@@ -77,12 +130,28 @@ impl OrderBook {
             last_trade_price: None,
             index: HashMap::new(),
             next_seq: 1,
+            next_arrival: 1,
             spec,
+            matcher,
         }
     }
 
     pub fn spec(&self) -> InstrumentSpec {
         self.spec
+    }
+
+    /// The instrument's lot, without copying the whole spec.
+    ///
+    /// `spec()` returns `InstrumentSpec` by value — it is `Copy`, and ~72 bytes
+    /// of it. The match path reads the lot on every `submit`, including ones
+    /// that never touch a level, so going through `spec()` there put a
+    /// nine-field struct copy on the hot path to fetch one `u64`.
+    pub(crate) fn lot_size(&self) -> u64 {
+        self.spec.lot_size()
+    }
+
+    pub fn matcher(&self) -> &M {
+        &self.matcher
     }
 
     /// The instrument's admission policy, applied to one order.
@@ -126,7 +195,7 @@ impl OrderBook {
         Ok(())
     }
 
-    pub fn add_order(&mut self, order: Order) -> Result<(), OrderBookError> {
+    pub fn add_order(&mut self, mut order: Order) -> Result<(), OrderBookError> {
         let OrderType::Limit { price, .. } = order.order_type else {
             return Err(OrderBookError::NotRestable);
         };
@@ -138,6 +207,25 @@ impl OrderBook {
             Entry::Occupied(_) => return Err(OrderBookError::ExchangeIdDuplicated),
             Entry::Vacant(e) => e.insert(OrderLocation::Book { side, price }),
         };
+
+        // Stamped here, past every way out of this function, because this is
+        // the exact instant the order joins a queue — and this is the only
+        // door into one, for a taker's remainder and a triggered stop alike.
+        //
+        // Past the rejects for the same reason `submit` mints its id past
+        // admission: an order that never got in never took a place in line, so
+        // it should not consume a number. What the counter records is "how many
+        // orders have ever rested here", and a reject is not one of them.
+        order.arrival = self.next_arrival;
+        // `checked_add`, not `+=`. Wrapping would make the newest order at a
+        // level read as the oldest and silently invert time priority — a
+        // corruption with no symptom until someone audits a fill. Failing
+        // loudly at the boundary is the only honest option at this width; see
+        // the `u32` note on `Order::arrival` for why the width is what it is.
+        self.next_arrival = self
+            .next_arrival
+            .checked_add(1)
+            .expect("arrival counter exhausted: this book has rested u32::MAX orders");
 
         let price_level = match side {
             Side::Ask => self
@@ -300,13 +388,14 @@ A: At any moment when a LIMIT order arrives, we must check if it crosses the spr
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::allocation::FifoMatcher;
     use crate::instrument::{RejectReason, SpecError};
     use crate::test_helpers::{book, order, px, qty};
     use rust_decimal::Decimal;
 
     /// A non-crossed book: bids 99/98/97, asks 100/101/102.
     /// best_bid = 99, best_ask = 100, spread = 1.
-    fn book_with_depth() -> OrderBook {
+    fn book_with_depth() -> OrderBook<FifoMatcher> {
         let mut ob = book();
         ob.add_order(order(Side::Bid, 99, 110, None, "bid_99"))
             .unwrap();
@@ -674,7 +763,7 @@ mod test {
 
     #[test]
     fn submit_rejects_a_quantity_below_the_minimum() {
-        let mut ob = OrderBook::new(bounded_spec());
+        let mut ob = OrderBook::new(bounded_spec(), FifoMatcher);
         let result = ob.submit(order(Side::Bid, 5000, 4, None, "small"));
 
         assert_eq!(
@@ -690,7 +779,7 @@ mod test {
 
     #[test]
     fn submit_rejects_a_price_outside_the_band() {
-        let mut ob = OrderBook::new(bounded_spec());
+        let mut ob = OrderBook::new(bounded_spec(), FifoMatcher);
 
         assert!(matches!(
             ob.submit(order(Side::Bid, 50, 10, None, "cheap")),
@@ -711,7 +800,7 @@ mod test {
     /// one on something that never became an order would leave a hole.
     #[test]
     fn a_rejected_submit_leaves_the_book_bit_identical() {
-        let mut ob = OrderBook::new(bounded_spec());
+        let mut ob = OrderBook::new(bounded_spec(), FifoMatcher);
         ob.submit(order(Side::Bid, 5000, 10, None, "good"))
             .expect("within bounds");
 
@@ -730,7 +819,7 @@ mod test {
     /// door into the book and gets the same lock.
     #[test]
     fn add_order_is_gated_too() {
-        let mut ob = OrderBook::new(bounded_spec());
+        let mut ob = OrderBook::new(bounded_spec(), FifoMatcher);
         let result = ob.add_order(order(Side::Bid, 5000, 4, None, "small"));
 
         assert!(matches!(
@@ -748,7 +837,7 @@ mod test {
     /// a StopMarket has no limit price at all.
     #[test]
     fn a_stop_trigger_is_checked_against_the_band() {
-        let mut ob = OrderBook::new(bounded_spec());
+        let mut ob = OrderBook::new(bounded_spec(), FifoMatcher);
         let stop = Order::builder()
             .side(Side::Bid)
             .quantity(qty(10))
@@ -775,7 +864,7 @@ mod test {
 
     #[test]
     fn submit_rejects_an_order_worth_less_than_the_floor() {
-        let mut ob = OrderBook::new(min_notional_spec());
+        let mut ob = OrderBook::new(min_notional_spec(), FifoMatcher);
 
         // $0.10 x 99 == $9.90
         assert!(matches!(
@@ -794,7 +883,7 @@ mod test {
     /// says so out loud rather than pretending the check ran.
     #[test]
     fn a_market_order_skips_the_notional_floor() {
-        let mut ob = OrderBook::new(min_notional_spec());
+        let mut ob = OrderBook::new(min_notional_spec(), FifoMatcher);
         ob.add_order(order(Side::Ask, 10, 100, None, "maker"))
             .expect("clears the floor");
 
@@ -820,5 +909,161 @@ mod test {
             spec.price_from_minor(10_003),
             Err(SpecError::PriceOffTick { .. })
         ));
+    }
+
+    // ------------------------------------------------------ THE ARRIVAL CLOCK
+
+    /// `arrival` of the order resting at `price` on `side`, at queue position
+    /// `pos`.
+    fn arrival_at<M: MatchingAlgorithm>(
+        ob: &OrderBook<M>,
+        side: Side,
+        price: i64,
+        pos: usize,
+    ) -> u32 {
+        let level = match side {
+            Side::Bid => ob.bids.get(&Reverse(px(price))),
+            Side::Ask => ob.asks.get(&px(price)),
+        }
+        .expect("level should exist");
+        level.orders[pos].arrival
+    }
+
+    #[test]
+    fn resting_hands_out_increasing_arrivals() {
+        let mut ob = book();
+        ob.add_order(order(Side::Bid, 99, 10, None, "first"))
+            .unwrap();
+        ob.add_order(order(Side::Bid, 99, 10, None, "second"))
+            .unwrap();
+        // a different level shares the one counter — "who was here first" is a
+        // fact about the book, not about a price
+        ob.add_order(order(Side::Ask, 101, 10, None, "third"))
+            .unwrap();
+
+        assert_eq!(arrival_at(&ob, Side::Bid, 99, 0), 1);
+        assert_eq!(arrival_at(&ob, Side::Bid, 99, 1), 2);
+        assert_eq!(arrival_at(&ob, Side::Ask, 101, 0), 3);
+    }
+
+    /// The counter is not `next_seq` under another name. Two submits that never
+    /// rest burn two ids and no arrivals.
+    #[test]
+    fn arrivals_count_rests_not_submissions() {
+        let mut ob = book();
+        ob.add_order(order(Side::Ask, 100, 10, None, "maker"))
+            .unwrap();
+
+        let market = |id: &str| {
+            Order::builder()
+                .side(Side::Bid)
+                .quantity(qty(2))
+                .client_id(id)
+                .exchange_id(id)
+                .order_type(OrderType::Market)
+                .build()
+        };
+        ob.submit(market("t1")).unwrap();
+        ob.submit(market("t2")).unwrap();
+
+        assert_eq!(ob.next_arrival, 2, "only the maker ever rested");
+        assert_eq!(ob.next_seq, 3, "but both takers were assigned ids");
+    }
+
+    #[test]
+    fn a_rejected_add_burns_no_arrival() {
+        let mut ob = book();
+        let before = ob.next_arrival;
+
+        // not restable
+        let market = Order::builder()
+            .side(Side::Bid)
+            .quantity(qty(1))
+            .client_id("c")
+            .exchange_id("m")
+            .order_type(OrderType::Market)
+            .build();
+        assert_eq!(ob.add_order(market), Err(OrderBookError::NotRestable));
+
+        // duplicate id
+        ob.add_order(order(Side::Bid, 99, 10, None, "dup")).unwrap();
+        assert_eq!(
+            ob.add_order(order(Side::Bid, 99, 10, None, "dup")),
+            Err(OrderBookError::ExchangeIdDuplicated)
+        );
+
+        assert_eq!(ob.next_arrival, before + 1, "exactly one order got in");
+    }
+
+    /// A taker that partially fills is aged from when its remainder came to
+    /// rest, not from when it was sent — it queued behind everything already
+    /// standing at its level, and the stamp has to say so.
+    #[test]
+    fn a_partially_filled_taker_is_stamped_at_rest_time() {
+        let mut ob = book();
+        ob.add_order(order(Side::Ask, 100, 5, None, "maker"))
+            .unwrap(); // arrival 1
+        ob.add_order(order(Side::Bid, 100, 10, None, "resident"))
+            .unwrap(); // arrival 2
+
+        // crosses the ask for 5, rests the other 5 at 100 behind `resident`
+        let taker = Order::builder()
+            .side(Side::Bid)
+            .quantity(qty(10))
+            .client_id("t")
+            .exchange_id("t")
+            .order_type(OrderType::limit_gtc(px(100)))
+            .build();
+        ob.submit(taker).unwrap();
+
+        assert_eq!(arrival_at(&ob, Side::Bid, 100, 0), 2, "resident was first");
+        assert_eq!(arrival_at(&ob, Side::Bid, 100, 1), 3, "remainder is newer");
+    }
+
+    /// The case `Order.timestamp` gets wrong, and the reason this field exists.
+    /// A stop submitted before everything else parks — it is not in a queue —
+    /// and when it finally triggers it joins the back of the line, behind
+    /// orders that were sent long after it.
+    #[test]
+    fn a_stop_is_aged_from_when_it_rested_not_when_it_parked() {
+        let mut ob = book();
+
+        // parked first: sell stop at 99, waiting for the market to fall
+        let stop = Order::builder()
+            .side(Side::Ask)
+            .quantity(qty(10))
+            .client_id("stopper")
+            .exchange_id("stop")
+            .order_type(OrderType::stop_limit(px(99), px(105)))
+            .build();
+        ob.submit(stop).unwrap();
+        assert_eq!(ob.next_arrival, 1, "parking is not resting");
+
+        // submitted later, rests immediately
+        ob.add_order(order(Side::Ask, 105, 10, None, "latecomer"))
+            .unwrap(); // arrival 1
+
+        // print a trade at 99 to fire the stop
+        ob.add_order(order(Side::Bid, 99, 1, None, "bid_99"))
+            .unwrap(); // arrival 2
+        let taker = Order::builder()
+            .side(Side::Ask)
+            .quantity(qty(1))
+            .client_id("t")
+            .exchange_id("t")
+            .order_type(OrderType::limit_gtc(px(99)))
+            .build();
+        ob.submit(taker).unwrap();
+
+        assert_eq!(
+            arrival_at(&ob, Side::Ask, 105, 0),
+            1,
+            "the latecomer holds the front of the queue"
+        );
+        assert_eq!(
+            arrival_at(&ob, Side::Ask, 105, 1),
+            3,
+            "the stop queues where it landed, not where it was sent from"
+        );
     }
 }

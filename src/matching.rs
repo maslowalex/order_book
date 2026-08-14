@@ -1,6 +1,8 @@
+use std::cmp;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
+use crate::allocation::{Fill, Maker, MatchingAlgorithm};
 use crate::instrument::Qty;
 use crate::orderbook::{OrderBook, OrderBookError, OrderLocation};
 use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, PriceLevel, Side, TimeInForce};
@@ -62,7 +64,7 @@ struct MatchingResult {
     pub outcome: SubmitOutcome,
 }
 
-impl OrderBook {
+impl<M: MatchingAlgorithm> OrderBook<M> {
     /// Submit an order to be matched against the book, resting any remainder
     /// (limit) or discarding it (market). Contrast with `add_order`, which
     /// always rests without matching (used for seeding the book).
@@ -97,6 +99,16 @@ impl OrderBook {
         }
 
         Ok(report)
+    }
+
+    /// The instant a sweep starting right now measures maker ages against.
+    ///
+    /// One past every arrival the book has handed out, so every resting maker
+    /// is at least one tick old and none of them weighs zero. It is a count of
+    /// orders that have rested, not a wall clock — which is the point: it is
+    /// unforgeable by a client, monotone, and replays identically off a log.
+    fn arrival_now(&self) -> u128 {
+        u128::from(self.next_arrival)
     }
 
     /// Run ONE order through matching — no cascade, no id minting (the id is
@@ -205,9 +217,30 @@ impl OrderBook {
         // A limit only sweeps the marketable prefix: fill against the opposite
         // side while it crosses the limit price, then TIF decides the
         // remainder's fate.
+        //
+        // `now` and `lot` are read out first so that `self.spec` and
+        // `self.next_arrival` are not borrowed across the call — leaving the
+        // side map, the index and the matcher as three disjoint field borrows.
+        let (now, lot) = (self.arrival_now(), self.lot_size());
         let (trades, cancelled) = match order.side {
-            Side::Bid => fill_against(&mut self.asks, &mut self.index, &mut order, Some(limit)),
-            Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, Some(limit)),
+            Side::Bid => fill_against(
+                &mut self.asks,
+                &mut self.index,
+                &self.matcher,
+                &mut order,
+                Some(limit),
+                now,
+                lot,
+            ),
+            Side::Ask => fill_against(
+                &mut self.bids,
+                &mut self.index,
+                &self.matcher,
+                &mut order,
+                Some(limit),
+                now,
+                lot,
+            ),
         };
 
         if order.remaining_quantity.is_zero() {
@@ -265,9 +298,26 @@ impl OrderBook {
             });
         }
 
+        let (now, lot) = (self.arrival_now(), self.lot_size());
         let (trades, cancelled) = match order.side {
-            Side::Bid => fill_against(&mut self.asks, &mut self.index, &mut order, Some(limit)),
-            Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, Some(limit)),
+            Side::Bid => fill_against(
+                &mut self.asks,
+                &mut self.index,
+                &self.matcher,
+                &mut order,
+                Some(limit),
+                now,
+                lot,
+            ),
+            Side::Ask => fill_against(
+                &mut self.bids,
+                &mut self.index,
+                &self.matcher,
+                &mut order,
+                Some(limit),
+                now,
+                lot,
+            ),
         };
         debug_assert!(
             order.remaining_quantity.is_zero(),
@@ -283,9 +333,26 @@ impl OrderBook {
 
     fn process_market_order(&mut self, mut order: Order) -> Result<MatchingResult, OrderBookError> {
         // A market order accepts any price, so there is no limit bound.
+        let (now, lot) = (self.arrival_now(), self.lot_size());
         let (trades, cancelled) = match order.side {
-            Side::Bid => fill_against(&mut self.asks, &mut self.index, &mut order, None),
-            Side::Ask => fill_against(&mut self.bids, &mut self.index, &mut order, None),
+            Side::Bid => fill_against(
+                &mut self.asks,
+                &mut self.index,
+                &self.matcher,
+                &mut order,
+                None,
+                now,
+                lot,
+            ),
+            Side::Ask => fill_against(
+                &mut self.bids,
+                &mut self.index,
+                &self.matcher,
+                &mut order,
+                None,
+                now,
+                lot,
+            ),
         };
 
         // IOC: anything left unfilled is discarded, not rested.
@@ -349,26 +416,43 @@ fn fillable_quantity<K: Ord>(side: &BTreeMap<K, PriceLevel>, taker: &Order, limi
 }
 
 /// Walk the opposite side of the book and fill `taker` against it — best price
-/// first, FIFO within a level. `limit` bounds the sweep: `None` takes any price
-/// (market), `Some(p)` stops once the best resting price no longer crosses `p`
-/// (limit). `taker.remaining_quantity` is decremented as it fills.
+/// first, `matcher` deciding who gets what within a level.
 ///
-/// Self-trade prevention: a resting order from the taker's own client is
-/// cancelled (removed from the book) instead of traded against; its id goes into
-/// the returned `cancelled` list.
+/// `limit` bounds the sweep: `None` takes any price (market), `Some(p)` stops
+/// once the best resting price no longer crosses `p` (limit).
+/// `taker.remaining_quantity` is decremented as it fills. `now` is the instant
+/// ages are measured against and `lot` the instrument's lot — both are the
+/// engine's to supply, so that an allocation stays a pure function of its
+/// arguments and replays identically off a log.
+///
+/// Self-trade prevention: resting orders belonging to the taker's own client
+/// are cancelled (removed from the book) instead of traded against, and their
+/// ids go into the returned `cancelled` list. This happens **before** the level
+/// is handed to the matcher, and so applies to the whole level rather than to
+/// the prefix a FIFO walk would have reached — see the note on the pre-pass
+/// below.
 ///
 /// Generic over the key type so one body serves both `asks` (keyed by `Price`)
 /// and `bids` (keyed by `Reverse<Price>`) — the level carries its own `price`,
-/// so only the key's ordering differs. Taking the side map and index as separate
-/// `&mut` args (rather than `&mut self`) is what keeps the borrows disjoint.
-fn fill_against<K: Ord>(
+/// so only the key's ordering differs. Taking the side map, index and matcher
+/// as separate args (rather than `&mut self`) is what keeps the borrows
+/// disjoint.
+fn fill_against<K: Ord, M: MatchingAlgorithm>(
     side: &mut BTreeMap<K, PriceLevel>,
     index: &mut HashMap<ExchangeId, OrderLocation>,
+    matcher: &M,
     taker: &mut Order,
     limit: Option<Price>,
+    now: u128,
+    lot: u64,
 ) -> (Vec<Trade>, Vec<ExchangeId>) {
     let mut trades: Vec<Trade> = vec![];
     let mut cancelled: Vec<ExchangeId> = vec![];
+    // One buffer for the whole sweep, cleared per level: the projection has to
+    // be a slice (the matcher indexes into it, and pro-rata needs the level's
+    // total before it can apportion anything), but it does not have to be a
+    // fresh allocation each time. Capacity settles at the deepest level touched.
+    let mut makers: Vec<Maker> = vec![];
 
     while !taker.remaining_quantity.is_zero() {
         // best opposing level, or stop — this side of the book is dry
@@ -388,41 +472,83 @@ fn fill_against<K: Ord>(
             }
         }
 
-        // consume FIFO from the front of this level
-        while !taker.remaining_quantity.is_zero() {
-            let Some(front) = level.orders.first_mut() else {
-                break;
-            };
+        // Self-trade prevention, as a pre-pass over the WHOLE level.
+        //
+        // It cannot be folded into the allocation, and it cannot be a skip.
+        // Leaving a self order in the slice would have the matcher fill it,
+        // printing exactly the self-trade this exists to prevent. Skipping it
+        // without removing it leaves it resting and crossable — a taker's
+        // remainder would come to rest through its own untouched order on the
+        // other side, and the book would sit crossed — and the un-drained level
+        // would be re-selected by `first_entry` forever. So: remove.
+        //
+        // What DOES change here is reach. The old FIFO loop cancelled only the
+        // self orders the taker physically walked past, because it stopped the
+        // moment the taker filled up; anything deeper survived. Under a policy
+        // that apportions across the whole level there is no "walked past" to
+        // speak of, so the rule becomes "your own orders at a level you trade
+        // through are gone". That is more aggressive than most venues' per-match
+        // STP — and it is what `fillable_quantity` has always assumed, so the
+        // FOK dry run and the real sweep now agree on the cancellation set as
+        // well as on the quantities.
+        for own in level
+            .orders
+            .extract_if(.., |o| o.client_id == taker.client_id)
+        {
+            index.remove(&own.exchange_id);
+            cancelled.push(own.exchange_id);
+        }
 
-            // self-trade: cancel the resting order rather than trade against it
-            if front.client_id == taker.client_id {
-                let self_order = level.orders.remove(0);
-                index.remove(&self_order.exchange_id);
-                cancelled.push(self_order.exchange_id);
-                continue;
-            }
+        // Hand the level to the policy. Everything it learns about the queue
+        // passes through `makers()`: sizes and arrivals, oldest first.
+        makers.clear();
+        makers.extend(level.makers());
+        let fills = matcher.allocate(taker.remaining_quantity, &makers, now);
+        debug_assert_fills(&fills, taker.remaining_quantity, &makers, lot);
 
-            let fill = taker.remaining_quantity.min(front.remaining_quantity);
+        // Apply forward, removing nothing: the fills index into `makers`, and
+        // `makers` is positional, so a removal mid-loop would silently shift
+        // every index after it.
+        let price = level.price; // maker's price == its level's price
+        for fill in &fills {
+            let maker = &mut level.orders[fill.order_index];
             trades.push(Trade {
-                price: level.price, // maker's price == its level's price
-                quantity: fill,
-                maker_order_id: front.exchange_id.clone(),
+                price,
+                quantity: fill.quantity,
+                maker_order_id: maker.exchange_id.clone(),
                 taker_order_id: taker.exchange_id.clone(),
-                maker_client: front.client_id.clone(),
+                maker_client: maker.client_id.clone(),
                 taker_client: taker.client_id.clone(),
                 taker_side: taker.side,
                 timestamp: taker.timestamp,
             });
 
-            front.remaining_quantity -= fill;
-            taker.remaining_quantity -= fill;
-
-            if front.remaining_quantity.is_zero() {
-                let done = level.orders.remove(0);
-                index.remove(&done.exchange_id);
-            }
+            maker.remaining_quantity -= fill.quantity;
+            taker.remaining_quantity -= fill.quantity;
         }
 
+        // Compact once, after the fact. `extract_if` is a single O(level) pass
+        // that keeps the survivors in queue order and hands back owned orders,
+        // so the index cleanup needs no id clone. (`retain` would force one;
+        // `swap_remove` would destroy the oldest-first ordering the matcher is
+        // promised; repeated `remove` would be O(k·level), and under pro-rata
+        // every maker can be exhausted at once. The FIFO-only `drain(..k)` fast
+        // path — exhausted makers are always a prefix — is what this gives up.)
+        //
+        // 6.2a: this is O(level) however few makers were exhausted, because a
+        // `Vec` level has no handles. A slab or an intrusive list makes it O(1)
+        // per exhausted maker, and nothing in this function has to know.
+        for done in level
+            .orders
+            .extract_if(.., |o| o.remaining_quantity.is_zero())
+        {
+            index.remove(&done.exchange_id);
+        }
+
+        debug_assert!(
+            level.orders.is_empty() || taker.remaining_quantity.is_zero(),
+            "contract (4): a level survives only if the taker is full"
+        );
         if level.orders.is_empty() {
             level_entry.remove(); // level drained → drop it, move to the next price
         } else {
@@ -433,10 +559,82 @@ fn fill_against<K: Ord>(
     (trades, cancelled)
 }
 
+/// The allocation contract, checked against a real level.
+///
+/// Its counterpart in `allocation.rs`'s tests checks clauses (1)-(4) on
+/// hand-built slices. This one runs on every allocation the engine ever makes,
+/// and adds the clause the unit tests structurally cannot: **(5), whole lots**.
+/// Only the engine knows the instrument's lot, so only here can "the lattice
+/// never leaks" be enforced rather than argued.
+///
+/// One body under `cfg!`, not a `#[cfg]`-split pair: the release twin of such a
+/// pair is never type-checked, so it rots. The optimizer deletes this entirely
+/// when `debug_assertions` is off.
+fn debug_assert_fills(fills: &[Fill], available: Qty, makers: &[Maker], lot: u64) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+
+    let mut last: Option<usize> = None;
+    let mut allocated: u128 = 0;
+
+    for fill in fills {
+        assert!(
+            fill.order_index < makers.len(),
+            "(1) fill index {} is past the end of a {}-deep level",
+            fill.order_index,
+            makers.len()
+        );
+        assert!(
+            last.is_none_or(|prev| fill.order_index > prev),
+            "(1) fill indices must strictly increase, got {:?} then {}",
+            last,
+            fill.order_index
+        );
+        last = Some(fill.order_index);
+
+        // A zero fill would print a zero-quantity trade AND read downstream as
+        // "this maker was touched", which is precisely how the self-trade
+        // filter and the depth accounting decide what happened to an order.
+        assert!(!fill.quantity.is_zero(), "(2) a fill must be positive");
+        assert!(
+            fill.quantity <= makers[fill.order_index].remaining_quantity,
+            "(3) fill of {:?} exceeds maker {}'s remaining {:?}",
+            fill.quantity,
+            fill.order_index,
+            makers[fill.order_index].remaining_quantity
+        );
+        assert!(
+            fill.quantity.base().is_multiple_of(lot),
+            "(5) fill of {:?} is not a whole multiple of lot {}",
+            fill.quantity,
+            lot
+        );
+
+        allocated += u128::from(fill.quantity.base());
+    }
+
+    // u128 throughout: a level's total genuinely can overrun u64, which is the
+    // whole reason the weighted allocators widen internally.
+    let total: u128 = makers
+        .iter()
+        .map(|m| u128::from(m.remaining_quantity.base()))
+        .sum();
+    let expected = cmp::min(u128::from(available.base()), total);
+    assert_eq!(
+        allocated,
+        expected,
+        "(4) allocated {allocated} but owed min(available {}, total {total})",
+        available.base()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{book, order, px, qty};
+    use crate::allocation::{ProRataMatcher, TimeProRataMatcher};
+    use crate::instrument::InstrumentSpec;
+    use crate::test_helpers::{book, book_with, order, px, qty, spec};
 
     // The `order()` helper builds a resting GTC limit maker with
     // client_id == exchange_id == id; the incoming taker controls its own
@@ -1275,5 +1473,152 @@ mod tests {
         assert_eq!(report.outcome, SubmitOutcome::Killed); // nothing left to fill against
         assert!(ob.index.is_empty());
         assert_eq!(ob.best_ask(), None);
+    }
+
+    // ------------------------------------------------ ALLOCATING VIA THE TRAIT
+
+    /// A resting maker at `price`, `quantity` deep, owned by `client`.
+    fn maker(client: &str, id_: &str, price: i64, quantity: u64) -> Order {
+        Order::builder()
+            .side(Side::Ask)
+            .quantity(qty(quantity))
+            .client_id(client)
+            .exchange_id(id_)
+            .order_type(OrderType::limit_gtc(px(price)))
+            .build()
+    }
+
+    /// A market buy for `quantity`, from `client`.
+    fn buyer(client: &str, id_: &str, quantity: u64) -> Order {
+        Order::builder()
+            .side(Side::Bid)
+            .quantity(qty(quantity))
+            .client_id(client)
+            .exchange_id(id_)
+            .order_type(OrderType::Market)
+            .build()
+    }
+
+    /// The point of the whole phase, in one case. The same book, the same
+    /// orders, the same taker — and the policy decides who trades.
+    ///
+    /// FIFO gives the front of the queue everything it can absorb. Pro-rata
+    /// splits by size: makers of 10/20/30 against a taker of 30 get
+    /// ⌊30·10/60⌋ = 5, ⌊30·20/60⌋ = 10, ⌊30·30/60⌋ = 15. Trades still come out
+    /// in queue order under both, because the fills are index-ascending.
+    #[test]
+    fn the_policy_decides_who_fills_at_one_level() {
+        // a fn, not a closure: closures are not generic, and the whole point
+        // here is to seed two books of different types identically
+        fn seed<M: MatchingAlgorithm>(ob: &mut OrderBook<M>) {
+            ob.add_order(maker("a", "m1", 100, 10)).unwrap();
+            ob.add_order(maker("b", "m2", 100, 20)).unwrap();
+            ob.add_order(maker("c", "m3", 100, 30)).unwrap();
+        }
+
+        let mut fifo = book();
+        seed(&mut fifo);
+        let report = fifo.submit(buyer("t", "t1", 30)).unwrap();
+        let split: Vec<_> = report
+            .trades
+            .iter()
+            .map(|t| (t.maker_order_id.clone(), t.quantity))
+            .collect();
+        assert_eq!(
+            split,
+            vec![(id("m1"), qty(10)), (id("m2"), qty(20))],
+            "FIFO drains the front of the queue and never reaches m3"
+        );
+
+        let mut pro_rata = book_with(ProRataMatcher::new(spec().lot_size()));
+        seed(&mut pro_rata);
+        let report = pro_rata.submit(buyer("t", "t1", 30)).unwrap();
+        let split: Vec<_> = report
+            .trades
+            .iter()
+            .map(|t| (t.maker_order_id.clone(), t.quantity))
+            .collect();
+        assert_eq!(
+            split,
+            vec![(id("m1"), qty(5)), (id("m2"), qty(10)), (id("m3"), qty(15)),],
+            "pro-rata touches everyone, in queue order"
+        );
+
+        // and every maker is still resting, shorter by its share
+        assert_eq!(
+            pro_rata
+                .best_ask_level()
+                .unwrap()
+                .orders
+                .iter()
+                .map(|o| o.remaining_quantity)
+                .collect::<Vec<_>>(),
+            vec![qty(5), qty(10), qty(15)]
+        );
+    }
+
+    /// The semantics the pre-pass changed, pinned.
+    ///
+    /// alice's second order sits BEHIND bob's, past the point a FIFO walk would
+    /// have stopped — the taker is full after bob. The old inner loop never
+    /// reached it and left it resting. Allocating across the whole level makes
+    /// "the prefix I walked" meaningless, so the rule is now "your own orders
+    /// at a level you trade through are gone", which is what
+    /// `fillable_quantity` has always assumed for FOK.
+    #[test]
+    fn stp_reaches_a_self_order_behind_the_fill_point() {
+        let mut ob = book();
+        ob.add_order(maker("alice", "a1", 100, 5)).unwrap();
+        ob.add_order(maker("bob", "b1", 100, 10)).unwrap();
+        ob.add_order(maker("alice", "a2", 100, 7)).unwrap();
+
+        let report = ob.submit(buyer("alice", "t1", 10)).unwrap();
+
+        assert_eq!(
+            report.cancelled,
+            vec![id("a1"), id("a2")],
+            "both of alice's orders go, not just the one at the front"
+        );
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].maker_order_id, id("b1"));
+        assert_eq!(report.outcome, SubmitOutcome::Filled);
+        assert_eq!(ob.best_ask(), None, "the level is drained");
+        assert!(ob.index.is_empty());
+    }
+
+    /// A pro-rata built for the wrong lot cannot be attached to a book. Not a
+    /// cosmetic check: its off-lot fills would be subtracted into the makers,
+    /// leaving them resting off the lattice and still matchable.
+    #[test]
+    #[should_panic(expected = "matcher floors to lot")]
+    fn a_matcher_built_for_another_instrument_is_refused() {
+        let lots_of_ten = InstrumentSpec::new(2, 0, 1, 10).unwrap();
+        OrderBook::new(lots_of_ten, ProRataMatcher::new(1));
+    }
+
+    /// Time-weighted pro-rata reads `Maker.arrival`, which the book stamps as
+    /// orders come to rest. Two makers of equal size, one that has watched more
+    /// of the book go by: the older one gets the larger share, and with a taker
+    /// of 20 against 20+20 resting the split has to be strictly uneven for the
+    /// clock to be doing anything at all.
+    #[test]
+    fn time_pro_rata_reads_the_books_own_arrival_clock() {
+        let mut ob = book_with(TimeProRataMatcher::new(spec().lot_size()));
+        ob.add_order(maker("old", "m1", 100, 20)).unwrap(); // arrival 1
+        // push the clock forward — these rest elsewhere and never trade here
+        for i in 0..8 {
+            ob.add_order(maker("filler", &format!("f{i}"), 200, 1))
+                .unwrap();
+        }
+        ob.add_order(maker("new", "m2", 100, 20)).unwrap(); // arrival 10
+
+        let report = ob.submit(buyer("t", "t1", 20)).unwrap();
+
+        let split: Vec<_> = report.trades.iter().map(|t| t.quantity).collect();
+        assert_eq!(split.iter().copied().sum::<Qty>(), qty(20));
+        assert!(
+            split[0] > split[1],
+            "the older maker should take the larger share, got {split:?}"
+        );
     }
 }

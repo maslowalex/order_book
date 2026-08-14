@@ -60,6 +60,22 @@ pub trait MatchingAlgorithm {
     /// Nothing is read from a clock inside: an allocation is a pure function of
     /// its arguments, so it replays identically off a log.
     fn allocate(&self, available: Qty, makers: &[Maker], now: u128) -> Vec<Fill>;
+
+    /// The lot this allocator floors its shares to, if it needs to know one.
+    ///
+    /// Part of the contract, not a foreign concern: clause (5) says every fill
+    /// is a whole lot, and an allocator that genuinely multiplies and divides
+    /// quantities can only honour it if it was told where the grid is. `None`
+    /// means "closed under the lattice for free" — the FIFO answer.
+    ///
+    /// The engine reads this to check the matcher against the instrument it is
+    /// about to trade. A pro-rata built for lot `1` in a lot-`100` book does
+    /// not merely print badly: its off-lot fills are subtracted into the
+    /// makers, leaving them off-grid, resting, and matchable. See the
+    /// counterexample on [`ProRataMatcher`].
+    fn lot_size(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -156,6 +172,10 @@ impl ProRataMatcher {
 }
 
 impl MatchingAlgorithm for ProRataMatcher {
+    fn lot_size(&self) -> Option<u64> {
+        Some(self.lot_size)
+    }
+
     fn allocate(&self, available: Qty, makers: &[Maker], _now: u128) -> Vec<Fill> {
         // Unlike FIFO, which only ever compares and subtracts quantities, this
         // allocator genuinely multiplies and divides them — so it drops to raw
@@ -256,7 +276,7 @@ impl MatchingAlgorithm for ProRataMatcher {
 
 /// Time-weighted pro-rata: a maker's share scales with its size **and** with
 /// how long it has been resting, so liquidity that has been standing there
-/// taking risk outranks liquidity that arrived a microsecond ago with the same
+/// taking risk outranks liquidity that arrived one order ago with the same
 /// size. Pro-rata is the special case where every maker has rested equally
 /// long, and the property tests assert exactly that.
 ///
@@ -298,19 +318,29 @@ impl MatchingAlgorithm for ProRataMatcher {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeProRataMatcher {
     lot_size: u64,
-    tick_nanos: u128,
+    tick: u128,
     max_age_ticks: u128,
 }
 
 impl TimeProRataMatcher {
-    /// Resting time is counted in milliseconds by default. Raw nanoseconds
-    /// would make two makers a microsecond apart differ by a factor of a
-    /// thousand, which is noise dressed up as priority.
-    pub const DEFAULT_TICK_NANOS: u128 = 1_000_000;
+    /// One arrival, one tick.
+    ///
+    /// `Maker.arrival` is an engine-assigned counter — it advances by one each
+    /// time an order comes to rest, not with the wall clock — so an arrival is
+    /// already the finest resolution there is and the default tick has nothing
+    /// to coarsen. A tick above one buckets makers together: `tick = 10` means
+    /// the ten most recent arrivals at a level all count as equally new, which
+    /// blunts the size-vs-patience trade deliberately.
+    ///
+    /// (Were `arrival` a nanosecond timestamp, a coarser default would be
+    /// mandatory — two makers a microsecond apart would otherwise differ in
+    /// weight by a factor of a thousand, which is noise dressed up as
+    /// priority. It is not, so this is one.)
+    pub const DEFAULT_TICK: u128 = 1;
 
-    /// ~65 seconds of dwell at the default tick. Past the cap, patience stops
-    /// paying: an order resting since yesterday and one resting since last
-    /// minute weigh the same.
+    /// 65,535 arrivals of dwell at the default tick. Past the cap, patience
+    /// stops paying: an order that watched a million others come and go and one
+    /// that watched a hundred thousand weigh the same.
     pub const DEFAULT_MAX_AGE_TICKS: u128 = 65_535;
 
     /// Takes the lot in base units — `InstrumentSpec::lot_size()`. No
@@ -321,15 +351,16 @@ impl TimeProRataMatcher {
         assert!(lot_size > 0, "lot_size must be non-zero");
         TimeProRataMatcher {
             lot_size,
-            tick_nanos: Self::DEFAULT_TICK_NANOS,
+            tick: Self::DEFAULT_TICK,
             max_age_ticks: Self::DEFAULT_MAX_AGE_TICKS,
         }
     }
 
-    /// The resolution ages are measured at, in nanoseconds.
-    pub fn with_tick(mut self, tick_nanos: u128) -> Self {
-        assert!(tick_nanos > 0, "tick_nanos must be non-zero");
-        self.tick_nanos = tick_nanos;
+    /// The resolution ages are measured at, in units of whatever clock the
+    /// caller puts in `Maker.arrival` — arrivals, as the engine uses it.
+    pub fn with_tick(mut self, tick: u128) -> Self {
+        assert!(tick > 0, "tick must be non-zero");
+        self.tick = tick;
         self
     }
 
@@ -363,7 +394,7 @@ impl TimeProRataMatcher {
     /// Degenerating to "brand new" is the right answer there; panicking or
     /// wrapping to a colossal age is not.
     fn age_ticks(&self, maker: &Maker, now: u128) -> u128 {
-        (now.saturating_sub(maker.arrival) / self.tick_nanos).clamp(1, self.max_age_ticks)
+        (now.saturating_sub(maker.arrival) / self.tick).clamp(1, self.max_age_ticks)
     }
 
     /// Weights, normalized so each one fits `u64`.
@@ -393,6 +424,10 @@ impl TimeProRataMatcher {
 }
 
 impl MatchingAlgorithm for TimeProRataMatcher {
+    fn lot_size(&self) -> Option<u64> {
+        Some(self.lot_size)
+    }
+
     fn allocate(&self, available: Qty, makers: &[Maker], now: u128) -> Vec<Fill> {
         // Base units for the duration, `Qty` back on at the end — same reason
         // as `ProRataMatcher`: the widening to u128 is the entire point, and
@@ -1022,14 +1057,14 @@ mod tests {
 
     // --------------------------------------------------------- TIME PRO-RATA
 
-    /// Unit lot and a one-nanosecond tick, so an age in ticks IS the raw gap
+    /// Unit lot and a one-per-arrival tick, so an age in ticks IS the raw gap
     /// and every number below can be checked by hand.
     fn time_pro_rata() -> TimeProRataMatcher {
         TimeProRataMatcher::new(1).with_tick(1)
     }
 
     /// The whole point, in one case. Three makers of equal size that arrived
-    /// one nanosecond apart, read at `now = 3`: ages 3/2/1, so weights 30/20/10
+    /// one after another, read at `now = 3`: ages 3/2/1, so weights 30/20/10
     /// and the shares split 7/5/2 with the leftover lot going to the front by
     /// time priority. Pro-rata, which cannot see the difference, would hand out
     /// 5/5/5 — asserted here so the contrast is part of the test rather than a
@@ -1204,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tick_nanos must be non-zero")]
+    #[should_panic(expected = "tick must be non-zero")]
     fn a_zero_tick_is_rejected_loudly() {
         TimeProRataMatcher::new(1).with_tick(0);
     }
@@ -1380,5 +1415,18 @@ mod tests {
                 prop_assert!(f.quantity.base().is_multiple_of(lot));
             }
         }
+    }
+
+    // ------------------------------------------------- THE DECLARED LOT SIZE
+
+    /// The flip side of the property above: FIFO declares no lot because it
+    /// needs none, and the two allocators that divide declare the one they
+    /// were built with. The engine reads exactly this to refuse a matcher
+    /// built for the wrong instrument.
+    #[test]
+    fn only_the_allocators_that_divide_declare_a_lot() {
+        assert_eq!(FifoMatcher.lot_size(), None);
+        assert_eq!(ProRataMatcher::new(25).lot_size(), Some(25));
+        assert_eq!(TimeProRataMatcher::new(25).lot_size(), Some(25));
     }
 }

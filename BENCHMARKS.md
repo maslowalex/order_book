@@ -296,3 +296,176 @@ the Phase 6.2 methodology note. They are scored in observation 5.
    whichever scale created it first — making the scale a trade printed at depend on arrival
    order. That bug is gone by construction, as is any off-tick price or off-lot quantity. Had the
    wide-distribution numbers come back flat, that would still have been the result worth keeping.
+
+---
+
+# Phase 5.3 — allocation through the trait (2026-08-14)
+
+`fill_against` stopped running a hardcoded FIFO loop and started calling
+`MatchingAlgorithm::allocate` on every price level it touches. `OrderBook` became
+`OrderBook<M: MatchingAlgorithm>`, `Order` gained an engine-stamped `arrival`, and self-trade
+prevention became a pre-pass over the whole level.
+
+- **`post-tick`** — the `post` column from the tick/lot section above. It is the real parent of
+  this work, and the comparison that means anything. It was never saved as a criterion baseline,
+  so the Δ column is computed against the figures recorded in this file.
+- **`phase53`** — this work, saved as criterion baseline `phase53`. **Use this, not `phase62`,
+  as the Tier 0 number for 6.2a**: `phase62` predates the tick/lot migration and conflates two
+  changes.
+
+Same machine and toolchain as the runs above. Reproduce with
+`cargo bench --bench order_book -- --baseline phase53`.
+
+**Two rows are rebased and are NOT comparable to any earlier column.** `best_bid` and `spread`
+now `black_box` the *book*, not just the result — see observation 4. Their earlier figures were
+measuring a hoisted constant.
+
+**Thermal caveat, and it is not small.** These numbers were taken after roughly an hour of
+back-to-back benching on a fanless M3. The `scenarios` group (`sample_size(10)`) drifted 4–10%
+between consecutive identical runs, and `cancel_storm/wide/100000` carried a ±18% confidence
+interval. Scenario figures below are the median of repeated runs, and any scenario Δ under ~15%
+should be read as noise. The core and submit groups were stable to ~2%.
+
+## Core operations (per op)
+
+| Benchmark | post-tick | phase53 | Δ |
+|---|---:|---:|---:|
+| `add_order/tight/100` | 85 ns | 101 ns | +19% |
+| `add_order/tight/1000` | 76 ns | 75.2 ns | −1% |
+| `add_order/tight/10000` | 68 ns | 67.5 ns | −1% |
+| `add_order/tight/100000` | 85 ns | 83.0 ns | −2% |
+| `add_order/wide/100` | 71 ns | 74.1 ns | +4% |
+| `add_order/wide/1000` | 78 ns | 79.8 ns | +2% |
+| `add_order/wide/10000` | 97 ns | 99.4 ns | +2% |
+| `add_order/wide/100000` | 263 ns | 297 ns | +13% |
+| `cancel_order/tight/100` | 91 ns | 90.9 ns | 0% |
+| `cancel_order/tight/1000` | 127 ns | 127 ns | 0% |
+| `cancel_order/tight/10000` | 494 ns | 501 ns | +1% |
+| `cancel_order/tight/100000` | 4.51 µs | 4.49 µs | 0% |
+| `cancel_order/wide/100` | 119 ns | 117 ns | −2% |
+| `cancel_order/wide/1000` | 120 ns | 128 ns | +6% |
+| `cancel_order/wide/10000` | 157 ns | 171 ns | +9% |
+| `cancel_order/wide/100000` | 370 ns | 344 ns | −7% |
+
+## Top-of-book reads (single op)
+
+| Benchmark | post-tick | phase53 | Δ |
+|---|---:|---:|---:|
+| `best_bid` (tight/100) | 1.331 ns | 0.820 ns | *rebased* |
+| `best_bid` (tight/100k) | 1.333 ns | 0.823 ns | *rebased* |
+| `best_bid` (wide/100) | 1.329 ns | 0.827 ns | *rebased* |
+| `best_bid` (wide/100k) | 2.659 ns | 2.145 ns | *rebased* |
+| `spread` (tight/100k) | 1.858 ns | 2.159 ns | *rebased* |
+| `best_bid_level_clone` (tight/100k) | 87.3 µs | 92.7 µs | +6% |
+| `best_bid_level_clone` (wide/100k) | 193 ns | 199 ns | +3% |
+
+## Matching path (`submit`, per op)
+
+| Benchmark | post-tick | phase53 | Δ |
+|---|---:|---:|---:|
+| `rest_limit/tight/10000` | 296 ns | 295 ns | 0% |
+| `rest_limit/wide/10000` | 177 ns | 189 ns | +7% |
+| `cross_limit/levels/1` | 1.63 µs | 1.78 µs | +9% |
+| `cross_limit/levels/5` | 7.27 µs | 7.48 µs | +3% |
+| `cross_limit/levels/20` | 27.76 µs | 29.96 µs | +8% |
+| `market/levels/1` | 1.63 µs | 1.73 µs | +6% |
+| `market/levels/20` | 27.54 µs | 30.05 µs | +9% |
+
+## Scenarios (per op, median of repeated runs)
+
+| Benchmark | post-tick | phase53 | Δ |
+|---|---:|---:|---:|
+| `burst_1000/tight` | 346 ns | **440 ns** | **+27%** |
+| `burst_1000/wide` | 285 ns | 337 ns | +18% |
+| `cancel_storm/tight/10000` | 308 ns | 316 ns | +3% |
+| `cancel_storm/tight/100000` | 2.36 µs | 2.55 µs | +8% |
+| `cancel_storm/wide/10000` | 169 ns | 184 ns | +9% |
+| `cancel_storm/wide/100000` | 268 ns | 357 ns | +33% (±18% CI — unreliable) |
+
+## Allocation policy (new group, `matcher/*`)
+
+The policy axis with the storage layout held fixed: same ladder, same takers, three matchers.
+
+| Benchmark | FIFO | pro-rata | time-pro-rata |
+|---|---:|---:|---:|
+| `matcher/levels/1` (one partial level) | 962 ns | 1.459 µs **+52%** | 1.524 µs **+58%** |
+| `matcher/levels/20` (19 full + 1 partial) | 28.35 µs | 29.35 µs +4% | 29.33 µs +3% |
+
+## Observations
+
+1. **The headline is a layout accident, and it cost 14% of `Order` for one field.** `arrival`
+   was written as `u64` first, and `Order` went **112 → 128 bytes**. Not the 8 bytes the field
+   holds: `timestamp` is a `u128`, so `Order` aligns to 16, and 106 bytes of content had exactly
+   6 bytes of tail padding — enough for a `u32`, not enough for a `u64`, so the field pushed the
+   struct over a boundary and took a whole 16-byte step. Measured, both ways, with
+   `size_of::<Order>()`.
+
+   The `u64` version cost **+24% on `add_order/tight/10000`, +16% on `cancel_order/tight/100000`,
+   +27% on `rest_limit/tight`**. Narrowing to `u32` — free, it lands in the padding — brought all
+   three back to **−1%, 0%, 0%**. Every one of those benchmarks is bound by walking or memmoving
+   a level's `Vec`, so they are counting bytes per element and nothing else, which is why the
+   tight distribution (deep levels) took it all and wide barely noticed.
+
+   The price is a ~4.29-billion-rest ceiling per book, enforced with `checked_add` rather than
+   left to wrap — a wrapped counter would make the newest order at a level read as the oldest and
+   silently invert time priority, which is the one thing the field exists to establish.
+
+2. **The abstraction has a real cost, and it is the projection, not the dispatch.** `allocate`
+   takes `&[Maker]`, so `fill_against` must materialise the *whole* level before it can allocate
+   anything — `makers.extend(level.makers())` is O(level) no matter how little the taker
+   consumes. The old FIFO loop was O(makers actually touched).
+
+   The distribution split is the evidence. `burst_1000` is **+27% tight, +18% wide**, and tight
+   at N=10k packs 10,000 orders into ~40 levels — **~250 makers per level**, against a taker
+   drawing qty 1..=50 that needs one or two of them. Wide spreads the same orders over ~20k
+   levels, so there is almost nothing to project and the regression is proportionally smaller.
+   The `submit` group agrees more mildly (+3…+9%) because its ladder holds only 10 makers a level.
+
+   This is not a bug in the implementation; it is what `allocate(&[Maker])` *means*. Pro-rata
+   genuinely needs the level total before it can apportion. FIFO does not, and pays anyway.
+   Per the project's own rule the fix waits for a flamegraph (6.3), but the shape is already
+   visible: either a fast path for policies that don't need the whole level, or a projection the
+   matcher pulls lazily. Worth deciding *before* 6.2a swaps the storage under it.
+
+3. **Static dispatch cost nothing measurable, as predicted.** `allocate` is called once per price
+   level and does O(level) work inside, so even a vtable would have amortised away — which is why
+   5.2's dispatch question was never a performance question. The `matcher/*` group confirms the
+   flip side: with dispatch free, the +52% at `levels/1` is *all* policy — pro-rata touching all
+   ten makers on a partial level where FIFO touches five, at two `String` clones per `Trade`.
+   At `levels/20` that shrinks to +3…4%, because nineteen of the twenty levels are consumed whole
+   and every matcher takes its `available >= total` early return on those.
+
+4. **A benchmark was measuring a hoisted constant, and the generic change exposed it.**
+   `best_bid` reads a book that never changes with `black_box` on the *result* only, leaving the
+   whole call loop-invariant. It reported **0.55 ns** — under 1.5 cycles, less than a `BTreeMap`
+   first-key descent can possibly cost. Fencing the book with `black_box(&book)` gives **0.82 ns**.
+
+   The weakness dates to the Phase 6.2 harness; making `OrderBook` generic just gave the
+   optimizer enough to act on it. Two consequences worth carrying forward: the `best_bid`/`spread`
+   rows are rebased and not comparable to `phase62` or `pre-ticks`, and **6.2a must audit every
+   read-only benchmark the same way** before it starts comparing storage layouts, because that is
+   precisely a group of benchmarks where the compiler can delete the work being measured.
+
+5. **The first version of the `matcher/*` group measured nothing, and the reason generalises.**
+   It reused `crossing_takers`, which sizes each taker to consume an exact number of whole levels
+   — so at every level `available >= total`, every weighted matcher took its take-everything
+   early return, and all three "policies" allocated byte-for-byte identically. The group showed
+   FIFO 1.722 µs vs pro-rata 1.772 µs and looked like a legitimate 3% result.
+
+   `partial_takers` (demand `levels_each · depth − depth/2`, so the last level is always partial)
+   turned that into the +52% above. The lesson for 6.2a: a benchmark can exercise the code path
+   under test and still route it entirely through a degenerate branch. Check that the thing you
+   are comparing is actually doing different work before believing a small delta.
+
+6. **`market/levels/20` printed +113% once and it was a phantom.** Re-measured immediately, the
+   same benchmark came back at 30.05 µs (+9%), in line with `cross_limit/levels/20`'s +8%;
+   criterion's own change detection called the stored value 48.9% worse than reality. Recorded
+   here because an unreproduced 2× on a tracked artifact is how a phantom becomes folklore — and
+   because it is the concrete argument for the thermal caveat at the top of this section.
+
+7. **What this bought.** The book can be told how to allocate: `OrderBook::new(spec,
+   ProRataMatcher::new(lot))` and the whole engine changes policy, with the same nine property
+   invariants holding against all three matchers (plus a differential property asserting the
+   three agree on every total). The measured price is +3…9% on the match path and +27% on the
+   deep-level burst, all of it in observation 2's projection, all of it recoverable behind the
+   same seam that makes 6.2a possible.

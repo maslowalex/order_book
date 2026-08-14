@@ -38,11 +38,13 @@ use std::time::Duration;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
+use order_book::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
 
 /// Deterministic workload generation. Self-contained because
 /// `src/test_helpers.rs` is `#[cfg(test)]`-private and invisible to bench
 /// targets (benches link the lib as an external crate).
 mod generators {
+    use order_book::allocation::{FifoMatcher, MatchingAlgorithm};
     use order_book::instrument::{InstrumentSpec, Qty};
     use order_book::orderbook::OrderBook;
     use order_book::types::{ExchangeId, Order, OrderType, Price, Side};
@@ -136,9 +138,9 @@ mod generators {
     /// clones behave identically). Returns the exchange ids pre-shuffled for
     /// cancel benchmarks. Client ids are all distinct (`maker-{i}`) so no
     /// submit benchmark can accidentally trip self-trade prevention.
-    pub fn seeded_book(dist: Dist, n: usize) -> (OrderBook, Vec<ExchangeId>) {
+    pub fn seeded_book(dist: Dist, n: usize) -> (OrderBook<FifoMatcher>, Vec<ExchangeId>) {
         let mut rng = StdRng::seed_from_u64(SEED);
-        let mut book = OrderBook::new(dist.spec());
+        let mut book = OrderBook::new(dist.spec(), FifoMatcher);
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
             let side = if rng.random_range(0..2) == 0 {
@@ -225,9 +227,17 @@ mod generators {
     /// levels from 100.25 upward in 0.25 steps, each holding `per_level` makers
     /// of `qty` — so level depth is exactly `per_level * qty` and a taker can
     /// be sized to consume an exact number of levels by construction.
-    pub fn matching_book(levels: usize, per_level: usize, qty: u64) -> OrderBook {
+    /// The allocation policy is a parameter because the `matcher/*` group
+    /// benches the *same* ladder under each one — the whole point being to
+    /// isolate the cost of the policy from the cost of the layout.
+    pub fn matching_book<M: MatchingAlgorithm>(
+        matcher: M,
+        levels: usize,
+        per_level: usize,
+        qty: u64,
+    ) -> OrderBook<M> {
         let spec = quarter_tick();
-        let mut book = OrderBook::new(spec);
+        let mut book = OrderBook::new(spec, matcher);
         for j in 0..levels {
             let price = spec
                 .price_from_minor(10_025 + (j as u64) * 25)
@@ -264,6 +274,39 @@ mod generators {
                         .price_from_minor(10_025 + last_level * 25)
                         .expect("takers land on ladder levels"),
                     levels_each as u64 * level_depth,
+                    3_000_000 + j as u128,
+                )
+            })
+            .collect()
+    }
+
+    /// Takers that leave **half a level** standing, for the `matcher/*` group.
+    ///
+    /// `crossing_takers` cannot measure an allocation policy, and the reason is
+    /// worth writing down: it sizes each taker to consume an exact number of
+    /// whole levels, so at every level `available >= total` and every weighted
+    /// matcher takes its "the taker swallows the level whole" early return —
+    /// allocating byte-for-byte what FIFO would. The policies only diverge on a
+    /// level the taker *cannot* finish, which is exactly what this generator
+    /// guarantees: demand is `levels_each * level_depth − level_depth/2`, so
+    /// the last level touched is always partial.
+    ///
+    /// Regions stay disjoint. Taker `j`'s limit price sits at the last level of
+    /// its own block, so it can never reach into taker `j+1`'s; and its demand
+    /// is under what its block plus the previous taker's leftover holds, so it
+    /// always fills completely and no `rest_limit` cost leaks into the numbers.
+    pub fn partial_takers(count: usize, levels_each: usize, level_depth: u64) -> Vec<Order> {
+        (0..count)
+            .map(|j| {
+                let last_level = ((j + 1) * levels_each - 1) as u64;
+                limit(
+                    format!("taker-{j}"),
+                    format!("taker-{j}"),
+                    Side::Bid,
+                    quarter_tick()
+                        .price_from_minor(10_025 + last_level * 25)
+                        .expect("takers land on ladder levels"),
+                    levels_each as u64 * level_depth - level_depth / 2,
                     3_000_000 + j as u128,
                 )
             })
@@ -390,6 +433,21 @@ fn bench_cancel_order(c: &mut Criterion) {
 /// whole PriceLevel — at tight/100k that's ~2.5k orders × 2 heap Strings each,
 /// expect orders of magnitude over `best_bid`. Fix candidate for Phase 6.4:
 /// return `Option<&PriceLevel>`.
+/// Top-of-book reads.
+///
+/// **The book itself is `black_box`ed, not just the result**, and that is not
+/// decoration. These routines read a book that never changes, so the whole call
+/// is loop-invariant: `black_box` on the *return value* alone still lets the
+/// compiler hoist the read out of the iteration loop and time an already-known
+/// answer. It measurably did — `best_bid/tight` reported 0.55 ns unguarded
+/// (≈1.5 cycles, less than a `BTreeMap` first-key descent can possibly cost)
+/// against 0.82 ns with the book fenced.
+///
+/// The weakness predates the matcher work; making `OrderBook` generic just gave
+/// the optimizer more to work with and pushed the artifact into the open. It
+/// means the `best_bid` figures here are NOT comparable with the `phase62` and
+/// `pre-ticks` columns in BENCHMARKS.md, which were taken with the old, leakier
+/// routine. Consider that row rebased.
 fn bench_best_price(c: &mut Criterion) {
     let mut group = c.benchmark_group("best_price");
     for dist in DISTS {
@@ -397,7 +455,7 @@ fn bench_best_price(c: &mut Criterion) {
             let (book, _) = generators::seeded_book(dist, n);
             group.bench_function(
                 BenchmarkId::new(format!("best_bid/{}", dist.name), n),
-                |b| b.iter(|| black_box(book.best_bid())),
+                |b| b.iter(|| black_box(black_box(&book).best_bid())),
             );
             if n == 100_000 {
                 group.bench_function(
@@ -409,7 +467,7 @@ fn bench_best_price(c: &mut Criterion) {
     }
     let (book, _) = generators::seeded_book(generators::TIGHT, 100_000);
     group.bench_function("spread/tight/100000", |b| {
-        b.iter(|| black_box(book.spread()))
+        b.iter(|| black_box(black_box(&book).spread()))
     });
     group.finish();
 }
@@ -453,7 +511,7 @@ fn bench_submit(c: &mut Criterion) {
     }
 
     // 1000 levels × (10 makers × qty 10) = 10k orders, level depth exactly 100.
-    let ladder = generators::matching_book(1_000, 10, 10);
+    let ladder = generators::matching_book(FifoMatcher, 1_000, 10, 10);
     const TAKERS: usize = 50;
 
     for levels_each in [1usize, 5, 20] {
@@ -559,12 +617,92 @@ fn bench_scenarios(c: &mut Criterion) {
     group.finish();
 }
 
+/// What the allocation POLICY costs, with the storage layout held fixed.
+///
+/// The same ladder, the same takers, three matchers — so the only variable is
+/// how a level is apportioned. This is the axis Phase 5 introduced; 6.2a adds
+/// the orthogonal one (layout), and keeping them in separate groups is what
+/// lets either be read without the other confounding it.
+///
+/// Takers come from `partial_takers`, NOT `crossing_takers`, and that choice is
+/// the whole validity of this group: a taker sized to whole levels hits every
+/// weighted matcher's `available >= total` early return and allocates exactly
+/// what FIFO would, so the benchmark would have compared three spellings of the
+/// same work. Leaving half a level standing is what makes the policies do
+/// different things.
+///
+/// On that half-full level the ladder's 10 makers per level is what the
+/// divergence rides on: FIFO fills 5 makers and stops, a weighted policy gives
+/// all 10 a share — twice the `Trade` values, each carrying two `String` clones.
+/// `levels_each ∈ {1, 20}` separates "one partial level, allocation dominates"
+/// from "nineteen full levels plus one partial, the walk dominates".
+fn bench_matcher(c: &mut Criterion) {
+    let mut group = c.benchmark_group("matcher");
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .measurement_time(Duration::from_secs(10));
+
+    const TAKERS: usize = 50;
+    let lot = generators::quarter_tick().lot_size();
+
+    // One generic body, three instantiations — the benched code is identical
+    // across policies, which is the only way the comparison means anything.
+    fn run<M: MatchingAlgorithm + Clone>(
+        group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+        name: &str,
+        matcher: M,
+        levels_each: usize,
+        takers: &[order_book::types::Order],
+    ) {
+        let ladder = generators::matching_book(matcher, 1_000, 10, 10);
+        group.throughput(Throughput::Elements(TAKERS as u64));
+        group.bench_with_input(
+            BenchmarkId::new(format!("{name}/levels"), levels_each),
+            &(),
+            |b, _| {
+                b.iter_batched(
+                    || (ladder.clone(), takers.to_vec()),
+                    |(mut book, takers)| {
+                        for taker in takers {
+                            black_box(book.submit(taker)).unwrap();
+                        }
+                        book
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+
+    for levels_each in [1usize, 20] {
+        let takers = generators::partial_takers(TAKERS, levels_each, 100);
+        run(&mut group, "fifo", FifoMatcher, levels_each, &takers);
+        run(
+            &mut group,
+            "pro_rata",
+            ProRataMatcher::new(lot),
+            levels_each,
+            &takers,
+        );
+        run(
+            &mut group,
+            "time_pro_rata",
+            TimeProRataMatcher::new(lot),
+            levels_each,
+            &takers,
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_add_order,
     bench_cancel_order,
     bench_best_price,
     bench_submit,
-    bench_scenarios
+    bench_scenarios,
+    bench_matcher
 );
 criterion_main!(benches);
