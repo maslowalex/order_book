@@ -120,18 +120,13 @@ impl OrderType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OrderLifecycle {
+    #[default]
     New,
     PartiallyFilled, // represents how much is filled
     Filled,
     Cancelled,
-}
-
-impl Default for OrderLifecycle {
-    fn default() -> OrderLifecycle {
-        OrderLifecycle::New
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

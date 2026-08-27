@@ -469,3 +469,60 @@ The policy axis with the storage layout held fixed: same ladder, same takers, th
    three agree on every total). The measured price is +3…9% on the match path and +27% on the
    deep-level burst, all of it in observation 2's projection, all of it recoverable behind the
    same seam that makes 6.2a possible.
+
+---
+
+# Phase 6.2a — storage seam and dense tick ladder (2026-08-27)
+
+The active book is now `OrderBook<M, S = BTreeStore>`, with the existing BTree maps and a
+`TickLadderStore` implementing the same `OrderBookStore` trait. The storage group holds FIFO,
+orders, random seed, finite instrument band, and timed operation constant. Tight spans 41 legal
+ticks per side; wide spans 19,901. Setup and cloning remain outside the timed routine, and
+read-only calls fence the book itself.
+
+## Direct comparison
+
+Medians from `cargo bench --bench order_book -- storage`:
+
+| workload | BTreeStore | TickLadderStore | ladder Δ |
+|---|---:|---:|---:|
+| add / tight / 100 | 86.7 ns/op | 85.6 ns/op | −1% |
+| add / tight / 10k | 67.9 ns/op | 64.3 ns/op | −5% |
+| add / tight / 100k | 90.3 ns/op | 81.2 ns/op | −10% |
+| cancel / tight / 100k | 4.66 µs/op | 4.65 µs/op | flat |
+| burst 1000 / tight | 436 µs | 431 µs | −1% |
+| add / wide / 100k | 310 ns/op | 259 ns/op | −17% |
+| cancel / wide / 100k | 399 ns/op | 305 ns/op | −24% |
+| best bid / wide / 100k | 1.60 ns | 0.85 ns | −47% |
+| burst 1000 / wide | 339 µs | 313 µs | −8% |
+| cross 20 levels × 50 | 1.45 ms | 1.42 ms | −2% (noise) |
+
+Chunk rows above are divided by Criterion's `Throughput::Elements`; the displayed group time is
+the whole chunk. At small N the cached ladder touch is slower than BTree's already-hot first node
+(about 0.84 ns vs 0.72 ns on tight), so “O(1)” is not shorthand for “always faster.”
+
+## The benchmark caught a broken first attempt
+
+The initial ladder repaired a removed best by scanning from the array boundary. On the wide
+burst it took **1.84 ms against BTree's 346 µs** — 5.3× slower — and a sequential ask sweep
+revisited a growing empty prefix after every level. Repair now searches only beyond the removed
+touch. The wide burst dropped to **313 µs** and the 20-level crossing workload to **1.42 ms**.
+This is the distribution lesson in executable form: price-as-index is cheap; repeatedly walking
+empty price space is not.
+
+## BTree seam regression against `phase53`
+
+Representative unbounded BTree reruns used the unchanged legacy benchmark names and
+`--baseline phase53`. Mixed bursts remained within noise and the 20-level sweep improved about
+2%. After explicit inlining, `best_bid` improved 17% tight / 26% wide. Cancel at 100k was +2.7%
+tight and statistically unchanged wide. `add_order/tight/100k` retained a measured ~7%
+regression, while wide was noisy across runs; this is the known price of keeping rollback-safe
+fallible store insertion behind the public trait rather than assuming every backend accepts an
+order after the id index has been mutated.
+
+## Memory conclusion is deliberately limited
+
+The ladder reserves 2 × 41 slots for tight and 2 × 19,901 for wide — **485× more slots** for the
+wide distribution before order queues are counted. This run measured CPU latency, not resident
+heap size, so it does not claim the ladder is the overall winner. Phase 6.3 memory profiling is
+the gate for that conclusion.

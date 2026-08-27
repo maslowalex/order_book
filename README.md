@@ -207,8 +207,56 @@ id-carrying fill would heap-allocate on the hot path *and* force a second linear
 to find the maker again. An index is `Copy`, free, and carries zero information about
 how orders are stored.
 
-The book is `OrderBook<M: MatchingAlgorithm>`, so policy and storage layout are two
-independent axes. Only the first is a type parameter today.
+The book is `OrderBook<M: MatchingAlgorithm, S: OrderBookStore = BTreeStore>`, so
+policy and storage layout are independent static-dispatch axes. The default keeps
+`OrderBook::new(spec, matcher)` source-compatible with the original BTree layout;
+alternative stores use the fallible `OrderBook::<M, S>::try_new` constructor.
+
+---
+
+## Storage
+
+### The active book is behind a trait; stops are not
+
+`OrderBookStore` owns only active bid/ask levels. Stop queues, exchange sequence,
+arrival clock, admission policy, and the unified id index remain in `OrderBook` because
+they are engine state rather than competing price-level layouts. The trait exposes
+ordered level iteration through a GAT, so neither backend boxes an iterator or allocates
+to answer `depth()` and FOK fillability checks.
+
+The first contender is `TickLadderStore`: one `Option<PriceLevel>` slot per legal tick
+per side, with cached best indices. It requires a finite `InstrumentSpec::max_price()`;
+constructing it for an unbounded instrument returns `StoreError::UnboundedPriceRange`
+instead of gambling on an allocation derived from an arbitrary `u64` price.
+
+### Cached-best repair starts where the old best disappeared
+
+The first implementation rescanned the ladder from its boundary whenever matching
+drained the touch. That made the wide mixed burst **5.3× slower** than BTree and made a
+sequential sweep trend toward quadratic work. The benchmark found a real algorithm bug,
+not a constant: after removing the best ask, the only possible next ask is above that
+index (and the next bid is below its removed index). Repair now resumes there. The same
+wide burst fell from 1.84 ms to 313 µs.
+
+### First bake-off: arithmetic lookup wins, empty slots are the bill
+
+Representative medians from the bounded, FIFO-held-constant `storage/*` group on
+2026-08-27:
+
+| workload | BTree | tick ladder | ladder delta |
+|---|---:|---:|---:|
+| add, tight, 100k | 903 µs | 812 µs | −10% |
+| cancel, tight, 100k | 46.56 ms | 46.48 ms | flat |
+| burst 1k, tight | 436 µs | 431 µs | −1% |
+| add, wide, 100k | 3.10 ms | 2.59 ms | −17% |
+| cancel, wide, 100k | 3.99 ms | 3.05 ms | −24% |
+| burst 1k, wide | 339 µs | 313 µs | −8% |
+| cross 20 levels × 50 | 1.45 ms | 1.42 ms | −2% (noise) |
+
+The tight range allocates 41 slots per side; the wide range allocates 19,901 — **485×
+as many slots** even before either holds an order. The ladder still won most wide CPU
+rows because direct indexing avoided tree walks, but this run did not measure heap
+residency. It is therefore a latency result, not permission to ignore the memory cost.
 
 ### Static dispatch — and the dispatch was never the cost
 
@@ -373,9 +421,8 @@ neighbouring lessons, both recorded rather than quietly fixed:
 ## Open questions
 
 - **The projection cost.** `allocate(&[Maker])` materialises whole levels for policies
-  that don't need them. Either a fast path for those, or a projection the matcher
-  pulls lazily — and it wants deciding *before* the storage layout changes underneath
-  it.
+  that don't need them. It was deliberately held constant for the first storage
+  comparison; a future fast path or lazy projection needs its own isolated A/B.
 - **Cancel is the tail.** ~4.5 µs at 100k orders on a tight book, against ~344 ns on a
   wide one, because `PriceLevel::remove_order` linearly scans a `Vec` with `String`
   compares and then shifts. Compaction after a sweep has the same shape: O(level)

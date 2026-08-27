@@ -1,11 +1,12 @@
 use std::cmp;
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
 
 use crate::allocation::{Fill, Maker, MatchingAlgorithm};
 use crate::instrument::Qty;
 use crate::orderbook::{OrderBook, OrderBookError, OrderLocation};
-use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, PriceLevel, Side, TimeInForce};
+use crate::storage::OrderBookStore;
+use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 
 /// A single executed fill between a resting maker and an incoming taker.
 ///
@@ -64,7 +65,13 @@ struct MatchingResult {
     pub outcome: SubmitOutcome,
 }
 
-impl<M: MatchingAlgorithm> OrderBook<M> {
+#[derive(Debug, Clone, Copy)]
+struct SweepContext {
+    now: u128,
+    lot: u64,
+}
+
+impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     /// Submit an order to be matched against the book, resting any remainder
     /// (limit) or discarding it (market). Contrast with `add_order`, which
     /// always rests without matching (used for seeding the book).
@@ -224,22 +231,22 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
         let (now, lot) = (self.arrival_now(), self.lot_size());
         let (trades, cancelled) = match order.side {
             Side::Bid => fill_against(
-                &mut self.asks,
+                &mut self.store,
+                Side::Ask,
                 &mut self.index,
                 &self.matcher,
                 &mut order,
                 Some(limit),
-                now,
-                lot,
+                SweepContext { now, lot },
             ),
             Side::Ask => fill_against(
-                &mut self.bids,
+                &mut self.store,
+                Side::Bid,
                 &mut self.index,
                 &self.matcher,
                 &mut order,
                 Some(limit),
-                now,
-                lot,
+                SweepContext { now, lot },
             ),
         };
 
@@ -286,8 +293,8 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
         limit: Price,
     ) -> Result<MatchingResult, OrderBookError> {
         let available = match order.side {
-            Side::Bid => fillable_quantity(&self.asks, &order, limit),
-            Side::Ask => fillable_quantity(&self.bids, &order, limit),
+            Side::Bid => fillable_quantity(&self.store, Side::Ask, &order, limit),
+            Side::Ask => fillable_quantity(&self.store, Side::Bid, &order, limit),
         };
 
         if available < order.remaining_quantity {
@@ -301,22 +308,22 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
         let (now, lot) = (self.arrival_now(), self.lot_size());
         let (trades, cancelled) = match order.side {
             Side::Bid => fill_against(
-                &mut self.asks,
+                &mut self.store,
+                Side::Ask,
                 &mut self.index,
                 &self.matcher,
                 &mut order,
                 Some(limit),
-                now,
-                lot,
+                SweepContext { now, lot },
             ),
             Side::Ask => fill_against(
-                &mut self.bids,
+                &mut self.store,
+                Side::Bid,
                 &mut self.index,
                 &self.matcher,
                 &mut order,
                 Some(limit),
-                now,
-                lot,
+                SweepContext { now, lot },
             ),
         };
         debug_assert!(
@@ -336,22 +343,22 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
         let (now, lot) = (self.arrival_now(), self.lot_size());
         let (trades, cancelled) = match order.side {
             Side::Bid => fill_against(
-                &mut self.asks,
+                &mut self.store,
+                Side::Ask,
                 &mut self.index,
                 &self.matcher,
                 &mut order,
                 None,
-                now,
-                lot,
+                SweepContext { now, lot },
             ),
             Side::Ask => fill_against(
-                &mut self.bids,
+                &mut self.store,
+                Side::Bid,
                 &mut self.index,
                 &self.matcher,
                 &mut order,
                 None,
-                now,
-                lot,
+                SweepContext { now, lot },
             ),
         };
 
@@ -389,11 +396,16 @@ fn activate(mut order: Order) -> Order {
 /// taker's client are EXCLUDED: self-trade prevention cancels them instead of
 /// trading, so counting them would overpromise and let a "fill or kill"
 /// partially fill. Returns early once `taker.remaining_quantity` is reachable.
-fn fillable_quantity<K: Ord>(side: &BTreeMap<K, PriceLevel>, taker: &Order, limit: Price) -> Qty {
+fn fillable_quantity<S: OrderBookStore>(
+    store: &S,
+    maker_side: Side,
+    taker: &Order,
+    limit: Price,
+) -> Qty {
     let needed = taker.remaining_quantity;
     let mut available: Qty = Qty::ZERO;
 
-    for level in side.values() {
+    for level in store.levels(maker_side) {
         let crosses = match taker.side {
             Side::Bid => level.price <= limit,
             Side::Ask => level.price >= limit,
@@ -432,19 +444,17 @@ fn fillable_quantity<K: Ord>(side: &BTreeMap<K, PriceLevel>, taker: &Order, limi
 /// the prefix a FIFO walk would have reached — see the note on the pre-pass
 /// below.
 ///
-/// Generic over the key type so one body serves both `asks` (keyed by `Price`)
-/// and `bids` (keyed by `Reverse<Price>`) — the level carries its own `price`,
-/// so only the key's ordering differs. Taking the side map, index and matcher
-/// as separate args (rather than `&mut self`) is what keeps the borrows
-/// disjoint.
-fn fill_against<K: Ord, M: MatchingAlgorithm>(
-    side: &mut BTreeMap<K, PriceLevel>,
+/// Taking the store, index and matcher as separate args (rather than `&mut
+/// self`) keeps the field borrows disjoint while making this walk independent
+/// of the concrete level layout.
+fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
+    store: &mut S,
+    maker_side: Side,
     index: &mut HashMap<ExchangeId, OrderLocation>,
     matcher: &M,
     taker: &mut Order,
     limit: Option<Price>,
-    now: u128,
-    lot: u64,
+    context: SweepContext,
 ) -> (Vec<Trade>, Vec<ExchangeId>) {
     let mut trades: Vec<Trade> = vec![];
     let mut cancelled: Vec<ExchangeId> = vec![];
@@ -456,10 +466,9 @@ fn fill_against<K: Ord, M: MatchingAlgorithm>(
 
     while !taker.remaining_quantity.is_zero() {
         // best opposing level, or stop — this side of the book is dry
-        let Some(mut level_entry) = side.first_entry() else {
+        let Some(level) = store.best_level_mut(maker_side) else {
             break;
         };
-        let level = level_entry.get_mut();
 
         // a limit order stops once the level no longer crosses its price
         if let Some(limit) = limit {
@@ -480,7 +489,7 @@ fn fill_against<K: Ord, M: MatchingAlgorithm>(
         // without removing it leaves it resting and crossable — a taker's
         // remainder would come to rest through its own untouched order on the
         // other side, and the book would sit crossed — and the un-drained level
-        // would be re-selected by `first_entry` forever. So: remove.
+        // would be re-selected as the backend's best level forever. So: remove.
         //
         // What DOES change here is reach. The old FIFO loop cancelled only the
         // self orders the taker physically walked past, because it stopped the
@@ -503,8 +512,8 @@ fn fill_against<K: Ord, M: MatchingAlgorithm>(
         // passes through `makers()`: sizes and arrivals, oldest first.
         makers.clear();
         makers.extend(level.makers());
-        let fills = matcher.allocate(taker.remaining_quantity, &makers, now);
-        debug_assert_fills(&fills, taker.remaining_quantity, &makers, lot);
+        let fills = matcher.allocate(taker.remaining_quantity, &makers, context.now);
+        debug_assert_fills(&fills, taker.remaining_quantity, &makers, context.lot);
 
         // Apply forward, removing nothing: the fills index into `makers`, and
         // `makers` is positional, so a removal mid-loop would silently shift
@@ -549,8 +558,9 @@ fn fill_against<K: Ord, M: MatchingAlgorithm>(
             level.orders.is_empty() || taker.remaining_quantity.is_zero(),
             "contract (4): a level survives only if the taker is full"
         );
-        if level.orders.is_empty() {
-            level_entry.remove(); // level drained → drop it, move to the next price
+        let level_empty = level.orders.is_empty();
+        if level_empty {
+            store.remove_level(maker_side, price); // drained → advance to next price
         } else {
             break; // level survived → the taker must be full
         }
@@ -771,7 +781,7 @@ mod tests {
         assert!(!ob.index.contains_key(&id("a1")));
         assert_eq!(ob.best_ask(), Some(px(101)));
         assert_eq!(ob.best_ask_level().unwrap().total_quantity(), qty(2));
-        assert!(ob.asks.contains_key(&px(102)));
+        assert!(ob.levels(Side::Ask).any(|level| level.price == px(102)));
     }
 
     #[test]
@@ -909,7 +919,7 @@ mod tests {
             (px(100), qty(5))
         );
 
-        assert!(ob.asks.contains_key(&px(102))); // a2 untouched
+        assert!(ob.levels(Side::Ask).any(|level| level.price == px(102))); // a2 untouched
         assert_eq!(ob.best_bid(), Some(px(100))); // remainder 5 rests
         assert_eq!(ob.best_bid_level().unwrap().total_quantity(), qty(5));
     }

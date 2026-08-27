@@ -1,9 +1,9 @@
-use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::allocation::MatchingAlgorithm;
 use crate::instrument::{InstrumentSpec, Qty, RejectReason, Ticks};
+use crate::storage::{BTreeStore, OrderBookStore, StoreError};
 use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
 
 /// Where a live order physically is — needed by `cancel_order`/`get_order`
@@ -18,22 +18,23 @@ pub enum OrderLocation {
     StopBook { side: Side, trigger: Price },
 }
 
-/// The book, parameterised by the policy it allocates with.
+/// The book, parameterised independently by allocation policy and active-book
+/// storage.
 ///
 /// `M` is the *allocation* axis — who at a price level gets filled, and by how
-/// much. It is deliberately the only axis here: the storage layout (how levels
-/// and queues are physically held) is a separate one, and nothing in matching
-/// may depend on it. The seam that keeps them apart is
+/// much. `S` is the *storage* axis — how active bid/ask levels are found and
+/// held. Matching depends only on [`OrderBookStore`], while allocation sees
+/// each level only through
 /// [`PriceLevel::makers`](crate::types::PriceLevel::makers) — a matcher sees a
 /// slice of sizes and arrivals, never an `Order` and never this struct.
 ///
-/// Note the `Clone` derive quietly adds `M: Clone` (and `Debug` adds
-/// `M: Debug`). Free today — every matcher in the crate is `Copy` — but it is a
-/// real bound on anyone writing a new one.
+/// Note the derives add `Clone`/`Debug` bounds to both parameters. Free for the
+/// built-in policies and stores, but real bounds for third-party types.
 #[derive(Debug, Clone)]
-pub struct OrderBook<M: MatchingAlgorithm> {
-    pub bids: BTreeMap<Reverse<Price>, PriceLevel>, // descending: best (highest) bid first
-    pub asks: BTreeMap<Price, PriceLevel>,          // ascending: best (lowest) ask first
+pub struct OrderBook<M: MatchingAlgorithm, S: OrderBookStore = BTreeStore> {
+    /// Active bid/ask levels. The layout is an independent static-dispatch
+    /// axis from `matcher`.
+    pub(crate) store: S,
     /// Buy stops keyed by trigger, FIFO within one trigger price. A buy stop
     /// fires when the market trades UP to its trigger, so the LOWEST key is
     /// nearest to firing.
@@ -94,9 +95,10 @@ pub enum OrderBookError {
     /// Note what is NOT here: an off-tick price or an off-lot quantity, which
     /// no longer have a way to reach the engine at all.
     Rejected(RejectReason),
+    Storage(StoreError),
 }
 
-impl<M: MatchingAlgorithm> OrderBook<M> {
+impl<M: MatchingAlgorithm> OrderBook<M, BTreeStore> {
     /// A book must be told what instrument it trades AND what policy it
     /// allocates by before it can hold a single order.
     ///
@@ -110,6 +112,13 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
     /// one-cent-tick grid; [`FifoMatcher`](crate::allocation::FifoMatcher) is
     /// the named price-time policy.
     pub fn new(spec: InstrumentSpec, matcher: M) -> Self {
+        Self::try_new(spec, matcher).expect("BTreeStore construction is infallible")
+    }
+}
+
+impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
+    /// Build a book with an explicitly selected storage backend.
+    pub fn try_new(spec: InstrumentSpec, matcher: M) -> Result<Self, StoreError> {
         // A matcher that floors to a lot must floor to THIS instrument's lot.
         // Get this wrong and the damage is not a bad print: off-lot fills are
         // subtracted into the makers, which stay resting, off-grid, and
@@ -122,9 +131,9 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
             spec.lot_size()
         );
 
-        OrderBook {
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+        let store = S::try_new(spec)?;
+        Ok(OrderBook {
+            store,
             stop_bids: BTreeMap::new(),
             stop_asks: BTreeMap::new(),
             last_trade_price: None,
@@ -133,7 +142,7 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
             next_arrival: 1,
             spec,
             matcher,
-        }
+        })
     }
 
     pub fn spec(&self) -> InstrumentSpec {
@@ -152,6 +161,10 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
 
     pub fn matcher(&self) -> &M {
         &self.matcher
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
     }
 
     /// The instrument's admission policy, applied to one order.
@@ -195,6 +208,7 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
         Ok(())
     }
 
+    #[inline]
     pub fn add_order(&mut self, mut order: Order) -> Result<(), OrderBookError> {
         let OrderType::Limit { price, .. } = order.order_type else {
             return Err(OrderBookError::NotRestable);
@@ -203,9 +217,9 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
         let side = order.side;
         let exchange_id = order.exchange_id.clone();
 
-        match self.index.entry(exchange_id) {
+        let index_entry = match self.index.entry(exchange_id) {
             Entry::Occupied(_) => return Err(OrderBookError::ExchangeIdDuplicated),
-            Entry::Vacant(e) => e.insert(OrderLocation::Book { side, price }),
+            Entry::Vacant(e) => e.insert_entry(OrderLocation::Book { side, price }),
         };
 
         // Stamped here, past every way out of this function, because this is
@@ -227,24 +241,15 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
             .checked_add(1)
             .expect("arrival counter exhausted: this book has rested u32::MAX orders");
 
-        let price_level = match side {
-            Side::Ask => self
-                .asks
-                .entry(price)
-                .or_insert_with(|| PriceLevel::new(price, side)),
-            Side::Bid => self
-                .bids
-                .entry(Reverse(price))
-                .or_insert_with(|| PriceLevel::new(price, side)),
-        };
-
-        price_level
-            .add_order(order)
-            .map_err(|_| OrderBookError::Generic)?;
+        if let Err(error) = self.store.add(order) {
+            index_entry.remove();
+            return Err(OrderBookError::Storage(error));
+        }
 
         Ok(())
     }
 
+    #[inline]
     pub fn cancel_order(&mut self, exchange_id: ExchangeId) -> Result<(), OrderBookError> {
         let location = self
             .index
@@ -252,27 +257,8 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
             .ok_or(OrderBookError::OrderNotFound)?;
 
         match location {
-            OrderLocation::Book {
-                side: Side::Ask,
-                price,
-            } => {
-                if let Some(level) = self.asks.get_mut(&price) {
-                    level.remove_order(&exchange_id);
-                    if level.is_empty() {
-                        self.asks.remove(&price);
-                    }
-                }
-            }
-            OrderLocation::Book {
-                side: Side::Bid,
-                price,
-            } => {
-                if let Some(level) = self.bids.get_mut(&Reverse(price)) {
-                    level.remove_order(&exchange_id);
-                    if level.is_empty() {
-                        self.bids.remove(&Reverse(price));
-                    }
-                }
+            OrderLocation::Book { side, price } => {
+                self.store.cancel(side, price, &exchange_id);
             }
             OrderLocation::StopBook { side, trigger } => {
                 let stops = match side {
@@ -291,12 +277,14 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
         Ok(())
     }
 
+    #[inline]
     pub fn best_bid(&self) -> Option<Price> {
-        self.bids.iter().next().map(|(price, _)| price.0)
+        self.store.best_price(Side::Bid)
     }
 
+    #[inline]
     pub fn best_ask(&self) -> Option<Price> {
-        self.asks.iter().next().map(|(price, _)| *price)
+        self.store.best_price(Side::Ask)
     }
 
     /// The touch, measured in ticks — which is how a spread is actually quoted
@@ -316,27 +304,26 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
     }
 
     pub fn best_bid_level(&self) -> Option<PriceLevel> {
-        self.bids
-            .iter()
-            .next()
-            .map(|(_price, price_level)| price_level.clone())
+        self.store.best_level(Side::Bid).cloned()
     }
 
     pub fn best_ask_level(&self) -> Option<PriceLevel> {
-        self.asks
-            .iter()
-            .next()
-            .map(|(_price, price_level)| price_level.clone())
+        self.store.best_level(Side::Ask).cloned()
     }
 
     /// Aggregated market depth: the top `levels` price levels of `side`,
     /// best price first, as `(price, total resting quantity)`.
     pub fn depth(&self, side: Side, levels: usize) -> Vec<(Price, Qty)> {
-        let aggregate = |level: &PriceLevel| (level.price, level.total_quantity());
-        match side {
-            Side::Bid => self.bids.values().take(levels).map(aggregate).collect(),
-            Side::Ask => self.asks.values().take(levels).map(aggregate).collect(),
-        }
+        self.levels(side)
+            .take(levels)
+            .map(|level| (level.price, level.total_quantity()))
+            .collect()
+    }
+
+    /// Active levels on one side, best price first, independent of backend.
+    #[inline]
+    pub fn levels(&self, side: Side) -> S::Levels<'_> {
+        self.store.levels(side)
     }
 
     /// Look up a live order by its exchange id — resting in the book or
@@ -344,14 +331,7 @@ impl<M: MatchingAlgorithm> OrderBook<M> {
     /// scan within it (same O(level) cost as cancel).
     pub fn get_order(&self, exchange_id: &ExchangeId) -> Option<&Order> {
         let orders = match self.index.get(exchange_id)? {
-            OrderLocation::Book {
-                side: Side::Bid,
-                price,
-            } => &self.bids.get(&Reverse(*price))?.orders,
-            OrderLocation::Book {
-                side: Side::Ask,
-                price,
-            } => &self.asks.get(price)?.orders,
+            OrderLocation::Book { side, price } => &self.store.level(*side, *price)?.orders,
             OrderLocation::StopBook {
                 side: Side::Bid,
                 trigger,
@@ -415,10 +395,8 @@ mod test {
     #[test]
     fn order_book_new_returns_empty_orderbook() {
         let orderbook = book();
-        let empty_bids: BTreeMap<Reverse<Price>, PriceLevel> = BTreeMap::new();
-        let empty_asks: BTreeMap<Price, PriceLevel> = BTreeMap::new();
-        assert_eq!(orderbook.bids, empty_bids);
-        assert_eq!(orderbook.asks, empty_asks);
+        assert_eq!(orderbook.levels(Side::Bid).count(), 0);
+        assert_eq!(orderbook.levels(Side::Ask).count(), 0);
     }
 
     #[test]
@@ -430,8 +408,8 @@ mod test {
                 .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
                 .is_ok()
         );
-        assert_eq!(orderbook.asks.len(), 1);
-        assert_eq!(orderbook.bids.len(), 0);
+        assert_eq!(orderbook.levels(Side::Ask).count(), 1);
+        assert_eq!(orderbook.levels(Side::Bid).count(), 0);
     }
 
     #[test]
@@ -443,8 +421,8 @@ mod test {
                 .add_order(order(Side::Bid, 100, 10, None, "ex_1"))
                 .is_ok()
         );
-        assert_eq!(orderbook.asks.len(), 0);
-        assert_eq!(orderbook.bids.len(), 1);
+        assert_eq!(orderbook.levels(Side::Ask).count(), 0);
+        assert_eq!(orderbook.levels(Side::Bid).count(), 1);
     }
 
     #[test]
@@ -462,9 +440,9 @@ mod test {
                 .is_ok()
         );
 
-        assert_eq!(orderbook.bids.len(), 0);
+        assert_eq!(orderbook.levels(Side::Bid).count(), 0);
 
-        let level = orderbook.asks.get(&px(100)).unwrap();
+        let level = orderbook.store.level(Side::Ask, px(100)).unwrap();
         assert_eq!(level.total_quantity(), qty(15)); // 10 + 5
     }
 
@@ -531,7 +509,7 @@ mod test {
                 .cancel_order(ExchangeId("bid_order".to_owned()))
                 .is_ok()
         );
-        assert_eq!(orderbook.bids.len(), 0);
+        assert_eq!(orderbook.levels(Side::Bid).count(), 0);
         assert!(orderbook.index.is_empty());
     }
 
@@ -551,7 +529,7 @@ mod test {
             .unwrap();
 
         // price level still exists with remaining order
-        let level = orderbook.asks.get(&px(100)).unwrap();
+        let level = orderbook.store.level(Side::Ask, px(100)).unwrap();
         assert_eq!(level.orders.len(), 1);
         assert_eq!(level.total_quantity(), qty(5));
 
@@ -571,7 +549,7 @@ mod test {
             .cancel_order(ExchangeId("ex_1".to_owned()))
             .unwrap();
 
-        assert_eq!(orderbook.asks.len(), 0);
+        assert_eq!(orderbook.levels(Side::Ask).count(), 0);
         assert!(orderbook.index.is_empty());
     }
 
@@ -828,7 +806,7 @@ mod test {
                 RejectReason::QuantityBelowMinimum { .. }
             ))
         ));
-        assert!(ob.bids.is_empty());
+        assert_eq!(ob.levels(Side::Bid).count(), 0);
         assert!(ob.index.is_empty());
     }
 
@@ -915,17 +893,13 @@ mod test {
 
     /// `arrival` of the order resting at `price` on `side`, at queue position
     /// `pos`.
-    fn arrival_at<M: MatchingAlgorithm>(
-        ob: &OrderBook<M>,
+    fn arrival_at<M: MatchingAlgorithm, S: OrderBookStore>(
+        ob: &OrderBook<M, S>,
         side: Side,
         price: i64,
         pos: usize,
     ) -> u32 {
-        let level = match side {
-            Side::Bid => ob.bids.get(&Reverse(px(price))),
-            Side::Ask => ob.asks.get(&px(price)),
-        }
-        .expect("level should exist");
+        let level = ob.store.level(side, px(price)).expect("level should exist");
         level.orders[pos].arrival
     }
 

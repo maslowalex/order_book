@@ -39,6 +39,7 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use order_book::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
+use order_book::storage::{BTreeStore, OrderBookStore, TickLadderStore};
 
 /// Deterministic workload generation. Self-contained because
 /// `src/test_helpers.rs` is `#[cfg(test)]`-private and invisible to bench
@@ -47,6 +48,7 @@ mod generators {
     use order_book::allocation::{FifoMatcher, MatchingAlgorithm};
     use order_book::instrument::{InstrumentSpec, Qty};
     use order_book::orderbook::OrderBook;
+    use order_book::storage::OrderBookStore;
     use order_book::types::{ExchangeId, Order, OrderType, Price, Side};
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
@@ -111,6 +113,20 @@ mod generators {
             InstrumentSpec::new(2, 0, self.tick_cents, 1).expect("dist ticks are non-zero")
         }
 
+        /// The same lattice with a finite band spanning this workload. Storage
+        /// comparisons require this because a dense ladder must know its full
+        /// slot count before accepting an order.
+        pub fn bounded_spec(&self) -> InstrumentSpec {
+            let spec = self.spec();
+            let min = spec
+                .price_from_minor(self.bid_ticks.0 * self.tick_cents)
+                .unwrap();
+            let max = spec
+                .price_from_minor(self.ask_ticks.1 * self.tick_cents)
+                .unwrap();
+            spec.with_price_range(min, Some(max)).unwrap()
+        }
+
         fn price(&self, rng: &mut StdRng, side: Side) -> Price {
             let (lo, hi) = match side {
                 Side::Bid => self.bid_ticks,
@@ -156,6 +172,33 @@ mod generators {
             book.add_order(order).expect("seed ids are unique");
         }
         ids.shuffle(&mut rng); // cancel victims hit random levels/positions
+        (book, ids)
+    }
+
+    /// Backend-generic equivalent of `seeded_book`, using a finite price band
+    /// shared by both contenders.
+    pub fn seeded_book_with<S: OrderBookStore>(
+        dist: Dist,
+        n: usize,
+    ) -> (OrderBook<FifoMatcher, S>, Vec<ExchangeId>) {
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let mut book = OrderBook::<FifoMatcher, S>::try_new(dist.bounded_spec(), FifoMatcher)
+            .expect("benchmark price span fits the selected store");
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let side = if rng.random_range(0..2) == 0 {
+                Side::Bid
+            } else {
+                Side::Ask
+            };
+            let price = dist.price(&mut rng, side);
+            let qty = rng.random_range(1..=50);
+            let id = format!("seed-{i}");
+            ids.push(ExchangeId(id.clone()));
+            let order = limit(id, format!("maker-{i}"), side, price, qty, i as u128);
+            book.add_order(order).expect("seed ids are unique");
+        }
+        ids.shuffle(&mut rng);
         (book, ids)
     }
 
@@ -238,6 +281,39 @@ mod generators {
     ) -> OrderBook<M> {
         let spec = quarter_tick();
         let mut book = OrderBook::new(spec, matcher);
+        for j in 0..levels {
+            let price = spec
+                .price_from_minor(10_025 + (j as u64) * 25)
+                .expect("ladder steps one tick at a time");
+            for m in 0..per_level {
+                let order = limit(
+                    format!("mm-{j}-{m}"),
+                    format!("mm-{j}-{m}"),
+                    Side::Ask,
+                    price,
+                    qty,
+                    (j * per_level + m) as u128,
+                );
+                book.add_order(order).expect("ladder ids are unique");
+            }
+        }
+        book
+    }
+
+    pub fn matching_book_with<M: MatchingAlgorithm, S: OrderBookStore>(
+        matcher: M,
+        levels: usize,
+        per_level: usize,
+        qty: u64,
+    ) -> OrderBook<M, S> {
+        let raw = quarter_tick();
+        let min = raw.price_from_minor(25).unwrap();
+        let max = raw
+            .price_from_minor(10_025 + (levels.saturating_sub(1) as u64) * 25)
+            .unwrap();
+        let spec = raw.with_price_range(min, Some(max)).unwrap();
+        let mut book = OrderBook::<M, S>::try_new(spec, matcher)
+            .expect("matching ladder span fits the selected store");
         for j in 0..levels {
             let price = spec
                 .price_from_minor(10_025 + (j as u64) * 25)
@@ -617,6 +693,115 @@ fn bench_scenarios(c: &mut Criterion) {
     group.finish();
 }
 
+/// Storage-layout bake-off with allocation policy, workload, and instrument
+/// held fixed. Unlike the legacy groups above, every spec here has a finite
+/// price band so the BTree and dense ladder receive identical inputs.
+fn bench_storage(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(2))
+        .warm_up_time(Duration::from_millis(500));
+
+    fn run<S: OrderBookStore + 'static>(
+        group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+        backend: &str,
+    ) {
+        for dist in DISTS {
+            for n in [100usize, 10_000, 100_000] {
+                let k = chunk(n);
+                let (book, ids) = generators::seeded_book_with::<S>(dist, n);
+                let fresh = generators::resting_orders(dist, k);
+
+                group.throughput(Throughput::Elements(k as u64));
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{backend}/add/{}", dist.name), n),
+                    &(),
+                    |b, _| {
+                        b.iter_batched(
+                            || (book.clone(), fresh.clone()),
+                            |(mut book, orders)| {
+                                for order in orders {
+                                    black_box(book.add_order(order)).unwrap();
+                                }
+                                book
+                            },
+                            batch_for(n),
+                        )
+                    },
+                );
+
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{backend}/cancel/{}", dist.name), n),
+                    &(),
+                    |b, _| {
+                        b.iter_batched(
+                            || (book.clone(), ids[..k].to_vec()),
+                            |(mut book, victims)| {
+                                for id in victims {
+                                    black_box(book.cancel_order(id)).unwrap();
+                                }
+                                book
+                            },
+                            batch_for(n),
+                        )
+                    },
+                );
+
+                if n == 100 || n == 100_000 {
+                    group.throughput(Throughput::Elements(1));
+                    group.bench_with_input(
+                        BenchmarkId::new(format!("{backend}/best_bid/{}", dist.name), n),
+                        &(),
+                        |b, _| b.iter(|| black_box(black_box(&book).best_bid())),
+                    );
+                }
+            }
+
+            let (book, _) = generators::seeded_book_with::<S>(dist, 10_000);
+            let orders = generators::burst(dist, 1_000);
+            group.throughput(Throughput::Elements(orders.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new(format!("{backend}/burst_1000"), dist.name),
+                &(),
+                |b, _| {
+                    b.iter_batched(
+                        || (book.clone(), orders.clone()),
+                        |(mut book, orders)| {
+                            for order in orders {
+                                black_box(book.submit(order)).unwrap();
+                            }
+                            book
+                        },
+                        BatchSize::LargeInput,
+                    )
+                },
+            );
+        }
+
+        const TAKERS: usize = 50;
+        let ladder = generators::matching_book_with::<FifoMatcher, S>(FifoMatcher, 1_000, 10, 10);
+        let takers = generators::crossing_takers(TAKERS, 20, 100);
+        group.throughput(Throughput::Elements(TAKERS as u64));
+        group.bench_function(format!("{backend}/cross_limit/20_levels"), |b| {
+            b.iter_batched(
+                || (ladder.clone(), takers.clone()),
+                |(mut book, takers)| {
+                    for taker in takers {
+                        black_box(book.submit(taker)).unwrap();
+                    }
+                    book
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+
+    run::<BTreeStore>(&mut group, "btree");
+    run::<TickLadderStore>(&mut group, "tick_ladder");
+    group.finish();
+}
+
 /// What the allocation POLICY costs, with the storage layout held fixed.
 ///
 /// The same ladder, the same takers, three matchers — so the only variable is
@@ -703,6 +888,7 @@ criterion_group!(
     bench_best_price,
     bench_submit,
     bench_scenarios,
+    bench_storage,
     bench_matcher
 );
 criterion_main!(benches);

@@ -29,9 +29,10 @@
 //! # The matcher axis
 //!
 //! Every invariant above except the FIFO half of 4 runs against **every**
-//! allocation policy, via [`for_each_matcher`] — that is Phase 5.3's "verify
-//! the same property tests pass for both", and it is why the bodies live in
-//! generic `check_*` functions rather than inline in `proptest!`.
+//! allocation policy and both active-book stores, via
+//! [`for_each_configuration`] — a type-level Cartesian product. That is why
+//! the bodies live in generic `check_*` functions rather than inline in
+//! `proptest!`.
 //!
 //! They are universal by construction, not by luck. Contract clause (4) —
 //! `Σ fills == min(available, total)` — says every conforming matcher fills
@@ -50,25 +51,29 @@ use order_book::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, Tim
 use order_book::instrument::{InstrumentSpec, Qty};
 use order_book::matching::{ExecutionReport, SubmitOutcome};
 use order_book::orderbook::{OrderBook, OrderBookError, OrderLocation};
+use order_book::storage::{BTreeStore, OrderBookStore, TickLadderStore};
 use order_book::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use rust_decimal::Decimal;
 
-// --- the matcher axis ---------------------------------------------------
+// --- matcher × storage axes --------------------------------------------
 
-/// Run one invariant body against every allocation policy, on the SAME drawn
-/// stream.
+/// Run one invariant body against every allocation/storage pairing, on the
+/// SAME drawn stream.
 ///
 /// A loop, not a proptest input. Drawing the matcher with
 /// `prop::sample::select` would shrink and print more prettily, but it would
 /// also split the case budget across policies — a pro-rata-only bug would
 /// then hide behind sampling luck instead of failing every run.
-macro_rules! for_each_matcher {
+macro_rules! for_each_configuration {
     ($check:ident, $($arg:expr),* $(,)?) => {{
-        $check(FifoMatcher, $($arg),*)?;
-        $check(ProRataMatcher::new(lot()), $($arg),*)?;
-        $check(TimeProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, BTreeStore>(FifoMatcher, $($arg),*)?;
+        $check::<_, BTreeStore>(ProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, BTreeStore>(TimeProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, TickLadderStore>(FifoMatcher, $($arg),*)?;
+        $check::<_, TickLadderStore>(ProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, TickLadderStore>(TimeProRataMatcher::new(lot()), $($arg),*)?;
     }};
 }
 
@@ -88,7 +93,10 @@ fn arb_side() -> impl Strategy<Value = Side> {
 /// way the tick is not. `the_lattice_holds_on_a_non_unit_lot` covers that gap
 /// on its own spec rather than making all nine properties pay for it.
 fn spec() -> InstrumentSpec {
-    InstrumentSpec::new(2, 0, 25, 1).expect("2/0/25/1 is a valid spec")
+    let spec = InstrumentSpec::new(2, 0, 25, 1).expect("2/0/25/1 is a valid spec");
+    let min = spec.price_from_minor(9_500).unwrap();
+    let max = spec.price_from_minor(10_500).unwrap();
+    spec.with_price_range(min, Some(max)).unwrap()
 }
 
 /// The lot the weighted matchers must be built with to be attachable to a
@@ -184,7 +192,10 @@ fn arb_stream_unique_clients() -> impl Strategy<Value = Vec<Order>> {
 
 /// The same tick grid on a lot of ten.
 fn lot_ten_spec() -> InstrumentSpec {
-    InstrumentSpec::new(2, 0, 25, 10).expect("2/0/25/10 is a valid spec")
+    let spec = InstrumentSpec::new(2, 0, 25, 10).expect("2/0/25/10 is a valid spec");
+    let min = spec.price_from_minor(9_500).unwrap();
+    let max = spec.price_from_minor(10_500).unwrap();
+    spec.with_price_range(min, Some(max)).unwrap()
 }
 
 /// Orders whose quantities are whole lots of ten. Drawn in *lots* and
@@ -220,12 +231,11 @@ fn opposite(side: Side) -> Side {
 
 /// Everything resting in the book right now: id → (side, price, remaining).
 /// Parked stops are deliberately NOT part of this — they hold no depth.
-fn resting_snapshot<M: MatchingAlgorithm>(
-    book: &OrderBook<M>,
+fn resting_snapshot<M: MatchingAlgorithm, S: OrderBookStore>(
+    book: &OrderBook<M, S>,
 ) -> HashMap<ExchangeId, (Side, Price, Qty)> {
-    book.bids
-        .values()
-        .chain(book.asks.values())
+    book.levels(Side::Bid)
+        .chain(book.levels(Side::Ask))
         .flat_map(|level| {
             level.orders.iter().map(|o| {
                 (
@@ -237,10 +247,9 @@ fn resting_snapshot<M: MatchingAlgorithm>(
         .collect()
 }
 
-fn total_depth<M: MatchingAlgorithm>(book: &OrderBook<M>) -> Qty {
-    book.bids
-        .values()
-        .chain(book.asks.values())
+fn total_depth<M: MatchingAlgorithm, S: OrderBookStore>(book: &OrderBook<M, S>) -> Qty {
+    book.levels(Side::Bid)
+        .chain(book.levels(Side::Ask))
         .map(|level| level.total_quantity())
         .sum()
 }
@@ -253,16 +262,20 @@ fn total_depth<M: MatchingAlgorithm>(book: &OrderBook<M>) -> Qty {
 /// merely in total. Comparing prices alone would let a policy that moved a fill
 /// from one level to another through — `(100: 5, 101: 10)` and `(100: 6,
 /// 101: 9)` have identical keys, identical totals, and identical touch prices.
-fn level_depths<M: MatchingAlgorithm>(book: &OrderBook<M>) -> Vec<(Price, Qty)> {
-    book.bids
-        .values()
-        .chain(book.asks.values())
+fn level_depths<M: MatchingAlgorithm, S: OrderBookStore>(
+    book: &OrderBook<M, S>,
+) -> Vec<(Price, Qty)> {
+    book.levels(Side::Bid)
+        .chain(book.levels(Side::Ask))
         .map(|level| (level.price, level.total_quantity()))
         .collect()
 }
 
 /// Remaining quantity of `id` if it rests in the BOOK (not the stop book).
-fn rested_remaining<M: MatchingAlgorithm>(book: &OrderBook<M>, id: &ExchangeId) -> Option<Qty> {
+fn rested_remaining<M: MatchingAlgorithm, S: OrderBookStore>(
+    book: &OrderBook<M, S>,
+    id: &ExchangeId,
+) -> Option<Qty> {
     match book.index.get(id)? {
         OrderLocation::Book { .. } => book.get_order(id).map(|o| o.remaining_quantity),
         OrderLocation::StopBook { .. } => None,
@@ -270,7 +283,10 @@ fn rested_remaining<M: MatchingAlgorithm>(book: &OrderBook<M>, id: &ExchangeId) 
 }
 
 /// Remaining quantity of `id` if it's parked in the stop book.
-fn parked_remaining<M: MatchingAlgorithm>(book: &OrderBook<M>, id: &ExchangeId) -> Option<Qty> {
+fn parked_remaining<M: MatchingAlgorithm, S: OrderBookStore>(
+    book: &OrderBook<M, S>,
+    id: &ExchangeId,
+) -> Option<Qty> {
     match book.index.get(id)? {
         OrderLocation::StopBook { .. } => book.get_order(id).map(|o| o.remaining_quantity),
         OrderLocation::Book { .. } => None,
@@ -308,10 +324,10 @@ fn cascade_filled(report: &ExecutionReport) -> Qty {
 ///
 /// Generic over both policies because the books are different *types* — the
 /// one place in the suite where static dispatch costs something.
-fn same_public_state<A: MatchingAlgorithm, B: MatchingAlgorithm>(
+fn same_public_state<A: MatchingAlgorithm, B: MatchingAlgorithm, S: OrderBookStore>(
     name: &str,
-    other: &OrderBook<A>,
-    base: &OrderBook<B>,
+    other: &OrderBook<A, S>,
+    base: &OrderBook<B, S>,
 ) -> Result<(), TestCaseError> {
     prop_assert_eq!(total_depth(other), total_depth(base), "{} depth", name);
     prop_assert_eq!(other.best_bid(), base.best_bid(), "{} best bid", name);
@@ -329,6 +345,33 @@ fn same_public_state<A: MatchingAlgorithm, B: MatchingAlgorithm>(
     Ok(())
 }
 
+/// Differential oracle for the storage axis: with the matcher held fixed, a
+/// backend is not allowed to change even maker identity or report ordering.
+fn check_storage_agreement<M: MatchingAlgorithm + Clone>(
+    matcher: M,
+    stream: &[Order],
+) -> Result<(), TestCaseError> {
+    let mut tree = OrderBook::<M, BTreeStore>::try_new(spec(), matcher.clone()).unwrap();
+    let mut ladder = OrderBook::<M, TickLadderStore>::try_new(spec(), matcher).unwrap();
+
+    for order in stream.iter().cloned() {
+        let tree_report = tree.submit(order.clone()).unwrap();
+        let ladder_report = ladder.submit(order).unwrap();
+        prop_assert_eq!(&ladder_report, &tree_report, "execution reports diverged");
+        prop_assert_eq!(resting_snapshot(&ladder), resting_snapshot(&tree));
+        prop_assert_eq!(level_depths(&ladder), level_depths(&tree));
+        prop_assert_eq!(ladder.best_bid(), tree.best_bid());
+        prop_assert_eq!(ladder.best_ask(), tree.best_ask());
+        prop_assert_eq!(ladder.last_trade_price, tree.last_trade_price);
+        prop_assert_eq!(&ladder.index, &tree.index);
+        prop_assert_eq!(&ladder.stop_bids, &tree.stop_bids);
+        prop_assert_eq!(&ladder.stop_asks, &tree.stop_asks);
+        prop_assert_eq!(ladder.next_seq, tree.next_seq);
+        prop_assert_eq!(ladder.next_arrival, tree.next_arrival);
+    }
+    Ok(())
+}
+
 // --- invariant bodies ---------------------------------------------------
 //
 // One generic function per invariant, taking the policy as a value. They are
@@ -343,11 +386,11 @@ fn same_public_state<A: MatchingAlgorithm, B: MatchingAlgorithm>(
 /// outcome agrees with where the quantity went. "Rested" is checked
 /// net of any quantity that later executions in the same cascade already
 /// consumed from it.
-fn check_conservation<M: MatchingAlgorithm>(
+fn check_conservation<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec(), matcher).unwrap();
     // original quantity of every currently-parked stop, by assigned id
     let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
 
@@ -494,11 +537,11 @@ fn check_conservation<M: MatchingAlgorithm>(
 ///
 /// This is the invariant that catches an apply pass which removes an order
 /// from a level without recording it — the STP pre-pass most of all.
-fn check_depth_accounting<M: MatchingAlgorithm>(
+fn check_depth_accounting<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec(), matcher).unwrap();
     let mut parked: HashMap<ExchangeId, Qty> = HashMap::new();
 
     for order in stream.iter().cloned() {
@@ -568,11 +611,11 @@ fn check_depth_accounting<M: MatchingAlgorithm>(
 /// Also the home of the flat assertion that self-trade prevention works at
 /// all: no trade ever has the same client on both sides. Nothing else in the
 /// suite said so, and the STP rule changed in this phase.
-fn check_price_validity<M: MatchingAlgorithm>(
+fn check_price_validity<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec(), matcher).unwrap();
 
     for order in stream.iter().cloned() {
         let taker_side = order.side;
@@ -643,11 +686,11 @@ fn check_price_validity<M: MatchingAlgorithm>(
 ///
 /// Per *execution*, not per cascade: each triggered stop is its own sweep and
 /// may legitimately revisit a price the first sweep already traded at.
-fn check_queue_order_within_execution<M: MatchingAlgorithm>(
+fn check_queue_order_within_execution<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec(), matcher).unwrap();
     let mut next_stamp: u64 = 0;
     let mut rest_stamp: HashMap<ExchangeId, u64> = HashMap::new();
 
@@ -691,11 +734,11 @@ fn check_queue_order_within_execution<M: MatchingAlgorithm>(
 /// out "skip the self order but leave it resting". A taker's remainder would
 /// come to rest through its own untouched order on the other side and the
 /// book would sit crossed — which is why the engine cancels rather than skips.
-fn check_never_crossed<M: MatchingAlgorithm>(
+fn check_never_crossed<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec(), matcher).unwrap();
 
     for order in stream.iter().cloned() {
         book.submit(order).unwrap();
@@ -713,20 +756,19 @@ fn check_never_crossed<M: MatchingAlgorithm>(
 ///
 /// The `!remaining_quantity.is_zero()` checks are the ones an apply pass that
 /// forgets to drop an exhausted maker fails.
-fn check_index_consistency<M: MatchingAlgorithm>(
+fn check_index_consistency<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec(), matcher).unwrap();
     for order in stream.iter().cloned() {
         book.submit(order).unwrap();
     }
 
     let mut live_orders = 0usize;
-    for (key, level) in &book.asks {
+    for level in book.levels(Side::Ask) {
         prop_assert!(!level.orders.is_empty(), "empty level left in asks");
         prop_assert_eq!(level.side, Side::Ask);
-        prop_assert_eq!(&level.price, key);
         for o in &level.orders {
             live_orders += 1;
             prop_assert!(!o.remaining_quantity.is_zero());
@@ -739,10 +781,9 @@ fn check_index_consistency<M: MatchingAlgorithm>(
             prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
         }
     }
-    for (key, level) in &book.bids {
+    for level in book.levels(Side::Bid) {
         prop_assert!(!level.orders.is_empty(), "empty level left in bids");
         prop_assert_eq!(level.side, Side::Bid);
-        prop_assert_eq!(level.price, key.0);
         for o in &level.orders {
             live_orders += 1;
             prop_assert!(!o.remaining_quantity.is_zero());
@@ -784,8 +825,8 @@ fn check_index_consistency<M: MatchingAlgorithm>(
     for id in ids {
         prop_assert!(book.cancel_order(id).is_ok());
     }
-    prop_assert!(book.bids.is_empty());
-    prop_assert!(book.asks.is_empty());
+    prop_assert_eq!(book.levels(Side::Bid).count(), 0);
+    prop_assert_eq!(book.levels(Side::Ask).count(), 0);
     prop_assert!(book.stop_bids.is_empty());
     prop_assert!(book.stop_asks.is_empty());
     prop_assert!(book.index.is_empty());
@@ -795,11 +836,11 @@ fn check_index_consistency<M: MatchingAlgorithm>(
 /// Invariant 7 — stop discipline: after every submit, every still-pending
 /// stop's trigger is strictly beyond the last trade price. If it weren't,
 /// the cascade failed to fire it.
-fn check_stop_discipline<M: MatchingAlgorithm>(
+fn check_stop_discipline<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec(), matcher).unwrap();
 
     for order in stream.iter().cloned() {
         book.submit(order).unwrap();
@@ -841,14 +882,14 @@ fn check_stop_discipline<M: MatchingAlgorithm>(
 /// end of a 60-order stream. Under a weighted policy it is worse than that —
 /// pro-rata *divides* quantities, and a floor pass that forgot the lot would
 /// leave every maker it touched off the grid.
-fn check_lattice_closure<M: MatchingAlgorithm>(
+fn check_lattice_closure<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     spec: InstrumentSpec,
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
     let tick = spec.tick_decimal();
     let lot = spec.lot_decimal();
-    let mut book = OrderBook::new(spec, matcher);
+    let mut book = OrderBook::<M, S>::try_new(spec, matcher).unwrap();
 
     for order in stream.iter().cloned() {
         let report = book.submit(order).unwrap();
@@ -861,7 +902,7 @@ fn check_lattice_closure<M: MatchingAlgorithm>(
         }
     }
 
-    let levels = book.bids.values().chain(book.asks.values());
+    let levels = book.levels(Side::Bid).chain(book.levels(Side::Ask));
     for level in levels {
         let p = spec.to_decimal(level.price);
         prop_assert_eq!(p % tick, Decimal::ZERO, "level price off the tick grid");
@@ -901,14 +942,14 @@ fn check_lattice_closure<M: MatchingAlgorithm>(
 /// sequence number on something that never became an order would punch
 /// a hole in the id space; asserting on `next_seq` is what makes that
 /// choice a checked property rather than a comment.
-fn check_reject_is_a_no_op<M: MatchingAlgorithm>(
+fn check_reject_is_a_no_op<M: MatchingAlgorithm, S: OrderBookStore>(
     matcher: M,
     stream: &[Order],
     too_small: u64,
     side: Side,
     price: Price,
 ) -> Result<(), TestCaseError> {
-    let mut book = OrderBook::new(bounded_spec(), matcher);
+    let mut book = OrderBook::<M, S>::try_new(bounded_spec(), matcher).unwrap();
     for order in stream.iter().cloned() {
         // some of these are themselves rejected — that is the point
         let _ = book.submit(order);
@@ -949,44 +990,44 @@ proptest! {
 
 #[test]
 fn conservation_per_submit(stream in arb_stream()) {
-    for_each_matcher!(check_conservation, &stream);
+    for_each_configuration!(check_conservation, &stream);
 }
 
 #[test]
 fn book_depth_accounting(stream in arb_stream()) {
-    for_each_matcher!(check_depth_accounting, &stream);
+    for_each_configuration!(check_depth_accounting, &stream);
 }
 
 #[test]
 fn trades_at_maker_price_within_taker_limit(stream in arb_stream()) {
-    for_each_matcher!(check_price_validity, &stream);
+    for_each_configuration!(check_price_validity, &stream);
 }
 
 #[test]
 fn queue_order_within_one_execution(stream in arb_stream()) {
-    for_each_matcher!(check_queue_order_within_execution, &stream);
+    for_each_configuration!(check_queue_order_within_execution, &stream);
 }
 
 #[test]
 fn book_never_crossed_after_submit(stream in arb_stream()) {
-    for_each_matcher!(check_never_crossed, &stream);
+    for_each_configuration!(check_never_crossed, &stream);
 }
 
 #[test]
 fn index_matches_levels_and_book_drains(stream in arb_stream()) {
-    for_each_matcher!(check_index_consistency, &stream);
+    for_each_configuration!(check_index_consistency, &stream);
 }
 
 #[test]
 fn no_satisfied_stop_left_pending(stream in arb_stream()) {
-    for_each_matcher!(check_stop_discipline, &stream);
+    for_each_configuration!(check_stop_discipline, &stream);
 }
 
 #[test]
 fn everything_the_book_holds_stays_on_the_lattice(
     stream in prop::collection::vec(arb_order(), 1..60)
 ) {
-    for_each_matcher!(check_lattice_closure, spec(), &stream);
+    for_each_configuration!(check_lattice_closure, spec(), &stream);
 }
 
 #[test]
@@ -996,7 +1037,14 @@ fn a_rejected_order_leaves_the_book_untouched(
     side in arb_side(),
     price in arb_limit_price(),
 ) {
-    for_each_matcher!(check_reject_is_a_no_op, &stream, too_small, side, price);
+    for_each_configuration!(check_reject_is_a_no_op, &stream, too_small, side, price);
+}
+
+#[test]
+fn storage_backends_are_observationally_identical(stream in arb_stream()) {
+    check_storage_agreement(FifoMatcher, &stream)?;
+    check_storage_agreement(ProRataMatcher::new(lot()), &stream)?;
+    check_storage_agreement(TimeProRataMatcher::new(lot()), &stream)?;
 }
 
 /// Invariant 4, FIFO half — the strong form of time priority: at any given
@@ -1129,9 +1177,12 @@ fn the_lattice_holds_on_a_non_unit_lot(
     stream in prop::collection::vec(arb_lot_ten_order(), 1..60)
 ) {
     let lot = lot_ten_spec().lot_size();
-    check_lattice_closure(FifoMatcher, lot_ten_spec(), &stream)?;
-    check_lattice_closure(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
-    check_lattice_closure(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, BTreeStore>(FifoMatcher, lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, BTreeStore>(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, BTreeStore>(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, TickLadderStore>(FifoMatcher, lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, TickLadderStore>(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, TickLadderStore>(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
 }
 
 }
