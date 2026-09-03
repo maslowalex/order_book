@@ -526,3 +526,84 @@ The ladder reserves 2 × 41 slots for tight and 2 × 19,901 for wide — **485×
 wide distribution before order queues are counted. This run measured CPU latency, not resident
 heap size, so it does not claim the ladder is the overall winner. Phase 6.3 memory profiling is
 the gate for that conclusion.
+
+---
+
+# Full-suite refresh — BTree, HashMap, and tick ladder (2026-09-03)
+
+This is a fresh `cargo bench --bench order_book` run after adding `HashMapStore` coverage. It is
+an absolute snapshot, not a Criterion baseline comparison. Figures below use Criterion medians;
+mutating rows are per operation (the timed chunk is divided by its declared
+`Throughput::Elements`). The storage comparisons use the same bounded instrument band and seeded
+workload for every backend. `Gnuplot` was absent, so Criterion used its Plotters backend; that
+changes report rendering, not the measurements.
+
+## Core path
+
+| Workload | tight / 100 | tight / 10k | tight / 100k | wide / 100 | wide / 10k | wide / 100k |
+|---|---:|---:|---:|---:|---:|---:|
+| add | 83.5 ns | 66.2 ns | 79.9 ns | 75.0 ns | 95.0 ns | 258 ns |
+| cancel | 97.8 ns | 500 ns | 4.37 µs | 130 ns | 154 ns | 320 ns |
+
+The distribution remains the dominant factor for cancellation: at 100k, a tight book costs
+**4.37 µs/op** versus **320 ns/op** wide (13.7×). The tight book packs many orders into each
+level, so the linear `Vec` scan/removal remains the limiting work. Add is comparatively stable
+through 10k, while wide/100k rises to 258 ns/op as the sparse price map grows.
+
+## Reads, matching, and scenarios
+
+| Workload | Result |
+|---|---:|
+| best bid, tight / 100 and 100k | 0.732 ns and 0.734 ns |
+| best bid, wide / 100 and 100k | 0.733 ns and 1.593 ns |
+| spread, tight / 100k | 1.378 ns |
+| best-bid level clone, tight / wide 100k | 87.7 µs / 186 ns |
+| rest limit, tight / wide 10k | 291 ns / 169 ns per order |
+| cross limit, 1 / 5 / 20 levels | 1.679 / 7.291 / 27.95 µs per order |
+| market, 1 / 20 levels | 1.646 / 27.99 µs per order |
+| burst 1000, tight / wide | 436 / 332 ns per order |
+| cancel storm, tight 10k / 100k | 309 ns / 2.329 µs per cancel |
+| cancel storm, wide 10k / 100k | 155 ns / 259 ns per cancel |
+
+Wide mixed bursts are **31% faster** than tight (3.015 vs 2.296 M orders/s). In contrast, a
+tight 100k cancel storm is ~9.0× slower than its wide equivalent; it still beats isolated tight
+100k cancels because each successful cancel shortens the levels that remain. Matching is nearly
+linear in fills: 1.679 µs for the one-level crossing case and 27.95 µs for 20 levels. Market and
+crossing-limit orders are effectively tied at 20 levels (27.99 vs 27.95 µs).
+
+## Storage backend comparison
+
+All figures are medians. BTree remains the production default; the table shows the trade-offs
+under the finite-band benchmark, not a memory verdict.
+
+| Workload | BTreeStore | HashMapStore | TickLadderStore | Fastest |
+|---|---:|---:|---:|---|
+| add, tight / 100k | 83.2 ns | 81.9 ns | 78.9 ns | ladder |
+| cancel, tight / 100k | 4.308 µs | 4.312 µs | 4.329 µs | BTree (tie) |
+| best bid, tight / 100k | 0.716 ns | 6.432 ns | 0.861 ns | BTree |
+| burst 1000, tight | 433 ns | 442 ns | 421 ns | ladder |
+| add, wide / 100k | 264 ns | 245 ns | 227 ns | ladder |
+| cancel, wide / 100k | 290 ns | 329 ns | 222 ns | ladder |
+| best bid, wide / 100k | 1.594 ns | 6.433 ns | 0.832 ns | ladder |
+| burst 1000, wide | 328 ns | 1.844 µs | 308 ns | ladder |
+| cross limit, 20 levels | 1.379 ms | 1.831 ms | 1.376 ms | ladder (near tie) |
+
+The dense tick ladder is the clear wide-book winner: versus BTree at 100k it improves add by
+**14%**, cancel by **24%**, best-bid by **48%**, and burst throughput by **6%**. It also leads
+tight add/burst modestly, but tight cancellation is unchanged because order removal within a
+level, not price lookup, dominates. Its cross-limit result is indistinguishable from BTree
+(1.376 vs 1.379 ms).
+
+`HashMapStore` makes a different trade: it can insert wide orders 7% faster than BTree, but has
+no ordered-key first-price operation. Its `best_bid` is ~4× slower on tight books and ~4× slower
+on wide books; the penalty compounds into a **5.6×** slower wide burst and **33%** slower
+20-level crossing workload. It is therefore not a suitable general order-book backend without a
+separate ordered-price index.
+
+## Reliability notes
+
+Criterion could not fit the requested samples into two seconds for the 100k wide add/cancel
+groups (and their storage equivalents). It still completed the configured samples, but a future
+run should increase `measurement_time`, enable flat sampling, or reduce sample count for these
+groups. Several slow 100k rows also have 10–40% outlier rates, especially HashMap wide cancel;
+use their broad conclusion rather than treating single-digit deltas as precision claims.

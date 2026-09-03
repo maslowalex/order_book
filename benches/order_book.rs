@@ -39,7 +39,7 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use order_book::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
-use order_book::storage::{BTreeStore, OrderBookStore, TickLadderStore};
+use order_book::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
 
 /// Deterministic workload generation. Self-contained because
 /// `src/test_helpers.rs` is `#[cfg(test)]`-private and invisible to bench
@@ -798,6 +798,7 @@ fn bench_storage(c: &mut Criterion) {
     }
 
     run::<BTreeStore>(&mut group, "btree");
+    run::<HashMapStore>(&mut group, "hash_map");
     run::<TickLadderStore>(&mut group, "tick_ladder");
     group.finish();
 }
