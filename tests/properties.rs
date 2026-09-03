@@ -29,7 +29,7 @@
 //! # The matcher axis
 //!
 //! Every invariant above except the FIFO half of 4 runs against **every**
-//! allocation policy and both active-book stores, via
+//! allocation policy and every active-book store, via
 //! [`for_each_configuration`] — a type-level Cartesian product. That is why
 //! the bodies live in generic `check_*` functions rather than inline in
 //! `proptest!`.
@@ -51,7 +51,7 @@ use order_book::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, Tim
 use order_book::instrument::{InstrumentSpec, Qty};
 use order_book::matching::{ExecutionReport, SubmitOutcome};
 use order_book::orderbook::{OrderBook, OrderBookError, OrderLocation};
-use order_book::storage::{BTreeStore, OrderBookStore, TickLadderStore};
+use order_book::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
 use order_book::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -74,6 +74,9 @@ macro_rules! for_each_configuration {
         $check::<_, TickLadderStore>(FifoMatcher, $($arg),*)?;
         $check::<_, TickLadderStore>(ProRataMatcher::new(lot()), $($arg),*)?;
         $check::<_, TickLadderStore>(TimeProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, HashMapStore>(FifoMatcher, $($arg),*)?;
+        $check::<_, HashMapStore>(ProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, HashMapStore>(TimeProRataMatcher::new(lot()), $($arg),*)?;
     }};
 }
 
@@ -352,22 +355,35 @@ fn check_storage_agreement<M: MatchingAlgorithm + Clone>(
     stream: &[Order],
 ) -> Result<(), TestCaseError> {
     let mut tree = OrderBook::<M, BTreeStore>::try_new(spec(), matcher.clone()).unwrap();
-    let mut ladder = OrderBook::<M, TickLadderStore>::try_new(spec(), matcher).unwrap();
+    let mut ladder = OrderBook::<M, TickLadderStore>::try_new(spec(), matcher.clone()).unwrap();
+    let mut hash_map = OrderBook::<M, HashMapStore>::try_new(spec(), matcher).unwrap();
 
     for order in stream.iter().cloned() {
         let tree_report = tree.submit(order.clone()).unwrap();
-        let ladder_report = ladder.submit(order).unwrap();
+        let ladder_report = ladder.submit(order.clone()).unwrap();
+        let hash_map_report = hash_map.submit(order).unwrap();
         prop_assert_eq!(&ladder_report, &tree_report, "execution reports diverged");
+        prop_assert_eq!(&hash_map_report, &tree_report, "execution reports diverged");
         prop_assert_eq!(resting_snapshot(&ladder), resting_snapshot(&tree));
+        prop_assert_eq!(resting_snapshot(&hash_map), resting_snapshot(&tree));
         prop_assert_eq!(level_depths(&ladder), level_depths(&tree));
+        prop_assert_eq!(level_depths(&hash_map), level_depths(&tree));
         prop_assert_eq!(ladder.best_bid(), tree.best_bid());
+        prop_assert_eq!(hash_map.best_bid(), tree.best_bid());
         prop_assert_eq!(ladder.best_ask(), tree.best_ask());
+        prop_assert_eq!(hash_map.best_ask(), tree.best_ask());
         prop_assert_eq!(ladder.last_trade_price, tree.last_trade_price);
+        prop_assert_eq!(hash_map.last_trade_price, tree.last_trade_price);
         prop_assert_eq!(&ladder.index, &tree.index);
+        prop_assert_eq!(&hash_map.index, &tree.index);
         prop_assert_eq!(&ladder.stop_bids, &tree.stop_bids);
+        prop_assert_eq!(&hash_map.stop_bids, &tree.stop_bids);
         prop_assert_eq!(&ladder.stop_asks, &tree.stop_asks);
+        prop_assert_eq!(&hash_map.stop_asks, &tree.stop_asks);
         prop_assert_eq!(ladder.next_seq, tree.next_seq);
+        prop_assert_eq!(hash_map.next_seq, tree.next_seq);
         prop_assert_eq!(ladder.next_arrival, tree.next_arrival);
+        prop_assert_eq!(hash_map.next_arrival, tree.next_arrival);
     }
     Ok(())
 }
@@ -1183,6 +1199,9 @@ fn the_lattice_holds_on_a_non_unit_lot(
     check_lattice_closure::<_, TickLadderStore>(FifoMatcher, lot_ten_spec(), &stream)?;
     check_lattice_closure::<_, TickLadderStore>(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
     check_lattice_closure::<_, TickLadderStore>(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, HashMapStore>(FifoMatcher, lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, HashMapStore>(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, HashMapStore>(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
 }
 
 }

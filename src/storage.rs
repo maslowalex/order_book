@@ -6,8 +6,10 @@
 //! decides how levels are found and held.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
 use std::collections::btree_map;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::fmt::Debug;
 
 use crate::instrument::InstrumentSpec;
 use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
@@ -32,7 +34,7 @@ pub enum StoreError {
 /// The trait is intentionally statically dispatched. Its iterator is a GAT so
 /// each backend can expose ordered levels without boxing or allocating on the
 /// read path.
-pub trait OrderBookStore: Clone + std::fmt::Debug {
+pub trait OrderBookStore: Clone + Debug {
     type Levels<'a>: Iterator<Item = &'a PriceLevel>
     where
         Self: 'a;
@@ -181,6 +183,164 @@ pub struct TickLadderStore {
     tick_size: u64,
     best_bid: Option<usize>,
     best_ask: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HashMapStore {
+    bids: HashMap<Price, PriceLevel>,
+    asks: HashMap<Price, PriceLevel>,
+    bids_index: BinaryHeap<Price>,
+    asks_index: BinaryHeap<Reverse<Price>>,
+}
+
+pub struct HashMapLevels<'a> {
+    inner: std::vec::IntoIter<&'a PriceLevel>,
+}
+
+impl<'a> Iterator for HashMapLevels<'a> {
+    type Item = &'a PriceLevel;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl OrderBookStore for HashMapStore {
+    type Levels<'a> = HashMapLevels<'a>;
+
+    fn levels(&self, side: Side) -> Self::Levels<'_> {
+        let mut levels: Vec<&PriceLevel> = match side {
+            Side::Bid => self.bids.values().collect(),
+            Side::Ask => self.asks.values().collect(),
+        };
+
+        match side {
+            Side::Bid => {
+                levels.sort_unstable_by_key(|level| Reverse(level.price));
+            }
+            Side::Ask => {
+                levels.sort_unstable_by_key(|level| level.price);
+            }
+        }
+
+        HashMapLevels {
+            inner: levels.into_iter(),
+        }
+    }
+
+    fn try_new(_spec: InstrumentSpec) -> Result<Self, StoreError> {
+        Ok(Self::default())
+    }
+
+    fn add(&mut self, order: Order) -> Result<(), StoreError> {
+        let OrderType::Limit { price, .. } = order.order_type else {
+            return Err(StoreError::NotRestable);
+        };
+        let side = order.side;
+        let created_new_level = {
+            let levels = match side {
+                Side::Bid => &mut self.bids,
+                Side::Ask => &mut self.asks,
+            };
+
+            match levels.entry(price) {
+                Entry::Occupied(mut entry) => {
+                    entry
+                        .get_mut()
+                        .add_order(order)
+                        .map_err(|_| StoreError::InvalidSide)?;
+
+                    false
+                }
+
+                Entry::Vacant(entry) => {
+                    let mut level = PriceLevel::new(price, side);
+
+                    level
+                        .add_order(order)
+                        .map_err(|_| StoreError::InvalidSide)?;
+
+                    entry.insert(level);
+                    true
+                }
+            }
+        };
+
+        if created_new_level {
+            match side {
+                Side::Ask => self.asks_index.push(Reverse(price)),
+                Side::Bid => self.bids_index.push(price),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn level(&self, side: Side, price: Price) -> Option<&PriceLevel> {
+        match side {
+            Side::Bid => self.bids.get(&price),
+            Side::Ask => self.asks.get(&price),
+        }
+    }
+
+    fn best_level(&self, side: Side) -> Option<&PriceLevel> {
+        match side {
+            Side::Bid => self
+                .bids_index
+                .peek()
+                .and_then(|price| self.bids.get(price)),
+
+            Side::Ask => self
+                .asks_index
+                .peek()
+                .and_then(|Reverse(price)| self.asks.get(price)),
+        }
+    }
+
+    fn best_level_mut(&mut self, side: Side) -> Option<&mut PriceLevel> {
+        match side {
+            Side::Bid => self
+                .bids_index
+                .peek()
+                .and_then(|price| self.bids.get_mut(price)),
+
+            Side::Ask => self
+                .asks_index
+                .peek()
+                .and_then(|Reverse(price)| self.asks.get_mut(price)),
+        }
+    }
+
+    fn cancel(&mut self, side: Side, price: Price, id: &ExchangeId) -> Option<Order> {
+        let (removed, empty) = {
+            let levels = match side {
+                Side::Bid => &mut self.bids,
+                Side::Ask => &mut self.asks,
+            };
+            let level = levels.get_mut(&price)?;
+            let removed = level.remove_order(id);
+            (removed, level.is_empty())
+        };
+
+        if empty {
+            self.remove_level(side, price);
+        }
+        removed
+    }
+
+    fn remove_level(&mut self, side: Side, price: Price) -> Option<PriceLevel> {
+        match side {
+            Side::Bid => {
+                self.bids_index.retain(|el| el != &price);
+                self.bids.remove(&price)
+            }
+            Side::Ask => {
+                self.asks_index.retain(|Reverse(el)| el != &price);
+                self.asks.remove(&price)
+            }
+        }
+    }
 }
 
 pub enum TickLevels<'a> {
@@ -414,6 +574,11 @@ mod tests {
     #[test]
     fn btree_satisfies_the_store_contract() {
         check_store_contract::<BTreeStore>();
+    }
+
+    #[test]
+    fn hash_map_satisfies_the_store_contract() {
+        check_store_contract::<HashMapStore>();
     }
 
     #[test]
