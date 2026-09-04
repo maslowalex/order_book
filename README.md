@@ -423,12 +423,11 @@ neighbouring lessons, both recorded rather than quietly fixed:
 - **The projection cost.** `allocate(&[Maker])` materialises whole levels for policies
   that don't need them. It was deliberately held constant for the first storage
   comparison; a future fast path or lazy projection needs its own isolated A/B.
-- **Cancel is the tail.** ~4.5 µs at 100k orders on a tight book, against ~344 ns on a
-  wide one, because `PriceLevel::remove_order` linearly scans a `Vec` with `String`
-  compares and then shifts. Compaction after a sweep has the same shape: O(level)
-  however few makers were exhausted, because a `Vec` level has no handles. A slab plus
-  an intrusive list makes both O(1) per order, and nothing in the matching path has to
-  know.
+- **Arena cancellation paid off only at deep levels.** A generational arena plus an
+  intrusive queue reduced tight/100k cancellation from ~4.59 µs to 0.32 µs per
+  order. It is slower for shallow/wide levels because hashing and handle chasing cost
+  more than a tiny contiguous scan. The full Vec → slotmap → custom-arena comparison is
+  in `BENCHMARKS.md`.
 - **`String` ids are the visible ceiling** now that `Decimal` is gone — they hold up
   the level scan, the trade-id clones in the fill loop, and `best_bid_level()`.
 - **`best_bid_level()` deep-clones the level** — 92.7 µs at tight/100k, against 0.82 ns

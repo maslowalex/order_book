@@ -4,6 +4,7 @@ use std::collections::hash_map::Entry;
 
 use crate::allocation::{Fill, Maker, MatchingAlgorithm};
 use crate::instrument::Qty;
+use crate::order_queue::OrderKey;
 use crate::orderbook::{OrderBook, OrderBookError, OrderLocation};
 use crate::storage::OrderBookStore;
 use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, Side, TimeInForce};
@@ -413,7 +414,7 @@ fn fillable_quantity<S: OrderBookStore>(
         if !crosses {
             break;
         }
-        for order in &level.orders {
+        for order in level.orders() {
             if order.client_id == taker.client_id {
                 continue; // would be STP-cancelled, not traded
             }
@@ -463,6 +464,7 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
     // total before it can apportion anything), but it does not have to be a
     // fresh allocation each time. Capacity settles at the deepest level touched.
     let mut makers: Vec<Maker> = vec![];
+    let mut maker_keys: Vec<OrderKey> = vec![];
 
     while !taker.remaining_quantity.is_zero() {
         // best opposing level, or stop — this side of the book is dry
@@ -500,18 +502,14 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
         // STP — and it is what `fillable_quantity` has always assumed, so the
         // FOK dry run and the real sweep now agree on the cancellation set as
         // well as on the quantities.
-        for own in level
-            .orders
-            .extract_if(.., |o| o.client_id == taker.client_id)
-        {
+        for own in level.remove_client_orders(&taker.client_id) {
             index.remove(&own.exchange_id);
             cancelled.push(own.exchange_id);
         }
 
         // Hand the level to the policy. Everything it learns about the queue
         // passes through `makers()`: sizes and arrivals, oldest first.
-        makers.clear();
-        makers.extend(level.makers());
+        level.collect_makers(&mut makers, &mut maker_keys);
         let fills = matcher.allocate(taker.remaining_quantity, &makers, context.now);
         debug_assert_fills(&fills, taker.remaining_quantity, &makers, context.lot);
 
@@ -520,7 +518,9 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
         // every index after it.
         let price = level.price; // maker's price == its level's price
         for fill in &fills {
-            let maker = &mut level.orders[fill.order_index];
+            let maker = level
+                .order_mut(maker_keys[fill.order_index])
+                .expect("maker projection key must remain live until fills are applied");
             trades.push(Trade {
                 price,
                 quantity: fill.quantity,
@@ -536,29 +536,27 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
             taker.remaining_quantity -= fill.quantity;
         }
 
-        // Compact once, after the fact. `extract_if` is a single O(level) pass
-        // that keeps the survivors in queue order and hands back owned orders,
-        // so the index cleanup needs no id clone. (`retain` would force one;
-        // `swap_remove` would destroy the oldest-first ordering the matcher is
-        // promised; repeated `remove` would be O(k·level), and under pro-rata
-        // every maker can be exhausted at once. The FIFO-only `drain(..k)` fast
-        // path — exhausted makers are always a prefix — is what this gives up.)
-        //
-        // 6.2a: this is O(level) however few makers were exhausted, because a
-        // `Vec` level has no handles. A slab or an intrusive list makes it O(1)
-        // per exhausted maker, and nothing in this function has to know.
-        for done in level
-            .orders
-            .extract_if(.., |o| o.remaining_quantity.is_zero())
-        {
-            index.remove(&done.exchange_id);
+        // Fills point back to stable generational keys, so exhausted makers can
+        // be unlinked directly. There is no second whole-level scan and no
+        // memmove of the surviving orders.
+        for fill in &fills {
+            let key = maker_keys[fill.order_index];
+            let exhausted = level
+                .order_mut(key)
+                .is_some_and(|order| order.remaining_quantity.is_zero());
+            if exhausted {
+                let done = level
+                    .remove_key(key)
+                    .expect("an exhausted projected maker must remain live");
+                index.remove(&done.exchange_id);
+            }
         }
 
         debug_assert!(
-            level.orders.is_empty() || taker.remaining_quantity.is_zero(),
+            level.is_empty() || taker.remaining_quantity.is_zero(),
             "contract (4): a level survives only if the taker is full"
         );
-        let level_empty = level.orders.is_empty();
+        let level_empty = level.is_empty();
         if level_empty {
             store.remove_level(maker_side, price); // drained → advance to next price
         } else {
@@ -1559,8 +1557,7 @@ mod tests {
             pro_rata
                 .best_ask_level()
                 .unwrap()
-                .orders
-                .iter()
+                .orders()
                 .map(|o| o.remaining_quantity)
                 .collect::<Vec<_>>(),
             vec![qty(5), qty(10), qty(15)]

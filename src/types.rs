@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::allocation::Maker;
+use crate::order_queue::{OrderKey, OrderQueue};
 
 /// Re-exported so the ~70 `use crate::types::Price` sites keep working. The
 /// type itself lives in [`crate::instrument`], with the tick grid that gives it
@@ -297,12 +298,13 @@ impl Order {
 pub struct PriceLevel {
     pub price: Price,
     pub side: Side,
-    pub orders: Vec<Order>,
+    orders: OrderQueue,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum OrderError {
     InvalidSide,
+    DuplicateExchangeId,
 }
 
 impl PriceLevel {
@@ -310,7 +312,7 @@ impl PriceLevel {
         Self {
             price,
             side,
-            orders: vec![],
+            orders: OrderQueue::default(),
         }
     }
 
@@ -323,18 +325,15 @@ impl PriceLevel {
             return Err(OrderError::InvalidSide);
         }
 
-        self.orders.push(order);
+        self.orders
+            .push_back(order)
+            .map_err(|_| OrderError::DuplicateExchangeId)?;
 
         Ok(self)
     }
 
     pub fn remove_order(&mut self, order_exchange_id: &ExchangeId) -> Option<Order> {
-        let idx = self
-            .orders
-            .iter()
-            .position(|order| &order.exchange_id == order_exchange_id)?;
-
-        Some(self.orders.remove(idx))
+        self.orders.remove(order_exchange_id)
     }
 
     pub fn total_quantity(&self) -> Qty {
@@ -361,6 +360,40 @@ impl PriceLevel {
             arrival: u128::from(order.arrival),
         })
     }
+
+    /// Resting orders in price-time order.
+    pub fn orders(&self) -> impl Iterator<Item = &Order> {
+        self.orders.iter()
+    }
+
+    pub fn order_count(&self) -> usize {
+        self.orders.len()
+    }
+
+    pub(crate) fn get_order(&self, id: &ExchangeId) -> Option<&Order> {
+        self.orders.get(id)
+    }
+
+    pub(crate) fn remove_client_orders(&mut self, client: &ClientId) -> Vec<Order> {
+        self.orders.remove_client(client)
+    }
+
+    pub(crate) fn collect_makers(&self, makers: &mut Vec<Maker>, keys: &mut Vec<OrderKey>) {
+        self.orders.collect_makers(makers, keys);
+    }
+
+    pub(crate) fn order_mut(&mut self, key: OrderKey) -> Option<&mut Order> {
+        self.orders.get_by_key_mut(key)
+    }
+
+    pub(crate) fn remove_key(&mut self, key: OrderKey) -> Option<Order> {
+        self.orders.remove_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn order_at(&self, position: usize) -> Option<&Order> {
+        self.orders.at(position)
+    }
 }
 
 #[cfg(test)]
@@ -374,7 +407,7 @@ mod tests {
 
         assert_eq!(level.price, px(500));
         assert_eq!(level.side, Side::Ask);
-        assert_eq!(level.orders, vec![]);
+        assert_eq!(level.order_count(), 0);
     }
 
     #[test]

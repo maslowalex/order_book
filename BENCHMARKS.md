@@ -607,3 +607,62 @@ groups (and their storage equivalents). It still completed the configured sample
 run should increase `measurement_time`, enable flat sampling, or reduce sample count for these
 groups. Several slow 100k rows also have 10–40% outlier rates, especially HashMap wide cancel;
 use their broad conclusion rather than treating single-digit deltas as precision claims.
+
+---
+
+# Phase 6.2a — within-level queue: Vec, slotmap, and custom arena (2026-09-04)
+
+The baseline `PriceLevel` stored FIFO orders in a `Vec<Order>`. The first replacement used
+`slotmap::SlotMap`; the second kept the same intrusive doubly-linked queue but replaced slotmap
+with this crate's generational `Arena<T>`. In both contenders, a level maps exchange ids to
+stable handles, and exhausted makers are unlinked by handle instead of rescanning and compacting
+the level. The saved Criterion baselines are `vec_queue` and `slotmap_queue`.
+
+Representative medians from the unchanged BTree workload follow. Chunked measurements are
+divided by their declared element count; `cross 20` remains the full batch of 50 takers. The
+arena column is from the direct slotmap-baseline pass; a second Vec-baseline pass showed the same
+large conclusions but some thermal variation, most visibly 326–357 ns/op for tight/100k cancel.
+
+| workload | Vec queue | slotmap queue | custom arena |
+|---|---:|---:|---:|
+| add, tight / 100k | 88.2 ns/op | 160 ns/op | 170 ns/op |
+| cancel, tight / 100 | 79.7 ns/op | 158 ns/op | 155–157 ns/op |
+| cancel, tight / 10k | 492 ns/op | 164 ns/op | 166–173 ns/op |
+| cancel, tight / 100k | 4.59 µs/op | 468 ns/op | 318–320 ns/op |
+| add, wide / 100k | 296 ns/op | 541 ns/op | 480 ns/op |
+| cancel, wide / 100k | 366 ns/op | 659 ns/op | 593–599 ns/op |
+| burst 1000, tight | 426 ns/op | 998 ns/op | 1.02 µs/op |
+| burst 1000, wide | 333 ns/op | 444 ns/op | 411 ns/op |
+| cross 20 levels × 50 | 1.42 ms | 1.95 ms | 2.13 ms |
+
+## What the comparison says
+
+1. **The asymptotic win is real and narrow.** At tight/100k, direct unlinking cuts cancellation
+   by about 92% versus Vec. The crossover is already visible at tight/10k. At tight/100, Vec's
+   tiny linear scan is cheaper than hashing plus three arena lookups.
+2. **A handle is not free.** Every insert now performs an arena insertion and per-level hash-map
+   insertion, then repairs links. Vec's amortized `push` is substantially cheaper, so arena add
+   is about 2× slower on the large tight workload.
+3. **Wide books are the wrong shape for this per-level design.** They hold only a few orders per
+   level, so the old scan was short while every level now owns an arena and hash map. The custom
+   arena improves most large wide operations by roughly 9–19% over slotmap, but remains slower
+   than Vec.
+4. **The custom arena is not a blanket slotmap win.** It improves large tight cancellation by
+   about 32% and the large wide add/cancel cases by 9–19%, but regresses the 20-level crossing batch by
+   9%. Slotmap remains the safer default when those deltas do not justify maintaining unsafe
+   storage code.
+5. **The next architectural experiment is global ownership.** One book-wide arena plus
+   `OrderLocation::{price, handle}` would remove the hash map and allocation duplicated in every
+   price level. That is a materially different layout and needs its own A/B; these results do not
+   assume it will win.
+
+## Unsafe validation
+
+The arena's invariant is: a slot's `MaybeUninit<T>` contains one live `T` exactly when
+`occupied` is true. Every unsafe operation has a local safety argument, stale handles are
+rejected by generation, removal changes generation before reuse, and `Drop` visits only occupied
+slots. Eleven deterministic arena tests and four intrusive-queue integration tests pass under
+Miri. The randomized operation sequence runs
+natively against slotmap as a differential oracle; its default Proptest workload is deliberately
+not interpreted under Miri because generation dominates runtime rather than exercising a new
+unsafe transition.

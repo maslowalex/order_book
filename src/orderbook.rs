@@ -327,21 +327,30 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     }
 
     /// Look up a live order by its exchange id — resting in the book or
-    /// parked in the stop book. Index hop to the level/queue, then a linear
-    /// scan within it (same O(level) cost as cancel).
+    /// parked in the stop book. Active orders use the book index followed by
+    /// the level's handle index; pending stops still scan their trigger queue.
     pub fn get_order(&self, exchange_id: &ExchangeId) -> Option<&Order> {
-        let orders = match self.index.get(exchange_id)? {
-            OrderLocation::Book { side, price } => &self.store.level(*side, *price)?.orders,
+        match self.index.get(exchange_id)? {
+            OrderLocation::Book { side, price } => {
+                self.store.level(*side, *price)?.get_order(exchange_id)
+            }
             OrderLocation::StopBook {
                 side: Side::Bid,
                 trigger,
-            } => self.stop_bids.get(trigger)?,
+            } => self
+                .stop_bids
+                .get(trigger)?
+                .iter()
+                .find(|order| &order.exchange_id == exchange_id),
             OrderLocation::StopBook {
                 side: Side::Ask,
                 trigger,
-            } => self.stop_asks.get(trigger)?,
-        };
-        orders.iter().find(|o| &o.exchange_id == exchange_id)
+            } => self
+                .stop_asks
+                .get(trigger)?
+                .iter()
+                .find(|order| &order.exchange_id == exchange_id),
+        }
     }
 
     pub fn crosses(&self, side: Side, price: Price) -> bool {
@@ -530,7 +539,7 @@ mod test {
 
         // price level still exists with remaining order
         let level = orderbook.store.level(Side::Ask, px(100)).unwrap();
-        assert_eq!(level.orders.len(), 1);
+        assert_eq!(level.order_count(), 1);
         assert_eq!(level.total_quantity(), qty(5));
 
         // index only has the remaining order
@@ -900,7 +909,7 @@ mod test {
         pos: usize,
     ) -> u32 {
         let level = ob.store.level(side, px(price)).expect("level should exist");
-        level.orders[pos].arrival
+        level.order_at(pos).expect("position must exist").arrival
     }
 
     #[test]

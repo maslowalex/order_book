@@ -240,7 +240,7 @@ fn resting_snapshot<M: MatchingAlgorithm, S: OrderBookStore>(
     book.levels(Side::Bid)
         .chain(book.levels(Side::Ask))
         .flat_map(|level| {
-            level.orders.iter().map(|o| {
+            level.orders().map(|o| {
                 (
                     o.exchange_id.clone(),
                     (o.side, level.price, o.remaining_quantity),
@@ -783,9 +783,9 @@ fn check_index_consistency<M: MatchingAlgorithm, S: OrderBookStore>(
 
     let mut live_orders = 0usize;
     for level in book.levels(Side::Ask) {
-        prop_assert!(!level.orders.is_empty(), "empty level left in asks");
+        prop_assert!(!level.is_empty(), "empty level left in asks");
         prop_assert_eq!(level.side, Side::Ask);
-        for o in &level.orders {
+        for o in level.orders() {
             live_orders += 1;
             prop_assert!(!o.remaining_quantity.is_zero());
             // everything resting must be a limit at its level's price
@@ -798,9 +798,9 @@ fn check_index_consistency<M: MatchingAlgorithm, S: OrderBookStore>(
         }
     }
     for level in book.levels(Side::Bid) {
-        prop_assert!(!level.orders.is_empty(), "empty level left in bids");
+        prop_assert!(!level.is_empty(), "empty level left in bids");
         prop_assert_eq!(level.side, Side::Bid);
-        for o in &level.orders {
+        for o in level.orders() {
             live_orders += 1;
             prop_assert!(!o.remaining_quantity.is_zero());
             prop_assert_eq!(o.order_type.limit_price(), Some(level.price));
@@ -928,7 +928,7 @@ fn check_lattice_closure<M: MatchingAlgorithm, S: OrderBookStore>(
             "price lost in conversion"
         );
 
-        for o in &level.orders {
+        for o in level.orders() {
             let q = spec.qty_to_decimal(o.remaining_quantity);
             prop_assert_eq!(q % lot, Decimal::ZERO, "resting quantity off the lot grid");
             prop_assert_eq!(
