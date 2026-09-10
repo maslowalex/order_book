@@ -225,6 +225,14 @@ fn arb_lot_ten_order() -> impl Strategy<Value = Order> {
 
 // --- helpers ------------------------------------------------------------
 
+fn locations<M: MatchingAlgorithm, S: OrderBookStore>(
+    book: &OrderBook<M, S>,
+) -> HashMap<ExchangeId, OrderLocation> {
+    book.order_ids()
+        .map(|id| (id.clone(), book.order_location(id).unwrap()))
+        .collect()
+}
+
 fn opposite(side: Side) -> Side {
     match side {
         Side::Bid => Side::Ask,
@@ -240,7 +248,7 @@ fn resting_snapshot<M: MatchingAlgorithm, S: OrderBookStore>(
     book.levels(Side::Bid)
         .chain(book.levels(Side::Ask))
         .flat_map(|level| {
-            level.orders().map(|o| {
+            level.orders().map(move |o| {
                 (
                     o.exchange_id.clone(),
                     (o.side, level.price, o.remaining_quantity),
@@ -279,7 +287,7 @@ fn rested_remaining<M: MatchingAlgorithm, S: OrderBookStore>(
     book: &OrderBook<M, S>,
     id: &ExchangeId,
 ) -> Option<Qty> {
-    match book.index.get(id)? {
+    match book.order_location(id)? {
         OrderLocation::Book { .. } => book.get_order(id).map(|o| o.remaining_quantity),
         OrderLocation::StopBook { .. } => None,
     }
@@ -290,7 +298,7 @@ fn parked_remaining<M: MatchingAlgorithm, S: OrderBookStore>(
     book: &OrderBook<M, S>,
     id: &ExchangeId,
 ) -> Option<Qty> {
-    match book.index.get(id)? {
+    match book.order_location(id)? {
         OrderLocation::StopBook { .. } => book.get_order(id).map(|o| o.remaining_quantity),
         OrderLocation::Book { .. } => None,
     }
@@ -374,8 +382,8 @@ fn check_storage_agreement<M: MatchingAlgorithm + Clone>(
         prop_assert_eq!(hash_map.best_ask(), tree.best_ask());
         prop_assert_eq!(ladder.last_trade_price, tree.last_trade_price);
         prop_assert_eq!(hash_map.last_trade_price, tree.last_trade_price);
-        prop_assert_eq!(&ladder.index, &tree.index);
-        prop_assert_eq!(&hash_map.index, &tree.index);
+        prop_assert_eq!(locations(&ladder), locations(&tree));
+        prop_assert_eq!(locations(&hash_map), locations(&tree));
         prop_assert_eq!(&ladder.stop_bids, &tree.stop_bids);
         prop_assert_eq!(&hash_map.stop_bids, &tree.stop_bids);
         prop_assert_eq!(&ladder.stop_asks, &tree.stop_asks);
@@ -794,7 +802,7 @@ fn check_index_consistency<M: MatchingAlgorithm, S: OrderBookStore>(
                 side: Side::Ask,
                 price: level.price,
             };
-            prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
+            prop_assert_eq!(book.order_location(&o.exchange_id), Some(expected));
         }
     }
     for level in book.levels(Side::Bid) {
@@ -808,7 +816,7 @@ fn check_index_consistency<M: MatchingAlgorithm, S: OrderBookStore>(
                 side: Side::Bid,
                 price: level.price,
             };
-            prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
+            prop_assert_eq!(book.order_location(&o.exchange_id), Some(expected));
         }
     }
     for (side, stops) in [(Side::Bid, &book.stop_bids), (Side::Ask, &book.stop_asks)] {
@@ -827,17 +835,17 @@ fn check_index_consistency<M: MatchingAlgorithm, S: OrderBookStore>(
                     side,
                     trigger: *trigger,
                 };
-                prop_assert_eq!(book.index.get(&o.exchange_id), Some(&expected));
+                prop_assert_eq!(book.order_location(&o.exchange_id), Some(expected));
             }
         }
     }
     prop_assert_eq!(
         live_orders,
-        book.index.len(),
+        book.order_count(),
         "index and structures disagree"
     );
 
-    let ids: Vec<ExchangeId> = book.index.keys().cloned().collect();
+    let ids: Vec<ExchangeId> = book.order_ids().cloned().collect();
     for id in ids {
         prop_assert!(book.cancel_order(id).is_ok());
     }
@@ -845,7 +853,7 @@ fn check_index_consistency<M: MatchingAlgorithm, S: OrderBookStore>(
     prop_assert_eq!(book.levels(Side::Ask).count(), 0);
     prop_assert!(book.stop_bids.is_empty());
     prop_assert!(book.stop_asks.is_empty());
-    prop_assert!(book.index.is_empty());
+    prop_assert!(book.order_count() == 0);
     Ok(())
 }
 

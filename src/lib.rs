@@ -1,5 +1,4 @@
 pub mod allocation;
-mod arena;
 pub mod instrument;
 pub mod matching;
 mod order_queue;

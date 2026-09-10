@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::allocation::Maker;
-use crate::order_queue::{OrderKey, OrderQueue};
+use crate::order_queue::OrderArena;
+use crate::storage::BookLevel;
 
 /// Re-exported so the ~70 `use crate::types::Price` sites keep working. The
 /// type itself lives in [`crate::instrument`], with the tick grid that gives it
@@ -294,11 +295,12 @@ impl Order {
     }
 }
 
+/// An owned FIFO snapshot, independent of the book and its arena.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PriceLevel {
     pub price: Price,
     pub side: Side,
-    orders: OrderQueue,
+    orders: Vec<Order>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -312,7 +314,7 @@ impl PriceLevel {
         Self {
             price,
             side,
-            orders: OrderQueue::default(),
+            orders: Vec::new(),
         }
     }
 
@@ -325,15 +327,24 @@ impl PriceLevel {
             return Err(OrderError::InvalidSide);
         }
 
-        self.orders
-            .push_back(order)
-            .map_err(|_| OrderError::DuplicateExchangeId)?;
+        if self
+            .orders
+            .iter()
+            .any(|existing| existing.exchange_id == order.exchange_id)
+        {
+            return Err(OrderError::DuplicateExchangeId);
+        }
+        self.orders.push(order);
 
         Ok(self)
     }
 
     pub fn remove_order(&mut self, order_exchange_id: &ExchangeId) -> Option<Order> {
-        self.orders.remove(order_exchange_id)
+        let position = self
+            .orders
+            .iter()
+            .position(|order| &order.exchange_id == order_exchange_id)?;
+        Some(self.orders.remove(position))
     }
 
     pub fn total_quantity(&self) -> Qty {
@@ -369,30 +380,57 @@ impl PriceLevel {
     pub fn order_count(&self) -> usize {
         self.orders.len()
     }
+}
 
-    pub(crate) fn get_order(&self, id: &ExchangeId) -> Option<&Order> {
-        self.orders.get(id)
+/// A borrowed FIFO view into a level and the book's shared order arena.
+/// Iterators borrow the book, so no node or order cloning is needed.
+#[derive(Debug, Clone, Copy)]
+pub struct PriceLevelView<'a> {
+    pub price: Price,
+    pub side: Side,
+    level: &'a BookLevel,
+    nodes: &'a OrderArena,
+}
+
+impl<'a> PriceLevelView<'a> {
+    pub(crate) fn new(level: &'a BookLevel, nodes: &'a OrderArena) -> Self {
+        Self {
+            price: level.price,
+            side: level.side,
+            level,
+            nodes,
+        }
     }
 
-    pub(crate) fn remove_client_orders(&mut self, client: &ClientId) -> Vec<Order> {
-        self.orders.remove_client(client)
+    pub fn is_empty(&self) -> bool {
+        self.level.is_empty()
+    }
+    pub fn order_count(&self) -> usize {
+        self.level.order_count()
     }
 
-    pub(crate) fn collect_makers(&self, makers: &mut Vec<Maker>, keys: &mut Vec<OrderKey>) {
-        self.orders.collect_makers(makers, keys);
+    pub fn orders(&self) -> impl ExactSizeIterator<Item = &'a Order> + use<'a> {
+        self.level.queue.iter(self.nodes)
     }
 
-    pub(crate) fn order_mut(&mut self, key: OrderKey) -> Option<&mut Order> {
-        self.orders.get_by_key_mut(key)
+    pub fn makers(&self) -> impl ExactSizeIterator<Item = Maker> + use<'a> {
+        self.orders().map(|order| Maker {
+            remaining_quantity: order.remaining_quantity,
+            arrival: u128::from(order.arrival),
+        })
     }
 
-    pub(crate) fn remove_key(&mut self, key: OrderKey) -> Option<Order> {
-        self.orders.remove_key(key)
+    pub fn total_quantity(&self) -> Qty {
+        self.orders().map(|order| order.remaining_quantity).sum()
     }
 
-    #[cfg(test)]
-    pub(crate) fn order_at(&self, position: usize) -> Option<&Order> {
-        self.orders.at(position)
+    /// Explicitly clone the orders into a snapshot that can outlive the book.
+    pub fn to_owned(&self) -> PriceLevel {
+        PriceLevel {
+            price: self.price,
+            side: self.side,
+            orders: self.orders().cloned().collect(),
+        }
     }
 }
 

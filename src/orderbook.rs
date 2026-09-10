@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::allocation::MatchingAlgorithm;
 use crate::instrument::{InstrumentSpec, Qty, RejectReason, Ticks};
+use crate::order_queue::{OrderArena, OrderKey};
 use crate::storage::{BTreeStore, OrderBookStore, StoreError};
-use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
+use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, PriceLevelView, Side};
 
 /// Where a live order physically is — needed by `cancel_order`/`get_order`
 /// to know which structure to search. A bare `(Side, Price, kind)` tuple
@@ -18,6 +19,29 @@ pub enum OrderLocation {
     StopBook { side: Side, trigger: Price },
 }
 
+/// Physical address kept private so handles never escape their owning book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderAddress {
+    Book {
+        side: Side,
+        price: Price,
+        key: OrderKey,
+    },
+    StopBook {
+        side: Side,
+        trigger: Price,
+    },
+}
+
+impl OrderAddress {
+    fn location(self) -> OrderLocation {
+        match self {
+            Self::Book { side, price, .. } => OrderLocation::Book { side, price },
+            Self::StopBook { side, trigger } => OrderLocation::StopBook { side, trigger },
+        }
+    }
+}
+
 /// The book, parameterised independently by allocation policy and active-book
 /// storage.
 ///
@@ -25,7 +49,7 @@ pub enum OrderLocation {
 /// much. `S` is the *storage* axis — how active bid/ask levels are found and
 /// held. Matching depends only on [`OrderBookStore`], while allocation sees
 /// each level only through
-/// [`PriceLevel::makers`](crate::types::PriceLevel::makers) — a matcher sees a
+/// [`PriceLevelView::makers`](crate::types::PriceLevelView::makers) — a matcher sees a
 /// slice of sizes and arrivals, never an `Order` and never this struct.
 ///
 /// Note the derives add `Clone`/`Debug` bounds to both parameters. Free for the
@@ -35,6 +59,8 @@ pub struct OrderBook<M: MatchingAlgorithm, S: OrderBookStore = BTreeStore> {
     /// Active bid/ask levels. The layout is an independent static-dispatch
     /// axis from `matcher`.
     pub(crate) store: S,
+    /// All active order nodes, shared by both sides and every price level.
+    pub(crate) nodes: OrderArena,
     /// Buy stops keyed by trigger, FIFO within one trigger price. A buy stop
     /// fires when the market trades UP to its trigger, so the LOWEST key is
     /// nearest to firing.
@@ -44,7 +70,7 @@ pub struct OrderBook<M: MatchingAlgorithm, S: OrderBookStore = BTreeStore> {
     pub stop_asks: BTreeMap<Price, Vec<Order>>,
     /// Price of the most recent trade — the signal stop triggers compare to.
     pub last_trade_price: Option<Price>,
-    pub index: HashMap<ExchangeId, OrderLocation>,
+    pub(crate) index: HashMap<ExchangeId, OrderAddress>,
     pub next_seq: u64,
     /// The stamp the next order to come to rest will carry — the exchange's
     /// answer to "who was here first", handed out by `add_order`.
@@ -134,6 +160,7 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
         let store = S::try_new(spec)?;
         Ok(OrderBook {
             store,
+            nodes: OrderArena::with_key(),
             stop_bids: BTreeMap::new(),
             stop_asks: BTreeMap::new(),
             last_trade_price: None,
@@ -219,32 +246,21 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
 
         let index_entry = match self.index.entry(exchange_id) {
             Entry::Occupied(_) => return Err(OrderBookError::ExchangeIdDuplicated),
-            Entry::Vacant(e) => e.insert_entry(OrderLocation::Book { side, price }),
+            Entry::Vacant(entry) => entry,
         };
-
-        // Stamped here, past every way out of this function, because this is
-        // the exact instant the order joins a queue — and this is the only
-        // door into one, for a taker's remainder and a triggered stop alike.
-        //
-        // Past the rejects for the same reason `submit` mints its id past
-        // admission: an order that never got in never took a place in line, so
-        // it should not consume a number. What the counter records is "how many
-        // orders have ever rested here", and a reject is not one of them.
-        order.arrival = self.next_arrival;
-        // `checked_add`, not `+=`. Wrapping would make the newest order at a
-        // level read as the oldest and silently invert time priority — a
-        // corruption with no symptom until someone audits a fill. Failing
-        // loudly at the boundary is the only honest option at this width; see
-        // the `u32` note on `Order::arrival` for why the width is what it is.
-        self.next_arrival = self
+        // Compute exhaustion before mutating either the level store or the arena.
+        let next_arrival = self
             .next_arrival
             .checked_add(1)
             .expect("arrival counter exhausted: this book has rested u32::MAX orders");
-
-        if let Err(error) = self.store.add(order) {
-            index_entry.remove();
-            return Err(OrderBookError::Storage(error));
-        }
+        let level = self
+            .store
+            .ensure_level(side, price)
+            .map_err(OrderBookError::Storage)?;
+        order.arrival = self.next_arrival;
+        let key = level.queue.push_back(&mut self.nodes, order);
+        index_entry.insert(OrderAddress::Book { side, price, key });
+        self.next_arrival = next_arrival;
 
         Ok(())
     }
@@ -257,10 +273,20 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
             .ok_or(OrderBookError::OrderNotFound)?;
 
         match location {
-            OrderLocation::Book { side, price } => {
-                self.store.cancel(side, price, &exchange_id);
+            OrderAddress::Book { side, price, key } => {
+                let level = self
+                    .store
+                    .level_mut(side, price)
+                    .expect("indexed level must exist");
+                level
+                    .queue
+                    .remove_key(&mut self.nodes, key)
+                    .expect("indexed node must be live");
+                if level.is_empty() {
+                    self.store.remove_level(side, price);
+                }
             }
-            OrderLocation::StopBook { side, trigger } => {
+            OrderAddress::StopBook { side, trigger } => {
                 let stops = match side {
                     Side::Bid => &mut self.stop_bids,
                     Side::Ask => &mut self.stop_asks,
@@ -304,11 +330,11 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     }
 
     pub fn best_bid_level(&self) -> Option<PriceLevel> {
-        self.store.best_level(Side::Bid).cloned()
+        self.best_level(Side::Bid).map(|level| level.to_owned())
     }
 
     pub fn best_ask_level(&self) -> Option<PriceLevel> {
-        self.store.best_level(Side::Ask).cloned()
+        self.best_level(Side::Ask).map(|level| level.to_owned())
     }
 
     /// Aggregated market depth: the top `levels` price levels of `side`,
@@ -322,19 +348,48 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
 
     /// Active levels on one side, best price first, independent of backend.
     #[inline]
-    pub fn levels(&self, side: Side) -> S::Levels<'_> {
-        self.store.levels(side)
+    pub fn levels(&self, side: Side) -> impl Iterator<Item = PriceLevelView<'_>> {
+        self.store
+            .levels(side)
+            .map(|level| PriceLevelView::new(level, &self.nodes))
+    }
+
+    /// Borrow one active level without cloning its orders.
+    pub fn level(&self, side: Side, price: Price) -> Option<PriceLevelView<'_>> {
+        self.store
+            .level(side, price)
+            .map(|level| PriceLevelView::new(level, &self.nodes))
+    }
+
+    /// Borrow the best active level on one side.
+    pub fn best_level(&self, side: Side) -> Option<PriceLevelView<'_>> {
+        self.store
+            .best_level(side)
+            .map(|level| PriceLevelView::new(level, &self.nodes))
+    }
+
+    /// Logical residency, without exposing an arena handle.
+    pub fn order_location(&self, id: &ExchangeId) -> Option<OrderLocation> {
+        self.index.get(id).map(|address| address.location())
+    }
+
+    /// Number of live orders, including pending stops.
+    pub fn order_count(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Live exchange IDs, including pending stops, in unspecified order.
+    pub fn order_ids(&self) -> impl ExactSizeIterator<Item = &ExchangeId> {
+        self.index.keys()
     }
 
     /// Look up a live order by its exchange id — resting in the book or
     /// parked in the stop book. Active orders use the book index followed by
-    /// the level's handle index; pending stops still scan their trigger queue.
+    /// a direct arena lookup; pending stops still scan their trigger queue.
     pub fn get_order(&self, exchange_id: &ExchangeId) -> Option<&Order> {
         match self.index.get(exchange_id)? {
-            OrderLocation::Book { side, price } => {
-                self.store.level(*side, *price)?.get_order(exchange_id)
-            }
-            OrderLocation::StopBook {
+            OrderAddress::Book { key, .. } => self.nodes.get(*key).map(|node| &node.order),
+            OrderAddress::StopBook {
                 side: Side::Bid,
                 trigger,
             } => self
@@ -342,7 +397,7 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
                 .get(trigger)?
                 .iter()
                 .find(|order| &order.exchange_id == exchange_id),
-            OrderLocation::StopBook {
+            OrderAddress::StopBook {
                 side: Side::Ask,
                 trigger,
             } => self
@@ -451,7 +506,7 @@ mod test {
 
         assert_eq!(orderbook.levels(Side::Bid).count(), 0);
 
-        let level = orderbook.store.level(Side::Ask, px(100)).unwrap();
+        let level = orderbook.level(Side::Ask, px(100)).unwrap();
         assert_eq!(level.total_quantity(), qty(15)); // 10 + 5
     }
 
@@ -463,9 +518,11 @@ mod test {
             .add_order(order(Side::Ask, 100, 10, None, "ex_1"))
             .unwrap();
 
-        let location = orderbook.index.get(&ExchangeId("ex_1".to_owned())).unwrap();
+        let location = orderbook
+            .order_location(&ExchangeId("ex_1".to_owned()))
+            .unwrap();
         assert_eq!(
-            *location,
+            location,
             OrderLocation::Book {
                 side: Side::Ask,
                 price: px(100)
@@ -538,7 +595,7 @@ mod test {
             .unwrap();
 
         // price level still exists with remaining order
-        let level = orderbook.store.level(Side::Ask, px(100)).unwrap();
+        let level = orderbook.level(Side::Ask, px(100)).unwrap();
         assert_eq!(level.order_count(), 1);
         assert_eq!(level.total_quantity(), qty(5));
 
@@ -908,8 +965,12 @@ mod test {
         price: i64,
         pos: usize,
     ) -> u32 {
-        let level = ob.store.level(side, px(price)).expect("level should exist");
-        level.order_at(pos).expect("position must exist").arrival
+        let level = ob.level(side, px(price)).expect("level should exist");
+        level
+            .orders()
+            .nth(pos)
+            .expect("position must exist")
+            .arrival
     }
 
     #[test]
@@ -1048,5 +1109,232 @@ mod test {
             3,
             "the stop queues where it landed, not where it was sent from"
         );
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+    use crate::allocation::{FifoMatcher, ProRataMatcher, TimeProRataMatcher};
+    use crate::storage::{HashMapStore, TickLadderStore};
+    use crate::test_helpers::{order, px, qty};
+    use crate::types::TimeInForce;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    /// Check both directions of the ownership relation, including arena orphans.
+    fn assert_ownership<M: MatchingAlgorithm, S: OrderBookStore>(book: &OrderBook<M, S>) {
+        let mut keys = HashSet::new();
+        let mut ids = HashSet::new();
+        for side in [Side::Bid, Side::Ask] {
+            for level in book.store.levels(side) {
+                assert_eq!(level.side, side);
+                assert!(!level.is_empty());
+                assert!(level.queue.links_are_consistent(&book.nodes));
+                for (key, order) in level.queue.iter_with_keys(&book.nodes) {
+                    assert!(keys.insert(key), "a node belongs to more than one level");
+                    assert!(ids.insert(order.exchange_id.clone()), "duplicate live ID");
+                    assert_eq!(order.side, side);
+                    assert_eq!(order.order_type.limit_price(), Some(level.price));
+                    assert!(!order.remaining_quantity.is_zero());
+                    assert_eq!(
+                        book.index.get(&order.exchange_id),
+                        Some(&OrderAddress::Book {
+                            side,
+                            price: level.price,
+                            key,
+                        })
+                    );
+                }
+            }
+        }
+        assert_eq!(keys.len(), book.nodes.len(), "orphaned arena nodes");
+        for (key, _) in &book.nodes {
+            assert!(keys.contains(&key));
+        }
+        for (side, stops) in [(Side::Bid, &book.stop_bids), (Side::Ask, &book.stop_asks)] {
+            for (trigger, orders) in stops {
+                assert!(!orders.is_empty());
+                for order in orders {
+                    assert!(ids.insert(order.exchange_id.clone()));
+                    assert_eq!(order.side, side);
+                    assert_eq!(
+                        book.index.get(&order.exchange_id),
+                        Some(&OrderAddress::StopBook {
+                            side,
+                            trigger: *trigger
+                        })
+                    );
+                }
+            }
+        }
+        assert_eq!(ids.len(), book.index.len(), "orphaned index entries");
+    }
+
+    fn bounded_spec() -> InstrumentSpec {
+        InstrumentSpec::cents()
+            .with_price_range(px(90), Some(px(110)))
+            .unwrap()
+    }
+
+    type Operation = (u8, bool, i64, u64, u8);
+
+    fn exercise<M: MatchingAlgorithm + Clone, S: OrderBookStore>(matcher: M, ops: &[Operation]) {
+        let mut book = OrderBook::<M, S>::try_new(bounded_spec(), matcher).unwrap();
+        let mut submitted: Vec<ExchangeId> = Vec::new();
+        for (step, &(kind, bid, price, size, client)) in ops.iter().enumerate() {
+            if kind == 0 && !submitted.is_empty() {
+                // Includes already filled/cancelled IDs and newly reused slots.
+                let id = submitted[step % submitted.len()].clone();
+                let expected = book.get_order(&id).is_some();
+                assert_eq!(book.cancel_order(id).is_ok(), expected);
+            } else {
+                let order_type = match kind {
+                    1 => OrderType::Market,
+                    2 => OrderType::limit_ioc(px(price)),
+                    3 => OrderType::limit_fok(px(price)),
+                    4 => OrderType::stop_market(px(price)),
+                    5 => OrderType::StopLimit {
+                        trigger: px(price),
+                        price: px(price),
+                        tif: TimeInForce::GTC,
+                    },
+                    _ => OrderType::limit_gtc(px(price)),
+                };
+                let incoming = Order::builder()
+                    .side(if bid { Side::Bid } else { Side::Ask })
+                    .order_type(order_type)
+                    .quantity(qty(size))
+                    .client_id(client.to_string())
+                    .timestamp(step as u128)
+                    .exchange_id("assigned-by-submit")
+                    .build();
+                submitted.push(book.submit(incoming).unwrap().order_id);
+            }
+            assert_ownership(&book);
+            // Cloning must preserve every handle-to-node relation.
+            if step % 13 == 0 {
+                assert_ownership(&book.clone());
+            }
+        }
+        let mut clone = book.clone();
+        let before: Vec<_> = book
+            .levels(Side::Bid)
+            .chain(book.levels(Side::Ask))
+            .map(|level| level.to_owned())
+            .collect();
+        let stops_before = (book.stop_bids.clone(), book.stop_asks.clone());
+        let ids: Vec<_> = clone.order_ids().cloned().collect();
+        for id in ids {
+            clone.cancel_order(id).unwrap();
+            assert_ownership(&clone);
+        }
+        assert!(clone.nodes.is_empty());
+        assert_eq!(clone.order_count(), 0);
+        let after: Vec<_> = book
+            .levels(Side::Bid)
+            .chain(book.levels(Side::Ask))
+            .map(|level| level.to_owned())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(
+            stops_before,
+            (book.stop_bids.clone(), book.stop_asks.clone())
+        );
+        assert_ownership(&book);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn mixed_operations_preserve_shared_arena_ownership(
+            ops in prop::collection::vec((0u8..9, any::<bool>(), 95i64..106, 1u64..21, 0u8..4), 1..80)
+        ) {
+            macro_rules! stores {
+                ($matcher:expr) => {{
+                    exercise::<_, BTreeStore>($matcher, &ops);
+                    exercise::<_, TickLadderStore>($matcher, &ops);
+                    exercise::<_, HashMapStore>($matcher, &ops);
+                }};
+            }
+            stores!(FifoMatcher);
+            stores!(ProRataMatcher::new(1));
+            stores!(TimeProRataMatcher::new(1));
+        }
+    }
+
+    #[test]
+    fn snapshots_and_clones_survive_partial_fills_and_slot_reuse() {
+        let mut book = OrderBook::new(bounded_spec(), FifoMatcher);
+        book.add_order(order(Side::Ask, 100, 10, None, "a"))
+            .unwrap();
+        book.add_order(order(Side::Ask, 100, 20, None, "b"))
+            .unwrap();
+        let snapshot = book.best_ask_level().unwrap();
+        let view = book.best_level(Side::Ask).unwrap();
+        assert_eq!(view.order_count(), view.orders().len());
+        assert_eq!(
+            view.makers().collect::<Vec<_>>(),
+            snapshot.makers().collect::<Vec<_>>()
+        );
+        let mut clone = book.clone();
+        clone
+            .submit(order(Side::Bid, 100, 15, None, "taker"))
+            .unwrap();
+        assert_eq!(
+            clone
+                .get_order(&ExchangeId("b".into()))
+                .unwrap()
+                .remaining_quantity,
+            qty(15)
+        );
+        clone
+            .add_order(order(Side::Ask, 101, 3, None, "c"))
+            .unwrap();
+        assert!(book.get_order(&ExchangeId("c".into())).is_none());
+        assert_eq!(book.best_ask_level(), Some(snapshot.clone()));
+        book.cancel_order(ExchangeId("a".into())).unwrap();
+        assert_eq!(snapshot.order_count(), 2);
+        assert_eq!(snapshot.total_quantity(), qty(30));
+        assert_ownership(&clone);
+        assert_ownership(&book);
+        drop(book);
+        assert_eq!(
+            snapshot
+                .orders()
+                .map(|order| order.exchange_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn duplicate_and_storage_rejections_leave_no_arena_or_index_entry() {
+        let mut book =
+            OrderBook::<_, TickLadderStore>::try_new(bounded_spec(), FifoMatcher).unwrap();
+        book.add_order(order(Side::Ask, 100, 1, None, "a")).unwrap();
+        let before = format!("{book:?}");
+        assert_eq!(
+            book.add_order(order(Side::Ask, 101, 2, None, "a")),
+            Err(OrderBookError::ExchangeIdDuplicated)
+        );
+        assert_eq!(format!("{book:?}"), before);
+        // A deliberately narrower backend rejects after book-level admission.
+        // Start with an empty book so replacing its backend cannot orphan nodes.
+        let mut book =
+            OrderBook::<_, TickLadderStore>::try_new(bounded_spec(), FifoMatcher).unwrap();
+        book.store = TickLadderStore::try_new(
+            InstrumentSpec::cents()
+                .with_price_range(px(100), Some(px(101)))
+                .unwrap(),
+        )
+        .unwrap();
+        let before = format!("{book:?}");
+        assert_eq!(
+            book.add_order(order(Side::Ask, 105, 1, None, "outside")),
+            Err(OrderBookError::Storage(StoreError::PriceOutsideRange))
+        );
+        assert_eq!(format!("{book:?}"), before);
+        assert_ownership(&book);
     }
 }

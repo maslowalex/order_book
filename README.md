@@ -218,16 +218,55 @@ alternative stores use the fallible `OrderBook::<M, S>::try_new` constructor.
 
 ### The active book is behind a trait; stops are not
 
-`OrderBookStore` owns only active bid/ask levels. Stop queues, exchange sequence,
-arrival clock, admission policy, and the unified id index remain in `OrderBook` because
-they are engine state rather than competing price-level layouts. The trait exposes
-ordered level iteration through a GAT, so neither backend boxes an iterator or allocates
-to answer `depth()` and FOK fillability checks.
+`OrderBookStore` owns active bid/ask level metadata. `OrderBook` owns one
+`slotmap::SlotMap<OrderKey, Node>` for active orders, plus stop queues, exchange
+sequence, arrival clock, admission policy, and the unified ID index. A level's
+`LevelQueue` holds only head/tail keys and a count; nodes hold the orders and
+previous/next links. Removing an active order needs one ID-index lookup, a level
+lookup, and direct unlinking by handle.
 
-The first contender is `TickLadderStore`: one `Option<PriceLevel>` slot per legal tick
-per side, with cached best indices. It requires a finite `InstrumentSpec::max_price()`;
-constructing it for an unbounded instrument returns `StoreError::UnboundedPriceRange`
-instead of gambling on an allocation derived from an arbitrary `u64` price.
+The trait exposes ordered metadata iteration through a GAT. BTree and tick-ladder
+iteration allocate nothing; HashMap iteration still sorts a temporary vector of
+level references. `depth()` collects its result into a vector on every backend.
+
+`TickLadderStore` holds one `Option<BookLevel>` slot per legal tick per side, with
+cached best indices. It requires a finite `InstrumentSpec::max_price()`;
+constructing it for an unbounded instrument returns `StoreError::UnboundedPriceRange`.
+
+### One arena delegates allocation; queues still define priority
+
+The per-level arena experiment won deep-level cancellation but regressed insertion
+and mixed workloads. Moving nodes into one book-wide arena removes per-level arena
+allocations and duplicate exchange-ID maps. `slotmap` now handles slot reuse and
+generation checks; the engine handles FIFO links and removes exhausted makers. The
+custom unsafe arena has been removed. The comparison with the previous revision is
+in [BENCHMARKS.md](BENCHMARKS.md).
+
+Ordinary `SlotMap` fits linked traversal: each step looks up a handle. DenseSlotMap's
+whole-arena iteration advantage would not directly speed up that walk. This is a
+layout choice, not a measured comparison of those two crate types. Slotmap retains
+its high-water slot storage, so an empty book can still retain arena capacity.
+
+**Identity cost:** slotmap documents possible stale-key aliasing after 2³¹ reuses of
+one slot, unlike the custom arena's checked generation-exhaustion panic. Handles stay
+internal and are discarded when orders leave; exchange IDs remain the public
+identity. The existing checked `u32` arrival counter also remains in place. See
+[slotmap's guarantees](https://docs.rs/slotmap/1.1.1/slotmap/#performance-characteristics-and-implementation-details).
+
+### Level reads borrow the book; snapshots own their orders
+
+`OrderBook::level(side, price)`, `best_level(side)`, and `levels(side)` return
+`PriceLevelView` values. Their `orders()` iterators borrow the shared arena and walk
+FIFO links without cloning orders. `to_owned()` explicitly copies a view into a
+`PriceLevel` snapshot backed by `Vec<Order>`. `best_bid_level()` and
+`best_ask_level()` continue returning owned snapshots that can outlive the book.
+
+This changes the public storage trait: `ensure_level` and `level_mut` replace
+order-level `add` and `cancel`; the engine owns those operations. Storage methods
+return `BookLevel` metadata. The ID index is private; use `order_location`,
+`order_ids`, `order_count`, and `get_order` for read access. Constructor and execution
+report shapes are unchanged. Stops acquire arena nodes only when they activate and
+leave a resting limit remainder.
 
 ### Cached-best repair starts where the old best disappeared
 
@@ -423,16 +462,15 @@ neighbouring lessons, both recorded rather than quietly fixed:
 - **The projection cost.** `allocate(&[Maker])` materialises whole levels for policies
   that don't need them. It was deliberately held constant for the first storage
   comparison; a future fast path or lazy projection needs its own isolated A/B.
-- **Arena cancellation paid off only at deep levels.** A generational arena plus an
-  intrusive queue reduced tight/100k cancellation from ~4.59 µs to 0.32 µs per
-  order. It is slower for shallow/wide levels because hashing and handle chasing cost
-  more than a tiny contiguous scan. The full Vec → slotmap → custom-arena comparison is
-  in `BENCHMARKS.md`.
+- **Queue traversal still costs.** The shared slotmap improves insertion,
+  cancellation, and mixed bursts against the per-level baseline, but the tight
+  burst remains slower than the historical Vec result. A fresh comparison is
+  needed to isolate linked traversal from projection costs. See `BENCHMARKS.md`.
 - **`String` ids are the visible ceiling** now that `Decimal` is gone — they hold up
   the level scan, the trade-id clones in the fill loop, and `best_bid_level()`.
-- **`best_bid_level()` deep-clones the level** — 92.7 µs at tight/100k, against 0.82 ns
-  for `best_bid`. `depth()` already exists and is the right replacement for most
-  callers.
+- **Owned level snapshots still clone strings.** `best_level(side)` now provides
+  a borrowed alternative; `depth()` provides aggregated quantities. Keep owned
+  snapshots for callers that need independent data.
 - **Tail latency is unmeasured.** Criterion reports the sampling distribution of the
   mean; per-op p99/p99.9 needs per-invocation timing.
 
@@ -443,8 +481,10 @@ neighbouring lessons, both recorded rather than quietly fixed:
 | Module | Role |
 |---|---|
 | `instrument` | `Price`, `Qty`, `Ticks`, `Notional`, and the `InstrumentSpec` lattice + admission checks |
-| `types` | `Order`, `OrderBuilder`, `OrderType`, `Side`, `TimeInForce`, `PriceLevel` |
-| `orderbook` | `OrderBook<M>` — both sides, stop books, id index, resting/cancel/read paths |
+| `types` | `Order`, `OrderBuilder`, `OrderType`, `Side`, `TimeInForce`, `PriceLevel`, `PriceLevelView` |
+| `orderbook` | `OrderBook<M, S>` — shared arena, stop books, ID index, resting/cancel/read paths |
+| `storage` | `OrderBookStore`, `BookLevel`, and the three price-level backends |
+| `order_queue` | Internal FIFO links over slotmap nodes |
 | `matching` | `submit`, `Trade`, `ExecutionReport`, the stop cascade, self-trade prevention |
 | `allocation` | `MatchingAlgorithm`, `Maker`/`Fill`, and the three matchers |
 
@@ -458,19 +498,10 @@ cargo bench --bench order_book
 
 Note the `--bench order_book`: plain `cargo bench` also runs the library's default
 test harness, which rejects criterion's flags. Numbers, methodology and the full
-run-by-run history are in [BENCHMARKS.md](BENCHMARKS.md); for orientation, the most
-recent burst scenario runs ~2.3M mixed orders/sec on a tight book and ~3.0M on a wide
-one, single-threaded on an Apple M3 — down from ~2.9M/~3.5M before the allocation
-trait, for the reason under "Static dispatch" above.
-
-**Read that as a pre-optimization number.** No optimization pass has happened yet, and
-nothing has been profiled — every attribution in `BENCHMARKS.md` is explicitly a
-hypothesis awaiting a flamegraph. The two speedups on record were side effects rather
-than the goal: the tick/lot migration was a correctness change that happened to be
-faster, and narrowing `arrival` to `u32` declined a regression rather than winning
-anything. The known costs are all still in place — four `String` clones per trade, a
-linear scan per cancel, whole levels projected for policies that don't need them. See
-[Open questions](#open-questions).
+run-by-run history are in [BENCHMARKS.md](BENCHMARKS.md). Historical tables describe
+the layout measured at the time; the latest entry compares per-level custom arenas
+with the shared slotmap implementation. Whole-level allocation projection and four
+`String` clones per trade remain. Active cancellation now unlinks by handle.
 
 Edition 2024. Developed against rustc 1.92.0.
 

@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fmt::Debug;
 
 use crate::instrument::InstrumentSpec;
-use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, Side};
+use crate::order_queue::LevelQueue;
+use crate::types::{Price, Side};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
@@ -23,19 +24,43 @@ pub enum StoreError {
     PriceRangeTooLarge,
     /// The price is outside the span this store was constructed for.
     PriceOutsideRange,
-    /// Only limit orders can live in active-book storage.
-    NotRestable,
-    /// An order was offered to a level on the opposite side.
-    InvalidSide,
 }
 
-/// The minimum active-book interface needed by matching and public queries.
+/// Metadata for an active price level. Orders live in the book-wide arena.
+/// Backends construct levels with `new`; only the engine changes queue links.
+#[derive(Debug, Clone)]
+pub struct BookLevel {
+    pub price: Price,
+    pub side: Side,
+    pub(crate) queue: LevelQueue,
+}
+
+impl BookLevel {
+    pub fn new(price: Price, side: Side) -> Self {
+        Self {
+            price,
+            side,
+            queue: LevelQueue::default(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+    pub fn order_count(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+/// Price-level storage, independent of active-order ownership.
+/// `ensure_level` must return the requested level or reject without mutation.
+/// The engine removes levels after their last order is unlinked.
 ///
 /// The trait is intentionally statically dispatched. Its iterator is a GAT so
-/// each backend can expose ordered levels without boxing or allocating on the
-/// read path.
+/// backends expose ordered levels without boxing. BTree and ladder iteration
+/// allocate nothing; HashMap iteration sorts a temporary vector of references.
 pub trait OrderBookStore: Clone + Debug {
-    type Levels<'a>: Iterator<Item = &'a PriceLevel>
+    type Levels<'a>: Iterator<Item = &'a BookLevel>
     where
         Self: 'a;
 
@@ -43,12 +68,12 @@ pub trait OrderBookStore: Clone + Debug {
     where
         Self: Sized;
 
-    fn add(&mut self, order: Order) -> Result<(), StoreError>;
-    fn cancel(&mut self, side: Side, price: Price, id: &ExchangeId) -> Option<Order>;
-    fn level(&self, side: Side, price: Price) -> Option<&PriceLevel>;
-    fn best_level(&self, side: Side) -> Option<&PriceLevel>;
-    fn best_level_mut(&mut self, side: Side) -> Option<&mut PriceLevel>;
-    fn remove_level(&mut self, side: Side, price: Price) -> Option<PriceLevel>;
+    fn ensure_level(&mut self, side: Side, price: Price) -> Result<&mut BookLevel, StoreError>;
+    fn level_mut(&mut self, side: Side, price: Price) -> Option<&mut BookLevel>;
+    fn level(&self, side: Side, price: Price) -> Option<&BookLevel>;
+    fn best_level(&self, side: Side) -> Option<&BookLevel>;
+    fn best_level_mut(&mut self, side: Side) -> Option<&mut BookLevel>;
+    fn remove_level(&mut self, side: Side, price: Price) -> Option<BookLevel>;
     fn levels(&self, side: Side) -> Self::Levels<'_>;
 
     #[inline]
@@ -60,17 +85,17 @@ pub trait OrderBookStore: Clone + Debug {
 /// Tier-0 baseline: the original pair of ordered maps.
 #[derive(Debug, Clone, Default)]
 pub struct BTreeStore {
-    bids: BTreeMap<Reverse<Price>, PriceLevel>,
-    asks: BTreeMap<Price, PriceLevel>,
+    bids: BTreeMap<Reverse<Price>, BookLevel>,
+    asks: BTreeMap<Price, BookLevel>,
 }
 
 pub enum BTreeLevels<'a> {
-    Bids(btree_map::Values<'a, Reverse<Price>, PriceLevel>),
-    Asks(btree_map::Values<'a, Price, PriceLevel>),
+    Bids(btree_map::Values<'a, Reverse<Price>, BookLevel>),
+    Asks(btree_map::Values<'a, Price, BookLevel>),
 }
 
 impl<'a> Iterator for BTreeLevels<'a> {
-    type Item = &'a PriceLevel;
+    type Item = &'a BookLevel;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -88,49 +113,29 @@ impl OrderBookStore for BTreeStore {
     }
 
     #[inline]
-    fn add(&mut self, order: Order) -> Result<(), StoreError> {
-        let OrderType::Limit { price, .. } = order.order_type else {
-            return Err(StoreError::NotRestable);
-        };
-        let side = order.side;
-        let level = match side {
+    fn ensure_level(&mut self, side: Side, price: Price) -> Result<&mut BookLevel, StoreError> {
+        Ok(match side {
             Side::Bid => self
                 .bids
                 .entry(Reverse(price))
-                .or_insert_with(|| PriceLevel::new(price, side)),
+                .or_insert_with(|| BookLevel::new(price, side)),
             Side::Ask => self
                 .asks
                 .entry(price)
-                .or_insert_with(|| PriceLevel::new(price, side)),
-        };
-        level
-            .add_order(order)
-            .map(|_| ())
-            .map_err(|_| StoreError::InvalidSide)
+                .or_insert_with(|| BookLevel::new(price, side)),
+        })
     }
 
     #[inline]
-    fn cancel(&mut self, side: Side, price: Price, id: &ExchangeId) -> Option<Order> {
-        let (removed, empty) = match side {
-            Side::Bid => {
-                let level = self.bids.get_mut(&Reverse(price))?;
-                let removed = level.remove_order(id);
-                (removed, level.is_empty())
-            }
-            Side::Ask => {
-                let level = self.asks.get_mut(&price)?;
-                let removed = level.remove_order(id);
-                (removed, level.is_empty())
-            }
-        };
-        if empty {
-            self.remove_level(side, price);
+    fn level_mut(&mut self, side: Side, price: Price) -> Option<&mut BookLevel> {
+        match side {
+            Side::Bid => self.bids.get_mut(&Reverse(price)),
+            Side::Ask => self.asks.get_mut(&price),
         }
-        removed
     }
 
     #[inline]
-    fn level(&self, side: Side, price: Price) -> Option<&PriceLevel> {
+    fn level(&self, side: Side, price: Price) -> Option<&BookLevel> {
         match side {
             Side::Bid => self.bids.get(&Reverse(price)),
             Side::Ask => self.asks.get(&price),
@@ -138,7 +143,7 @@ impl OrderBookStore for BTreeStore {
     }
 
     #[inline]
-    fn best_level(&self, side: Side) -> Option<&PriceLevel> {
+    fn best_level(&self, side: Side) -> Option<&BookLevel> {
         match side {
             Side::Bid => self.bids.first_key_value().map(|(_, level)| level),
             Side::Ask => self.asks.first_key_value().map(|(_, level)| level),
@@ -146,7 +151,7 @@ impl OrderBookStore for BTreeStore {
     }
 
     #[inline]
-    fn best_level_mut(&mut self, side: Side) -> Option<&mut PriceLevel> {
+    fn best_level_mut(&mut self, side: Side) -> Option<&mut BookLevel> {
         match side {
             Side::Bid => self.bids.first_entry().map(|entry| entry.into_mut()),
             Side::Ask => self.asks.first_entry().map(|entry| entry.into_mut()),
@@ -154,7 +159,7 @@ impl OrderBookStore for BTreeStore {
     }
 
     #[inline]
-    fn remove_level(&mut self, side: Side, price: Price) -> Option<PriceLevel> {
+    fn remove_level(&mut self, side: Side, price: Price) -> Option<BookLevel> {
         match side {
             Side::Bid => self.bids.remove(&Reverse(price)),
             Side::Ask => self.asks.remove(&price),
@@ -177,8 +182,8 @@ impl OrderBookStore for BTreeStore {
 /// complete configured price span, including empty prices.
 #[derive(Debug, Clone)]
 pub struct TickLadderStore {
-    bids: Vec<Option<PriceLevel>>,
-    asks: Vec<Option<PriceLevel>>,
+    bids: Vec<Option<BookLevel>>,
+    asks: Vec<Option<BookLevel>>,
     min_minor: u64,
     tick_size: u64,
     best_bid: Option<usize>,
@@ -187,18 +192,18 @@ pub struct TickLadderStore {
 
 #[derive(Debug, Clone, Default)]
 pub struct HashMapStore {
-    bids: HashMap<Price, PriceLevel>,
-    asks: HashMap<Price, PriceLevel>,
+    bids: HashMap<Price, BookLevel>,
+    asks: HashMap<Price, BookLevel>,
     bids_index: BinaryHeap<Price>,
     asks_index: BinaryHeap<Reverse<Price>>,
 }
 
 pub struct HashMapLevels<'a> {
-    inner: std::vec::IntoIter<&'a PriceLevel>,
+    inner: std::vec::IntoIter<&'a BookLevel>,
 }
 
 impl<'a> Iterator for HashMapLevels<'a> {
-    type Item = &'a PriceLevel;
+    type Item = &'a BookLevel;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
@@ -209,7 +214,7 @@ impl OrderBookStore for HashMapStore {
     type Levels<'a> = HashMapLevels<'a>;
 
     fn levels(&self, side: Side) -> Self::Levels<'_> {
-        let mut levels: Vec<&PriceLevel> = match side {
+        let mut levels: Vec<&BookLevel> = match side {
             Side::Bid => self.bids.values().collect(),
             Side::Ask => self.asks.values().collect(),
         };
@@ -232,59 +237,32 @@ impl OrderBookStore for HashMapStore {
         Ok(Self::default())
     }
 
-    fn add(&mut self, order: Order) -> Result<(), StoreError> {
-        let OrderType::Limit { price, .. } = order.order_type else {
-            return Err(StoreError::NotRestable);
+    fn ensure_level(&mut self, side: Side, price: Price) -> Result<&mut BookLevel, StoreError> {
+        let levels = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
         };
-        let side = order.side;
-        let created_new_level = {
-            let levels = match side {
-                Side::Bid => &mut self.bids,
-                Side::Ask => &mut self.asks,
-            };
-
-            match levels.entry(price) {
-                Entry::Occupied(mut entry) => {
-                    entry
-                        .get_mut()
-                        .add_order(order)
-                        .map_err(|_| StoreError::InvalidSide)?;
-
-                    false
+        Ok(match levels.entry(price) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                match side {
+                    Side::Bid => self.bids_index.push(price),
+                    Side::Ask => self.asks_index.push(Reverse(price)),
                 }
-
-                Entry::Vacant(entry) => {
-                    let mut level = PriceLevel::new(price, side);
-
-                    level
-                        .add_order(order)
-                        .map_err(|_| StoreError::InvalidSide)?;
-
-                    entry.insert(level);
-                    true
-                }
+                entry.insert(BookLevel::new(price, side))
             }
-        };
-
-        if created_new_level {
-            match side {
-                Side::Ask => self.asks_index.push(Reverse(price)),
-                Side::Bid => self.bids_index.push(price),
-            }
-        }
-
-        Ok(())
+        })
     }
 
     #[inline]
-    fn level(&self, side: Side, price: Price) -> Option<&PriceLevel> {
+    fn level(&self, side: Side, price: Price) -> Option<&BookLevel> {
         match side {
             Side::Bid => self.bids.get(&price),
             Side::Ask => self.asks.get(&price),
         }
     }
 
-    fn best_level(&self, side: Side) -> Option<&PriceLevel> {
+    fn best_level(&self, side: Side) -> Option<&BookLevel> {
         match side {
             Side::Bid => self
                 .bids_index
@@ -298,7 +276,7 @@ impl OrderBookStore for HashMapStore {
         }
     }
 
-    fn best_level_mut(&mut self, side: Side) -> Option<&mut PriceLevel> {
+    fn best_level_mut(&mut self, side: Side) -> Option<&mut BookLevel> {
         match side {
             Side::Bid => self
                 .bids_index
@@ -312,24 +290,14 @@ impl OrderBookStore for HashMapStore {
         }
     }
 
-    fn cancel(&mut self, side: Side, price: Price, id: &ExchangeId) -> Option<Order> {
-        let (removed, empty) = {
-            let levels = match side {
-                Side::Bid => &mut self.bids,
-                Side::Ask => &mut self.asks,
-            };
-            let level = levels.get_mut(&price)?;
-            let removed = level.remove_order(id);
-            (removed, level.is_empty())
-        };
-
-        if empty {
-            self.remove_level(side, price);
+    fn level_mut(&mut self, side: Side, price: Price) -> Option<&mut BookLevel> {
+        match side {
+            Side::Bid => self.bids.get_mut(&price),
+            Side::Ask => self.asks.get_mut(&price),
         }
-        removed
     }
 
-    fn remove_level(&mut self, side: Side, price: Price) -> Option<PriceLevel> {
+    fn remove_level(&mut self, side: Side, price: Price) -> Option<BookLevel> {
         match side {
             Side::Bid => {
                 self.bids_index.retain(|el| el != &price);
@@ -344,12 +312,12 @@ impl OrderBookStore for HashMapStore {
 }
 
 pub enum TickLevels<'a> {
-    Bids(std::iter::Rev<std::slice::Iter<'a, Option<PriceLevel>>>),
-    Asks(std::slice::Iter<'a, Option<PriceLevel>>),
+    Bids(std::iter::Rev<std::slice::Iter<'a, Option<BookLevel>>>),
+    Asks(std::slice::Iter<'a, Option<BookLevel>>),
 }
 
 impl<'a> Iterator for TickLevels<'a> {
-    type Item = &'a PriceLevel;
+    type Item = &'a BookLevel;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -425,56 +393,35 @@ impl OrderBookStore for TickLadderStore {
     }
 
     #[inline]
-    fn add(&mut self, order: Order) -> Result<(), StoreError> {
-        let OrderType::Limit { price, .. } = order.order_type else {
-            return Err(StoreError::NotRestable);
-        };
-        let side = order.side;
+    fn ensure_level(&mut self, side: Side, price: Price) -> Result<&mut BookLevel, StoreError> {
         let index = self.index(price).ok_or(StoreError::PriceOutsideRange)?;
-        let slots = match side {
-            Side::Bid => &mut self.bids,
-            Side::Ask => &mut self.asks,
-        };
-        let level = slots[index].get_or_insert_with(|| PriceLevel::new(price, side));
-        level
-            .add_order(order)
-            .map_err(|_| StoreError::InvalidSide)?;
-
         match side {
             Side::Bid if self.best_bid.is_none_or(|best| index > best) => {
-                self.best_bid = Some(index);
+                self.best_bid = Some(index)
             }
             Side::Ask if self.best_ask.is_none_or(|best| index < best) => {
-                self.best_ask = Some(index);
+                self.best_ask = Some(index)
             }
             _ => {}
         }
-        Ok(())
-    }
-
-    #[inline]
-    fn cancel(&mut self, side: Side, price: Price, id: &ExchangeId) -> Option<Order> {
-        let index = self.index(price)?;
         let slots = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        let removed = slots[index].as_mut()?.remove_order(id);
-        if slots[index].as_ref().is_some_and(PriceLevel::is_empty) {
-            slots[index] = None;
-            let removed_touch = match side {
-                Side::Bid => self.best_bid == Some(index),
-                Side::Ask => self.best_ask == Some(index),
-            };
-            if removed_touch {
-                self.repair_best_after_removal(side, index);
-            }
-        }
-        removed
+        Ok(slots[index].get_or_insert_with(|| BookLevel::new(price, side)))
     }
 
     #[inline]
-    fn level(&self, side: Side, price: Price) -> Option<&PriceLevel> {
+    fn level_mut(&mut self, side: Side, price: Price) -> Option<&mut BookLevel> {
+        let index = self.index(price)?;
+        match side {
+            Side::Bid => self.bids[index].as_mut(),
+            Side::Ask => self.asks[index].as_mut(),
+        }
+    }
+
+    #[inline]
+    fn level(&self, side: Side, price: Price) -> Option<&BookLevel> {
         let index = self.index(price)?;
         match side {
             Side::Bid => self.bids[index].as_ref(),
@@ -483,7 +430,7 @@ impl OrderBookStore for TickLadderStore {
     }
 
     #[inline]
-    fn best_level(&self, side: Side) -> Option<&PriceLevel> {
+    fn best_level(&self, side: Side) -> Option<&BookLevel> {
         match side {
             Side::Bid => self.best_bid.and_then(|index| self.bids[index].as_ref()),
             Side::Ask => self.best_ask.and_then(|index| self.asks[index].as_ref()),
@@ -491,7 +438,7 @@ impl OrderBookStore for TickLadderStore {
     }
 
     #[inline]
-    fn best_level_mut(&mut self, side: Side) -> Option<&mut PriceLevel> {
+    fn best_level_mut(&mut self, side: Side) -> Option<&mut BookLevel> {
         match side {
             Side::Bid => self.best_bid.and_then(|index| self.bids[index].as_mut()),
             Side::Ask => self.best_ask.and_then(|index| self.asks[index].as_mut()),
@@ -499,7 +446,7 @@ impl OrderBookStore for TickLadderStore {
     }
 
     #[inline]
-    fn remove_level(&mut self, side: Side, price: Price) -> Option<PriceLevel> {
+    fn remove_level(&mut self, side: Side, price: Price) -> Option<BookLevel> {
         let index = self.index(price)?;
         let removed = match side {
             Side::Bid => self.bids[index].take(),
@@ -527,7 +474,7 @@ impl OrderBookStore for TickLadderStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{order, px, qty};
+    use crate::test_helpers::px;
 
     fn bounded_spec() -> InstrumentSpec {
         InstrumentSpec::cents()
@@ -540,10 +487,10 @@ mod tests {
         assert!(store.best_level(Side::Bid).is_none());
         assert!(store.best_level(Side::Ask).is_none());
 
-        store.add(order(Side::Bid, 98, 7, None, "b98")).unwrap();
-        store.add(order(Side::Bid, 100, 5, None, "b100")).unwrap();
-        store.add(order(Side::Ask, 102, 3, None, "a102")).unwrap();
-        store.add(order(Side::Ask, 101, 4, None, "a101")).unwrap();
+        store.ensure_level(Side::Bid, px(98)).unwrap();
+        store.ensure_level(Side::Bid, px(100)).unwrap();
+        store.ensure_level(Side::Ask, px(102)).unwrap();
+        store.ensure_level(Side::Ask, px(101)).unwrap();
 
         assert_eq!(store.best_price(Side::Bid), Some(px(100)));
         assert_eq!(store.best_price(Side::Ask), Some(px(101)));
@@ -562,8 +509,8 @@ mod tests {
             vec![px(101), px(102)]
         );
 
-        let removed = store.cancel(Side::Bid, px(100), &ExchangeId("b100".into()));
-        assert_eq!(removed.unwrap().remaining_quantity, qty(5));
+        let removed = store.remove_level(Side::Bid, px(100));
+        assert_eq!(removed.unwrap().price, px(100));
         assert_eq!(store.best_price(Side::Bid), Some(px(98)));
         assert!(store.level(Side::Bid, px(100)).is_none());
 
@@ -598,8 +545,8 @@ mod tests {
     fn tick_ladder_maps_both_inclusive_boundaries() {
         let mut store = TickLadderStore::try_new(bounded_spec()).unwrap();
         assert_eq!(store.slots_per_side(), 11);
-        store.add(order(Side::Ask, 95, 1, None, "min")).unwrap();
-        store.add(order(Side::Bid, 105, 1, None, "max")).unwrap();
+        store.ensure_level(Side::Ask, px(95)).unwrap();
+        store.ensure_level(Side::Bid, px(105)).unwrap();
         assert_eq!(store.best_price(Side::Ask), Some(px(95)));
         assert_eq!(store.best_price(Side::Bid), Some(px(105)));
     }

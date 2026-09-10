@@ -32,6 +32,7 @@
 //! Run: `cargo bench`, or filtered: `cargo bench -- 'add_order/tight/1000$'`.
 //! HTML report: `target/criterion/report/index.html`.
 
+use order_book::types::Side;
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -61,7 +62,7 @@ mod generators {
     /// Tick 400 (= 100.00) is excluded from both sides in the tight grid so a
     /// seeded book never crosses itself; the wide grid leaves 100.00 out the
     /// same way. Distribution shape is the experiment: tight concentrates
-    /// N=100k orders into ~40 levels (~2.5k orders/level → the Vec scan inside
+    /// N=100k orders into ~40 levels (~2.5k orders/level → the queue traversal inside
     /// a level dominates), wide spreads them over ~20k levels (~5 orders/level
     /// → the BTreeMap walk dominates).
     #[derive(Clone, Copy)]
@@ -428,7 +429,7 @@ fn batch_for(n: usize) -> BatchSize {
     }
 }
 
-/// `add_order` (rest-only, no matching): BTreeMap entry + Vec push + HashMap
+/// `add_order` (rest-only, no matching): BTreeMap entry + arena insertion + HashMap
 /// index insert. Expect O(log levels); tight should beat wide at large N since
 /// 40 hot levels stay in cache while wide walks a ~20k-node tree.
 fn bench_add_order(c: &mut Criterion) {
@@ -460,11 +461,9 @@ fn bench_add_order(c: &mut Criterion) {
     group.finish();
 }
 
-/// `cancel_order`: HashMap remove + BTreeMap lookup + `PriceLevel::remove_order`
-/// — a LINEAR scan of the level's Vec with String comparisons. The expectation
-/// to verify: tight/100k ≫ wide/100k, because tight levels hold ~2.5k orders
-/// (long scans) while wide levels hold ~5. Same op, same N — distribution
-/// alone flips the cost. That's the Phase 6.2a lesson landing early.
+/// Active cancellation: one ID-index removal, price-level lookup, and arena
+/// unlinking. Tight and wide books exercise different level-map and node-access
+/// patterns; neither performs the old per-level linear ID scan.
 fn bench_cancel_order(c: &mut Criterion) {
     let mut group = c.benchmark_group("cancel_order");
     group
@@ -505,10 +504,9 @@ fn bench_cancel_order(c: &mut Criterion) {
 
 /// Read-only top-of-book queries on a shared (uncloned) book. `best_bid` and
 /// `spread` should be near-constant few-ns lookups regardless of N.
-/// `best_bid_level` is benchmarked to EXPOSE an API smell: it deep-clones the
-/// whole PriceLevel — at tight/100k that's ~2.5k orders × 2 heap Strings each,
-/// expect orders of magnitude over `best_bid`. Fix candidate for Phase 6.4:
-/// return `Option<&PriceLevel>`.
+/// `best_bid_level_clone` measures an owned FIFO snapshot: at tight/100k that's
+/// ~2.5k orders with two heap Strings each. `best_bid_level_view` separately
+/// measures borrowing the level, with no cloning.
 /// Top-of-book reads.
 ///
 /// **The book itself is `black_box`ed, not just the result**, and that is not
@@ -533,6 +531,10 @@ fn bench_best_price(c: &mut Criterion) {
                 BenchmarkId::new(format!("best_bid/{}", dist.name), n),
                 |b| b.iter(|| black_box(black_box(&book).best_bid())),
             );
+            group.bench_function(
+                BenchmarkId::new(format!("best_bid_level_view/{}", dist.name), n),
+                |b| b.iter(|| black_box(black_box(&book).best_level(Side::Bid))),
+            );
             if n == 100_000 {
                 group.bench_function(
                     BenchmarkId::new(format!("best_bid_level_clone/{}", dist.name), n),
@@ -554,7 +556,7 @@ fn bench_best_price(c: &mut Criterion) {
 ///   `ExchangeId::from_sequence` format! allocation + the crossing check).
 /// - `cross_limit`/`market`: takers each consuming exactly `levels` price
 ///   levels of a 1000-level ladder (10 makers × qty 10 per level → depth 100).
-///   These include `Trade` construction (2 String clones per fill) and
+///   These include `Trade` construction (4 String clones per fill) and
 ///   `ExecutionReport` allocation — deliberately timed, that IS the product's
 ///   real per-order cost.
 fn bench_submit(c: &mut Criterion) {
@@ -819,7 +821,7 @@ fn bench_storage(c: &mut Criterion) {
 ///
 /// On that half-full level the ladder's 10 makers per level is what the
 /// divergence rides on: FIFO fills 5 makers and stops, a weighted policy gives
-/// all 10 a share — twice the `Trade` values, each carrying two `String` clones.
+/// all 10 a share — twice the `Trade` values, each carrying four `String` clones.
 /// `levels_each ∈ {1, 20}` separates "one partial level, allocation dominates"
 /// from "nineteen full levels plus one partial, the walk dominates".
 fn bench_matcher(c: &mut Criterion) {

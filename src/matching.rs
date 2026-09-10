@@ -4,8 +4,8 @@ use std::collections::hash_map::Entry;
 
 use crate::allocation::{Fill, Maker, MatchingAlgorithm};
 use crate::instrument::Qty;
-use crate::order_queue::OrderKey;
-use crate::orderbook::{OrderBook, OrderBookError, OrderLocation};
+use crate::order_queue::{OrderArena, OrderKey};
+use crate::orderbook::{OrderAddress, OrderBook, OrderBookError};
 use crate::storage::OrderBookStore;
 use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 
@@ -171,7 +171,7 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
         let order_id = order.exchange_id.clone();
         match self.index.entry(order_id.clone()) {
             Entry::Occupied(_) => return Err(OrderBookError::ExchangeIdDuplicated),
-            Entry::Vacant(e) => e.insert(OrderLocation::StopBook {
+            Entry::Vacant(e) => e.insert(OrderAddress::StopBook {
                 side: order.side,
                 trigger,
             }),
@@ -228,28 +228,17 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
         //
         // `now` and `lot` are read out first so that `self.spec` and
         // `self.next_arrival` are not borrowed across the call — leaving the
-        // side map, the index and the matcher as three disjoint field borrows.
+        // store, arena, index and matcher as disjoint field borrows.
         let (now, lot) = (self.arrival_now(), self.lot_size());
-        let (trades, cancelled) = match order.side {
-            Side::Bid => fill_against(
-                &mut self.store,
-                Side::Ask,
-                &mut self.index,
-                &self.matcher,
-                &mut order,
-                Some(limit),
-                SweepContext { now, lot },
-            ),
-            Side::Ask => fill_against(
-                &mut self.store,
-                Side::Bid,
-                &mut self.index,
-                &self.matcher,
-                &mut order,
-                Some(limit),
-                SweepContext { now, lot },
-            ),
-        };
+        let (trades, cancelled) = fill_against(
+            &mut self.store,
+            &mut self.nodes,
+            &mut self.index,
+            &self.matcher,
+            &mut order,
+            Some(limit),
+            SweepContext { now, lot },
+        );
 
         if order.remaining_quantity.is_zero() {
             return Ok(MatchingResult {
@@ -294,8 +283,8 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
         limit: Price,
     ) -> Result<MatchingResult, OrderBookError> {
         let available = match order.side {
-            Side::Bid => fillable_quantity(&self.store, Side::Ask, &order, limit),
-            Side::Ask => fillable_quantity(&self.store, Side::Bid, &order, limit),
+            Side::Bid => fillable_quantity(&self.store, &self.nodes, Side::Ask, &order, limit),
+            Side::Ask => fillable_quantity(&self.store, &self.nodes, Side::Bid, &order, limit),
         };
 
         if available < order.remaining_quantity {
@@ -307,26 +296,15 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
         }
 
         let (now, lot) = (self.arrival_now(), self.lot_size());
-        let (trades, cancelled) = match order.side {
-            Side::Bid => fill_against(
-                &mut self.store,
-                Side::Ask,
-                &mut self.index,
-                &self.matcher,
-                &mut order,
-                Some(limit),
-                SweepContext { now, lot },
-            ),
-            Side::Ask => fill_against(
-                &mut self.store,
-                Side::Bid,
-                &mut self.index,
-                &self.matcher,
-                &mut order,
-                Some(limit),
-                SweepContext { now, lot },
-            ),
-        };
+        let (trades, cancelled) = fill_against(
+            &mut self.store,
+            &mut self.nodes,
+            &mut self.index,
+            &self.matcher,
+            &mut order,
+            Some(limit),
+            SweepContext { now, lot },
+        );
         debug_assert!(
             order.remaining_quantity.is_zero(),
             "FOK dry-run promised a full fill"
@@ -342,26 +320,15 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     fn process_market_order(&mut self, mut order: Order) -> Result<MatchingResult, OrderBookError> {
         // A market order accepts any price, so there is no limit bound.
         let (now, lot) = (self.arrival_now(), self.lot_size());
-        let (trades, cancelled) = match order.side {
-            Side::Bid => fill_against(
-                &mut self.store,
-                Side::Ask,
-                &mut self.index,
-                &self.matcher,
-                &mut order,
-                None,
-                SweepContext { now, lot },
-            ),
-            Side::Ask => fill_against(
-                &mut self.store,
-                Side::Bid,
-                &mut self.index,
-                &self.matcher,
-                &mut order,
-                None,
-                SweepContext { now, lot },
-            ),
-        };
+        let (trades, cancelled) = fill_against(
+            &mut self.store,
+            &mut self.nodes,
+            &mut self.index,
+            &self.matcher,
+            &mut order,
+            None,
+            SweepContext { now, lot },
+        );
 
         // IOC: anything left unfilled is discarded, not rested.
         let outcome = if order.remaining_quantity.is_zero() {
@@ -399,6 +366,7 @@ fn activate(mut order: Order) -> Order {
 /// partially fill. Returns early once `taker.remaining_quantity` is reachable.
 fn fillable_quantity<S: OrderBookStore>(
     store: &S,
+    nodes: &OrderArena,
     maker_side: Side,
     taker: &Order,
     limit: Price,
@@ -414,7 +382,7 @@ fn fillable_quantity<S: OrderBookStore>(
         if !crosses {
             break;
         }
-        for order in level.orders() {
+        for order in level.queue.iter(nodes) {
             if order.client_id == taker.client_id {
                 continue; // would be STP-cancelled, not traded
             }
@@ -445,18 +413,22 @@ fn fillable_quantity<S: OrderBookStore>(
 /// the prefix a FIFO walk would have reached — see the note on the pre-pass
 /// below.
 ///
-/// Taking the store, index and matcher as separate args (rather than `&mut
+/// Taking the store, arena, index and matcher as separate args (rather than `&mut
 /// self`) keeps the field borrows disjoint while making this walk independent
 /// of the concrete level layout.
 fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
     store: &mut S,
-    maker_side: Side,
-    index: &mut HashMap<ExchangeId, OrderLocation>,
+    nodes: &mut OrderArena,
+    index: &mut HashMap<ExchangeId, OrderAddress>,
     matcher: &M,
     taker: &mut Order,
     limit: Option<Price>,
     context: SweepContext,
 ) -> (Vec<Trade>, Vec<ExchangeId>) {
+    let maker_side = match taker.side {
+        Side::Bid => Side::Ask,
+        Side::Ask => Side::Bid,
+    };
     let mut trades: Vec<Trade> = vec![];
     let mut cancelled: Vec<ExchangeId> = vec![];
     // One buffer for the whole sweep, cleared per level: the projection has to
@@ -502,14 +474,16 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
         // STP — and it is what `fillable_quantity` has always assumed, so the
         // FOK dry run and the real sweep now agree on the cancellation set as
         // well as on the quantities.
-        for own in level.remove_client_orders(&taker.client_id) {
+        for own in level.queue.remove_client(nodes, &taker.client_id) {
             index.remove(&own.exchange_id);
             cancelled.push(own.exchange_id);
         }
 
         // Hand the level to the policy. Everything it learns about the queue
         // passes through `makers()`: sizes and arrivals, oldest first.
-        level.collect_makers(&mut makers, &mut maker_keys);
+        level
+            .queue
+            .collect_makers(nodes, &mut makers, &mut maker_keys);
         let fills = matcher.allocate(taker.remaining_quantity, &makers, context.now);
         debug_assert_fills(&fills, taker.remaining_quantity, &makers, context.lot);
 
@@ -518,9 +492,10 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
         // every index after it.
         let price = level.price; // maker's price == its level's price
         for fill in &fills {
-            let maker = level
-                .order_mut(maker_keys[fill.order_index])
-                .expect("maker projection key must remain live until fills are applied");
+            let maker = &mut nodes
+                .get_mut(maker_keys[fill.order_index])
+                .expect("maker projection key must remain live until fills are applied")
+                .order;
             trades.push(Trade {
                 price,
                 quantity: fill.quantity,
@@ -541,12 +516,13 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
         // memmove of the surviving orders.
         for fill in &fills {
             let key = maker_keys[fill.order_index];
-            let exhausted = level
-                .order_mut(key)
-                .is_some_and(|order| order.remaining_quantity.is_zero());
+            let exhausted = nodes
+                .get(key)
+                .is_some_and(|node| node.order.remaining_quantity.is_zero());
             if exhausted {
                 let done = level
-                    .remove_key(key)
+                    .queue
+                    .remove_key(nodes, key)
                     .expect("an exhausted projected maker must remain live");
                 index.remove(&done.exchange_id);
             }

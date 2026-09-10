@@ -1,150 +1,111 @@
-use std::collections::HashMap;
+use slotmap::{SlotMap, new_key_type};
 
 use crate::allocation::Maker;
-use crate::arena::{Arena, Handle};
-use crate::types::{ClientId, ExchangeId, Order};
+use crate::types::{ClientId, Order};
 
-/// Stable, generational identity for a resting order inside one level.
-pub(crate) type OrderKey = Handle;
+new_key_type! {
+    /// Identity of an active order in one book's arena, never exposed to callers.
+    /// Slotmap versions reused slots; its generation can wrap after 2^31 reuses.
+    pub(crate) struct OrderKey;
+}
+
+pub(crate) type OrderArena = SlotMap<OrderKey, Node>;
 
 #[derive(Debug, Clone)]
-struct Node {
-    order: Order,
+pub(crate) struct Node {
+    pub(crate) order: Order,
     previous: Option<OrderKey>,
     next: Option<OrderKey>,
 }
 
-/// A price-time queue backed by a safe generational arena.
-///
-/// `Arena` owns the nodes and rejects stale handles. FIFO topology lives in the
-/// nodes themselves, while `by_id` supplies constant-time arbitrary removal.
+/// FIFO topology for one level. The book owns the nodes and the ID index.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct OrderQueue {
-    nodes: Arena<Node>,
-    by_id: HashMap<ExchangeId, OrderKey>,
+pub(crate) struct LevelQueue {
     head: Option<OrderKey>,
     tail: Option<OrderKey>,
+    len: usize,
 }
 
-impl PartialEq for OrderQueue {
-    fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().eq(other.iter())
-    }
-}
-
-impl OrderQueue {
+impl LevelQueue {
     pub(crate) fn is_empty(&self) -> bool {
-        self.head.is_none()
+        self.len == 0
     }
-
     pub(crate) fn len(&self) -> usize {
-        self.nodes.len()
+        self.len
     }
 
-    pub(crate) fn push_back(&mut self, order: Order) -> Result<OrderKey, Order> {
-        if self.by_id.contains_key(&order.exchange_id) {
-            return Err(order);
-        }
-
-        let previous = self.tail;
-        let exchange_id = order.exchange_id.clone();
-        let key = self.nodes.insert(Node {
+    pub(crate) fn push_back(&mut self, nodes: &mut OrderArena, order: Order) -> OrderKey {
+        let key = nodes.insert(Node {
             order,
-            previous,
+            previous: self.tail,
             next: None,
         });
-
-        if let Some(previous) = previous {
-            self.nodes
-                .get_mut(previous)
-                .expect("tail key must name a live node")
+        if let Some(tail) = self.tail {
+            nodes
+                .get_mut(tail)
+                .expect("tail must reference a live node")
                 .next = Some(key);
         } else {
             self.head = Some(key);
         }
-
         self.tail = Some(key);
-        self.by_id.insert(exchange_id, key);
-        debug_assert!(self.links_are_consistent());
-        Ok(key)
+        self.len += 1;
+        key
     }
 
-    pub(crate) fn get(&self, id: &ExchangeId) -> Option<&Order> {
-        let key = *self.by_id.get(id)?;
-        self.nodes.get(key).map(|node| &node.order)
-    }
-
-    pub(crate) fn get_by_key_mut(&mut self, key: OrderKey) -> Option<&mut Order> {
-        self.nodes.get_mut(key).map(|node| &mut node.order)
-    }
-
-    pub(crate) fn remove(&mut self, id: &ExchangeId) -> Option<Order> {
-        let key = *self.by_id.get(id)?;
-        self.remove_key(key)
-    }
-
-    pub(crate) fn remove_key(&mut self, key: OrderKey) -> Option<Order> {
-        // Remove from the arena first: it performs its fallible free-list
-        // reservation before changing anything. Once this succeeds, repairing
-        // links and deleting the hash entry are allocation-free.
-        let node = self.nodes.remove(key)?;
-        let previous = node.previous;
-        let next = node.next;
-
-        if let Some(previous) = previous {
-            self.nodes
+    /// The caller must obtain `key` from this queue or its indexed location.
+    /// A stale key is harmless; a live key from another queue is a caller bug.
+    pub(crate) fn remove_key(&mut self, nodes: &mut OrderArena, key: OrderKey) -> Option<Order> {
+        let node = nodes.remove(key)?;
+        if let Some(previous) = node.previous {
+            nodes
                 .get_mut(previous)
-                .expect("previous link must name a live node")
-                .next = next;
+                .expect("previous link must be live")
+                .next = node.next;
         } else {
-            self.head = next;
+            self.head = node.next;
         }
-
-        if let Some(next) = next {
-            self.nodes
+        if let Some(next) = node.next {
+            nodes
                 .get_mut(next)
-                .expect("next link must name a live node")
-                .previous = previous;
+                .expect("next link must be live")
+                .previous = node.previous;
         } else {
-            self.tail = previous;
+            self.tail = node.previous;
         }
-
-        let indexed = self.by_id.remove(&node.order.exchange_id);
-        debug_assert_eq!(indexed, Some(key));
-        debug_assert_eq!(self.head.is_none(), self.tail.is_none());
-        debug_assert!(self.links_are_consistent());
+        self.len -= 1;
         Some(node.order)
     }
 
-    pub(crate) fn remove_where(&mut self, mut predicate: impl FnMut(&Order) -> bool) -> Vec<Order> {
+    pub(crate) fn remove_client(
+        &mut self,
+        nodes: &mut OrderArena,
+        client: &ClientId,
+    ) -> Vec<Order> {
         let mut removed = Vec::new();
         let mut cursor = self.head;
-
         while let Some(key) = cursor {
-            let node = self
-                .nodes
-                .get(key)
-                .expect("queue link must name a live node");
+            let node = nodes.get(key).expect("queue link must be live");
             cursor = node.next;
-            if predicate(&node.order) {
+            if &node.order.client_id == client {
                 removed.push(
-                    self.remove_key(key)
-                        .expect("key observed during exclusive traversal must remain live"),
+                    self.remove_key(nodes, key)
+                        .expect("observed key must be live"),
                 );
             }
         }
-
         removed
     }
 
-    pub(crate) fn remove_client(&mut self, client: &ClientId) -> Vec<Order> {
-        self.remove_where(|order| &order.client_id == client)
-    }
-
-    pub(crate) fn collect_makers(&self, makers: &mut Vec<Maker>, keys: &mut Vec<OrderKey>) {
+    pub(crate) fn collect_makers(
+        &self,
+        nodes: &OrderArena,
+        makers: &mut Vec<Maker>,
+        keys: &mut Vec<OrderKey>,
+    ) {
         makers.clear();
         keys.clear();
-        for (key, order) in self.iter_with_keys() {
+        for (key, order) in self.iter_with_keys(nodes) {
             makers.push(Maker {
                 remaining_quantity: order.remaining_quantity,
                 arrival: u128::from(order.arrival),
@@ -153,35 +114,31 @@ impl OrderQueue {
         }
     }
 
-    pub(crate) fn iter(&self) -> Iter<'_> {
-        Iter {
-            nodes: &self.nodes,
-            next: self.head,
-        }
+    pub(crate) fn iter<'a>(
+        &self,
+        nodes: &'a OrderArena,
+    ) -> impl ExactSizeIterator<Item = &'a Order> + use<'a> {
+        self.iter_with_keys(nodes).map(|(_, order)| order)
     }
 
-    fn iter_with_keys(&self) -> IterWithKeys<'_> {
+    pub(crate) fn iter_with_keys<'a>(&self, nodes: &'a OrderArena) -> IterWithKeys<'a> {
         IterWithKeys {
-            nodes: &self.nodes,
+            nodes,
             next: self.head,
+            remaining: self.len,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn at(&self, position: usize) -> Option<&Order> {
-        self.iter().nth(position)
-    }
-
-    fn links_are_consistent(&self) -> bool {
+    pub(crate) fn links_are_consistent(&self, nodes: &OrderArena) -> bool {
         if self.head.is_none() || self.tail.is_none() {
-            return self.head.is_none() && self.tail.is_none() && self.nodes.is_empty();
+            return self.head.is_none() && self.tail.is_none() && self.len == 0;
         }
-
         let mut previous = None;
         let mut cursor = self.head;
-        let mut visited = 0usize;
+        let mut visited = 0;
         while let Some(key) = cursor {
-            let Some(node) = self.nodes.get(key) else {
+            let Some(node) = nodes.get(key) else {
                 return false;
             };
             if node.previous != previous {
@@ -190,56 +147,37 @@ impl OrderQueue {
             previous = Some(key);
             cursor = node.next;
             visited += 1;
-            if visited > self.nodes.len() {
+            if visited > self.len {
                 return false;
             }
         }
-
-        previous == self.tail && visited == self.nodes.len() && visited == self.by_id.len()
+        previous == self.tail && visited == self.len
     }
 }
 
-pub(crate) struct Iter<'a> {
-    nodes: &'a Arena<Node>,
+pub(crate) struct IterWithKeys<'a> {
+    nodes: &'a OrderArena,
     next: Option<OrderKey>,
-}
-
-impl<'a> Iterator for Iter<'a> {
-    type Item = &'a Order;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let key = self.next?;
-        let node = self
-            .nodes
-            .get(key)
-            .expect("queue link must name a live node");
-        self.next = node.next;
-        Some(&node.order)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.nodes.len()))
-    }
-}
-
-struct IterWithKeys<'a> {
-    nodes: &'a Arena<Node>,
-    next: Option<OrderKey>,
+    remaining: usize,
 }
 
 impl<'a> Iterator for IterWithKeys<'a> {
     type Item = (OrderKey, &'a Order);
-
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.next?;
         let node = self
             .nodes
             .get(key)
-            .expect("queue link must name a live node");
+            .expect("queue link must reference a live node");
         self.next = node.next;
+        self.remaining -= 1;
         Some((key, &node.order))
     }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+impl ExactSizeIterator for IterWithKeys<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -250,64 +188,58 @@ mod tests {
     fn queued(id: &str) -> Order {
         order(Side::Bid, 100, 1, None, id)
     }
-
-    fn ids(queue: &OrderQueue) -> Vec<String> {
+    fn ids(queue: &LevelQueue, nodes: &OrderArena) -> Vec<String> {
         queue
-            .iter()
+            .iter(nodes)
             .map(|order| order.exchange_id.0.clone())
             .collect()
     }
 
     #[test]
-    fn arbitrary_removal_repairs_both_links() {
-        let mut queue = OrderQueue::default();
-        for id in ["a", "b", "c", "d"] {
-            queue.push_back(queued(id)).unwrap();
+    fn queues_share_storage_without_sharing_links() {
+        let mut nodes = OrderArena::with_key();
+        let mut left = LevelQueue::default();
+        let mut right = LevelQueue::default();
+        let a = left.push_back(&mut nodes, queued("a"));
+        let other = right.push_back(&mut nodes, queued("other"));
+        let b = left.push_back(&mut nodes, queued("b"));
+        let c = left.push_back(&mut nodes, queued("c"));
+        let d = left.push_back(&mut nodes, queued("d"));
+        assert!(left.links_are_consistent(&nodes));
+        assert!(right.links_are_consistent(&nodes));
+        assert_eq!(left.len(), 4);
+        assert_eq!(right.len(), 1);
+        for (key, expected) in [
+            (b, vec!["a", "c", "d"]),
+            (a, vec!["c", "d"]),
+            (d, vec!["c"]),
+            (c, vec![]),
+        ] {
+            assert!(left.remove_key(&mut nodes, key).is_some());
+            assert_eq!(ids(&left, &nodes), expected);
+            assert!(left.links_are_consistent(&nodes));
+            assert!(right.links_are_consistent(&nodes));
+            assert_eq!(ids(&right, &nodes), ["other"]);
         }
-
-        assert_eq!(
-            queue.remove(&ExchangeId("c".into())).unwrap().exchange_id.0,
-            "c"
-        );
-        assert_eq!(ids(&queue), ["a", "b", "d"]);
-        assert!(queue.links_are_consistent());
+        assert_eq!(nodes.len(), 1);
+        assert!(right.remove_key(&mut nodes, other).is_some());
+        assert!(nodes.is_empty());
+        assert!(right.links_are_consistent(&nodes));
     }
 
     #[test]
-    fn head_tail_and_last_removal_are_consistent() {
-        let mut queue = OrderQueue::default();
-        for id in ["a", "b", "c"] {
-            queue.push_back(queued(id)).unwrap();
-        }
-
-        queue.remove(&ExchangeId("a".into())).unwrap();
-        queue.remove(&ExchangeId("c".into())).unwrap();
-        assert_eq!(ids(&queue), ["b"]);
-        queue.remove(&ExchangeId("b".into())).unwrap();
-        assert!(queue.is_empty());
-        assert!(queue.links_are_consistent());
-    }
-
-    #[test]
-    fn removed_slot_reuse_does_not_revive_old_key() {
-        let mut queue = OrderQueue::default();
-        let stale = queue.push_back(queued("a")).unwrap();
-        queue.remove_key(stale).unwrap();
-        let current = queue.push_back(queued("b")).unwrap();
-
+    fn reuse_in_another_queue_does_not_revive_stale_key() {
+        let mut nodes = OrderArena::with_key();
+        let mut left = LevelQueue::default();
+        let mut right = LevelQueue::default();
+        let stale = left.push_back(&mut nodes, queued("a"));
+        left.remove_key(&mut nodes, stale).unwrap();
+        let current = right.push_back(&mut nodes, queued("b"));
         assert_ne!(stale, current);
-        assert!(queue.nodes.get(stale).is_none());
-        assert_eq!(queue.nodes.get(current).unwrap().order.exchange_id.0, "b");
-    }
-
-    #[test]
-    fn duplicate_id_is_rejected_without_mutation() {
-        let mut queue = OrderQueue::default();
-        queue.push_back(queued("a")).unwrap();
-        let duplicate = queue.push_back(queued("a")).unwrap_err();
-
-        assert_eq!(duplicate.exchange_id.0, "a");
-        assert_eq!(ids(&queue), ["a"]);
-        assert!(queue.links_are_consistent());
+        assert!(left.remove_key(&mut nodes, stale).is_none());
+        assert!(nodes.get(stale).is_none());
+        assert_eq!(ids(&right, &nodes), ["b"]);
+        assert!(left.links_are_consistent(&nodes));
+        assert!(right.links_are_consistent(&nodes));
     }
 }

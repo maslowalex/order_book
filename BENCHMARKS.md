@@ -1,8 +1,39 @@
 # Benchmark Results
 
-Three full runs of the Criterion suite in `benches/order_book.rs`. The first two are compared
-side by side below; the third — the tick/lot migration — is its own A/B at the end of this file,
-because it was measured against its own immediate parent rather than against `phase62`.
+A history of Criterion measurements from `benches/order_book.rs`. Each dated entry
+records its own baseline, toolchain, workload, and interpretation. Historical
+columns labelled "now" refer to that entry's date, not the current implementation.
+
+## Latest results — 2026-09-10
+
+One book-wide `slotmap::SlotMap` replaces the per-level custom arenas and ID maps.
+The controlled comparison uses FIFO and the default BTree backend against
+`f9c5afd`, with the same workload generators and sampling settings.
+
+| workload | tight: median time reduction | wide: median time reduction |
+|---|---:|---:|
+| insert into a 100k-order book | 50.3% | 28.5% |
+| cancel from a 100k-order book | 47.2% | 53.6% |
+| mixed 1,000-order burst | 9.9% | 19.3% |
+
+The 20-level crossing batch improved 25.0%. No measured row regressed against
+the per-level baseline. Borrowed level views take approximately 1.3–1.9 ns to
+obtain; order traversal and owned snapshot cloning are separate operations.
+
+The comparison measures the combined ownership and crate change. It does not
+establish performance for the other storage backends, heap residency, or tail
+latency. The tight mixed burst remains slower than the historical Vec result,
+which would need a fresh run for a controlled comparison.
+
+See [the complete book-wide slotmap results](#phase-62b--book-wide-slotmap-ownership-2026-09-10)
+for absolute timings, saved baselines, reproduction commands, and validation.
+
+---
+
+## Phase 4 comparison — 2026-08-10
+
+The first two full runs are compared below. Later migrations and storage
+experiments have separate dated comparisons further down this file.
 
 - **`phase62`** — 2026-08-05, the **Tier 0 baseline** the 6.2a storage bake-off is measured
   against (saved as criterion baseline `phase62`).
@@ -16,9 +47,11 @@ full run, which measures **+7%** on that benchmark and shows where else the cost
 - **Machine:** Apple M3, 16 GB, macOS (Darwin 25.5.0)
 - **Toolchain:** rustc 1.92.0, criterion 0.8.2, `cargo bench` (release, default opts) — same
   for both runs
-- **Reproduce:** `cargo bench --bench order_book -- --baseline phase62` (compare against the
-  baseline) or `cargo bench` (fresh). Filter examples: `cargo bench -- 'add_order/tight/1000$'`,
-  `cargo bench -- cancel_storm`. HTML report: `target/criterion/report/index.html` (not committed).
+- **Reproduce on the historical revision:** `cargo bench --bench order_book -- --baseline phase62`
+  (compare against the saved baseline) or `cargo bench --bench order_book` (fresh).
+  Filter examples: `cargo bench --bench order_book -- 'add_order/tight/1000$'`,
+  `cargo bench --bench order_book -- cancel_storm`. HTML report:
+  `target/criterion/report/index.html` (not committed).
 
 **Reading the numbers.** Mutating benchmarks time a chunk of `K = max(10, N/10)` ops per cloned
 book (see the methodology comment in `benches/order_book.rs`); "per op" below is chunk time / K,
@@ -666,3 +699,105 @@ Miri. The randomized operation sequence runs
 natively against slotmap as a differential oracle; its default Proptest workload is deliberately
 not interpreted under Miri because generation dominates runtime rather than exercising a new
 unsafe transition.
+
+---
+
+# Phase 6.2b — book-wide slotmap ownership (2026-09-10)
+
+The baseline is `f9c5afd`, using one custom arena and exchange-ID map per price
+level. The contender uses one `slotmap::SlotMap` for all active nodes, keeps head,
+tail, and count in each level, and stores active handles in the unified ID index.
+Stops and allocation policies retain their existing behavior. This comparison
+measures the combined ownership and crate change, not either factor separately.
+
+Predictions recorded before inspecting the comparison results: eliminating a hash
+insertion and ID clone should help insertion; eliminating the second ID lookup
+should help cancellation. Mixed matching may improve from cheaper removals, but
+whole-level projection and linked traversal remain, so recovering the old Vec
+throughput is not assumed. Owned snapshots now clone FIFO orders into a Vec rather
+than copying arena and hash-map structures; their cost should fall while remaining
+proportional to level depth. These are hypotheses, not profiling results.
+
+## Results
+
+Same-machine runs on `aarch64-apple-darwin`, rustc `1.100.0-nightly`
+(`2e2b193f8`, 2026-09-02), Criterion 0.8, default release optimization. Both
+revisions used FIFO with the default BTree backend, identical existing workload
+generators, and identical sampling settings. The saved baselines are
+`per_level_arena` and `global_slotmap`; the latter preserves
+the comparison run's `new` results. No concurrent tests or builds ran during the
+comparison measurements.
+
+The table uses medians from Criterion's `estimates.json`. Add/cancel batches are
+divided by `N/10`, bursts by 1,000; the crossing row remains the full 50-taker
+batch. Owned snapshot rows remain owned snapshots on both revisions.
+
+| workload | per-level custom arena | book-wide slotmap | median delta |
+|---|---:|---:|---:|
+| `add_order/tight/100` | 140.5 ns | 81.1 ns | -42.3% |
+| `add_order/tight/100000` | 190.1 ns | 94.4 ns | -50.3% |
+| `add_order/wide/100` | 155.7 ns | 95.5 ns | -38.6% |
+| `add_order/wide/100000` | 582.0 ns | 416.3 ns | -28.5% |
+| `best_price/best_bid_level_clone/tight/100000` | 140.44 µs | 92.20 µs | -34.4% |
+| `best_price/best_bid_level_clone/wide/100000` | 311.3 ns | 201.7 ns | -35.2% |
+| `cancel_order/tight/100` | 178.6 ns | 86.2 ns | -51.7% |
+| `cancel_order/tight/100000` | 555.1 ns | 292.9 ns | -47.2% |
+| `cancel_order/wide/100` | 237.3 ns | 97.7 ns | -58.8% |
+| `cancel_order/wide/100000` | 743.9 ns | 344.8 ns | -53.6% |
+| `scenarios/burst_1000/tight` | 1.03 µs | 924.5 ns | -9.9% |
+| `scenarios/burst_1000/wide` | 426.2 ns | 343.8 ns | -19.3% |
+| `submit/cross_limit/levels/20` | 2.026 ms | 1.519 ms | -25.0% |
+
+Insertion and cancellation improved across shallow and deep cases in this run.
+The mixed burst benefits are smaller, consistent with the unchanged projection
+and linked traversal costs, but this is not a profile establishing causality.
+No measured row regressed against the current per-level baseline. The tight
+burst remains much slower than the historical Vec result; those historical runs
+used different sessions/toolchains and are context rather than a controlled A/B.
+
+Several large add/cancel groups exceeded their requested two-second measurement
+window and Criterion extended them. Some groups had 20–25% outliers. Treat the
+large improvements as the useful result; small differences and exact percentages
+need caution. These are throughput/latency samples, not p99/p99.9 measurements or
+heap-residency measurements. Slotmap still retains its high-water slot capacity.
+
+Reproduce the original comparison filter on the baseline revision first, then
+on this revision (saved baselines are local build artifacts):
+
+```sh
+cargo bench --locked --bench order_book -- '^(add_order|cancel_order)/(tight|wide)/(100|100000)$|^scenarios/burst_1000/|^submit/cross_limit/levels/20$|^best_price/best_bid_level_clone/(tight|wide)/100000$' --save-baseline per_level_arena
+cargo bench --locked --bench order_book -- '^(add_order|cancel_order)/(tight|wide)/(100|100000)$|^scenarios/burst_1000/|^submit/cross_limit/levels/20$|^best_price/best_bid_level_clone/(tight|wide)/100000$' --baseline per_level_arena
+```
+
+## Borrowed level views
+
+This is a new API benchmark, measured separately from owned snapshots. It times
+obtaining the view, not traversing its orders. The book and result are fenced
+with `black_box`.
+
+| distribution / orders | median per view |
+|---|---:|
+| tight/100 | 1.26 ns |
+| tight/100000 | 1.27 ns |
+| wide/100 | 1.27 ns |
+| wide/100000 | 1.86 ns |
+
+```sh
+cargo bench --locked --bench order_book -- '^best_price/best_bid_level_view/' --save-baseline global_slotmap
+```
+
+## Validation
+
+180 unit/property tests and 13 integration property/regression tests pass. The
+new mixed-operation property checks queue links, unique node membership, handle
+locations, and absence of arena/index orphans after every operation across all
+three matchers and all three backends. Cloning and independent cancellation are
+checked on the same generated states. Four focused queue/clone/rejection tests
+also pass under Miri; isolation is disabled because the existing order builder
+reads the system clock. The crate no longer contains custom unsafe storage.
+
+```sh
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --locked --lib -- order_queue::tests arena_tests --skip mixed_operations_preserve_shared_arena_ownership
+```
