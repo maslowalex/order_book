@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 order_book_core = { version = "0.1.0", path = "../order_book_core" }
+tokio = { version = "1.54.0", features = ["rt", "macros"] }
