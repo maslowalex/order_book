@@ -9,8 +9,15 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+hotpath = "0.25"
 rust_decimal = "1.42.1"
 slotmap = "1.1"
+
+[features]
+default = []
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-prometheus = ["hotpath/hotpath-prometheus"]
 
 [dev-dependencies]
 proptest = "1"
@@ -20,3 +27,10 @@ rand = "0.9"
 [[bench]]
 name = "order_book"
 harness = false
+
+# Keep ordinary release artifacts lean while giving perf/flamegraph enough
+# symbol information to attribute optimized code to Rust functions and lines.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

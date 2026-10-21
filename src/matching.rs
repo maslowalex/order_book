@@ -83,6 +83,7 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     /// every iteration permanently removes one stop and activations (market/
     /// limit orders) can never add one. The cascade's reports are collected
     /// flat into the returned report's `triggered`.
+    #[hotpath::measure]
     pub fn submit(&mut self, mut order: Order) -> Result<ExecutionReport, OrderBookError> {
         // Admission runs BEFORE the id is minted, so a rejected order consumes
         // no sequence number and leaves the book bit-identical. `next_seq` is
@@ -121,6 +122,7 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
 
     /// Run ONE order through matching — no cascade, no id minting (the id is
     /// already stamped). Both `submit` and stop activation come through here.
+    #[hotpath::measure]
     fn execute(&mut self, order: Order) -> Result<ExecutionReport, OrderBookError> {
         let order_id = order.exchange_id.clone();
 
@@ -364,6 +366,7 @@ fn activate(mut order: Order) -> Order {
 /// taker's client are EXCLUDED: self-trade prevention cancels them instead of
 /// trading, so counting them would overpromise and let a "fill or kill"
 /// partially fill. Returns early once `taker.remaining_quantity` is reachable.
+#[hotpath::measure]
 fn fillable_quantity<S: OrderBookStore>(
     store: &S,
     nodes: &OrderArena,
@@ -416,6 +419,7 @@ fn fillable_quantity<S: OrderBookStore>(
 /// Taking the store, arena, index and matcher as separate args (rather than `&mut
 /// self`) keeps the field borrows disjoint while making this walk independent
 /// of the concrete level layout.
+#[hotpath::measure]
 fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
     store: &mut S,
     nodes: &mut OrderArena,

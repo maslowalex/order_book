@@ -9,6 +9,31 @@ pluggable allocation policies behind one trait.
 > single-threaded, in-memory, and has no networking, persistence, or risk controls.
 > Do not point real money at it.
 
+## Hotpath profiling
+
+Run the deterministic workload with opt-in function profiling:
+
+```sh
+cargo run --profile profiling --features hotpath --bin profile_order_book -- --depth 1000 --operations 1000
+# Include allocation tracking:
+cargo run --profile profiling --features 'hotpath,hotpath-alloc' --bin profile_order_book -- --depth 1000 --operations 1000
+```
+
+The report prints on exit and covers the workload, order insertion/cancellation,
+submission, matching sweeps, FIFO allocation, self-trade removal, and maker
+projection. Sections with data appear automatically. Set
+`HOTPATH_OUTPUT_FORMAT=json` for machine-readable output.
+
+For a live view, run `cargo install hotpath --features tui`, then `hotpath console`
+while the workload runs (increase `--operations` for a longer session). The metrics
+server uses port 6770 by default. The `hotpath-prometheus` feature also exposes
+hotpath's optional Prometheus integration.
+
+Profiling is disabled by default. Keeping hotpath as a regular dependency is safe:
+without its profiling features, only the hotpath crates compile, with no additional
+third-party dependencies; instrumentation macros are noops with no runtime overhead.
+Use feature-off builds for ordinary Criterion measurements.
+
 ## What this document is
 
 The code has no users, so an API reference would document the least interesting thing

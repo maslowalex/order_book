@@ -81,6 +81,7 @@ pub trait MatchingAlgorithm {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FifoMatcher;
 
+#[hotpath::measure_all]
 impl MatchingAlgorithm for FifoMatcher {
     fn allocate(&self, available: Qty, makers: &[Maker], _now: u128) -> Vec<Fill> {
         let mut fills: Vec<Fill> = vec![];

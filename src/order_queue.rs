@@ -77,6 +77,7 @@ impl LevelQueue {
         Some(node.order)
     }
 
+    #[hotpath::measure]
     pub(crate) fn remove_client(
         &mut self,
         nodes: &mut OrderArena,
@@ -97,6 +98,7 @@ impl LevelQueue {
         removed
     }
 
+    #[hotpath::measure]
     pub(crate) fn collect_makers(
         &self,
         nodes: &OrderArena,

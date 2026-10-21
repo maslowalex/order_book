@@ -236,6 +236,7 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     }
 
     #[inline]
+    #[hotpath::measure]
     pub fn add_order(&mut self, mut order: Order) -> Result<(), OrderBookError> {
         let OrderType::Limit { price, .. } = order.order_type else {
             return Err(OrderBookError::NotRestable);
@@ -266,6 +267,7 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     }
 
     #[inline]
+    #[hotpath::measure]
     pub fn cancel_order(&mut self, exchange_id: ExchangeId) -> Result<(), OrderBookError> {
         let location = self
             .index

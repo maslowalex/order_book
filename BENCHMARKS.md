@@ -4,6 +4,49 @@ A history of Criterion measurements from `benches/order_book.rs`. Each dated ent
 records its own baseline, toolchain, workload, and interpretation. Historical
 columns labelled "now" refer to that entry's date, not the current implementation.
 
+## Phase 6.3 — CPU profiling probe (2026-09-10, capture pending)
+
+**Prediction, recorded before capture:** FIFO's `allocate(&[Maker])` boundary makes
+`fill_against` project every maker and key at a level even when the taker consumes
+one maker. On a deep level, `LevelQueue::collect_makers`, slotmap traversal, and the
+two temporary `Vec` allocations should therefore dominate the useful one-fill work.
+
+`src/bin/profile_order_book.rs` is a causal probe for that prediction, not another
+latency benchmark. Setup creates one 10,000-order ask level and prebuilds all input
+orders. The sampled loop repeatedly submits a one-unit market bid and appends a
+one-unit replacement ask, so the level stays exactly 10,000 orders deep. It includes
+the real execution report and replacement insertion, but excludes order construction,
+Criterion machinery, and whole-book cloning. That synthetic shape deliberately
+amplifies the suspected projection and must not be described as realistic traffic.
+
+The profiling profile retains symbols without changing normal release artifacts:
+
+```sh
+cargo install flamegraph --locked
+sudo sysctl -w kernel.perf_event_paranoid=1
+mkdir -p target/profiles
+RUSTFLAGS='-C force-frame-pointers=yes' cargo flamegraph \
+  --profile profiling --bin profile_order_book \
+  --output target/profiles/maker-projection.svg -- \
+  --depth 10000 --operations 25000
+```
+
+The runner rejects zero/malformed sizes, checks every submit is one unit at the maker
+price, and checks the final order count, level depth, and quantity remain constant.
+On this x86-64 Linux host with rustc 1.94.1, the optimized default workload completed
+in 2.56 seconds and retained named symbols for both `fill_against` and
+`LevelQueue::collect_makers`. That wall-clock smoke test only sizes the capture; it is
+not a benchmark result.
+
+The flamegraph is still pending. This host has `kernel.perf_event_paranoid=4`; an
+attempt to lower it could not pass the interactive sudo password prompt, and `perf`
+then rejected the cycles event. Once access is enabled, the result must record the
+inclusive stacks around `fill_against`, `collect_makers`, slotmap traversal, temporary
+vector allocation, fill application, and report construction. The hypothesis is
+complete whether supported or contradicted, but no optimization should land before
+that interpretation is written here. Generated SVG and perf data stay under ignored
+`target/`.
+
 ## Latest results — 2026-09-10
 
 One book-wide `slotmap::SlotMap` replaces the per-level custom arenas and ID maps.
