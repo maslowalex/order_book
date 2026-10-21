@@ -347,7 +347,7 @@ doesn't count until Miri + sanitizers are clean.
   cache locality, allocator behavior — Big-O is not wall-clock.)
 - Tie back to 6.4: you now have measurements, so optimization is allowed to begin.
 
-### 6.2c Guided Unsafe Arena Workshop — Current Lesson
+### 6.2c Guided Unsafe Arena Workshop — Unfinished
 
 **Learning goal:** be able to design, implement, audit, and explain a generational arena—not
 merely use one. Commit `f9c5afd` is a completed reference implementation and benchmark artifact.
@@ -417,14 +417,158 @@ Advanced Rust:
 
 ---
 
-## Phase 7: Advanced Topics (Choose Your Adventure)
+## Phase 7: Async Rust and Distributed Order Books — Next Workshop
 
-Pick what interests you:
-- **Persistence**: Snapshots, recovery, event sourcing
-- **Market Data**: L2/L3 feeds, incremental updates
-- **Multi-Symbol**: Multiple books, symbol routing
-- **Concurrency**: Lock-free structures, sharding
-- **Networking**: FIX protocol, binary formats
+**Agreed direction (2026-10-21, corrected after learner feedback):** learn async Rust through
+this order book, starting with futures and task-scheduling fundamentals, then progressing
+to sharding by instrument and replication. Use Tokio as the runtime, introducing its
+mechanisms when an order-book experiment motivates them.
+
+**Known prerequisites:** blocking/nonblocking sockets, readiness, TCP framing, and network
+backpressure. Those topics do not need a workshop. The TCP article supplies the teaching
+structure; the curriculum's subjects are async Rust and distributed order books.
+
+The teaching blueprint comes from Valentyn Kit's
+[Framework knowledge evaporates. Low-level knowledge compounds.](https://valentynkit.com/blog/framework-knowledge-evaporates/)
+([author's cross-post](https://dev.to/valentynkit/framework-knowledge-evaporates-low-level-knowledge-compounds-4acj)):
+make a limitation observable before introducing the mechanism that addresses it. Adapt that
+method to this order book; consult library documentation when a concrete question arises.
+
+**Workshop loop:** predict → implement → reproduce the limitation → explain its cause →
+change one mechanism → compare. Each chunk produces a runnable experiment, focused checks,
+and an explanation in the learner's own words. The learner writes the conceptual code;
+the assistant teaches and reviews one chunk at a time.
+
+**Planned home:** a separate `crates/order_book_service` workspace member depending on
+`order_book`. Add it when implementation starts. Keep the synchronous engine as the domain
+boundary; networking and coordination live above it. Early exercises use in-process callers
+and real book operations. Introduce dependencies as their lessons need them.
+
+**Endpoint:** locally running processes that own different instruments, with a fixed leader
+and in-memory followers for each shard. Persistence, restart recovery, and automatic leader
+failover require a later planning session. The incomplete Phase 6 workshops remain incomplete.
+
+### 7.1 Orders as futures: what actually runs?
+
+- **Build:** wrap a small order-submission workload in async functions and record when
+  each operation starts and finishes. Use separate books when comparing independent work.
+- **Experiment:** create a future without polling it, then compare sequential awaits,
+  joined futures, and spawned tasks. Run a matching burst alongside a progress task on a
+  single-thread runtime, first with no suspension and then with explicit yield points
+  between submissions.
+- **Learn:** a future's state, `poll`, `Pending`/`Ready`, wakeups, and task scheduling.
+  `.await` only permits suspension when the awaited future returns `Pending`. Introduce
+  `Pin`, `Send`, and task lifetimes as these exercises need them.
+- **Checkpoint:** predict when book state changes and explain why putting matching in an
+  async function does not make it yield. Identify the state that survives a suspension and
+  what causes another poll. Use the [Tokio futures explanation](https://tokio.rs/tokio/tutorial/async)
+  as a reference; constructing a custom executor is outside this workshop.
+
+### 7.2 Concurrent callers: who owns the book?
+
+- **Build:** progress from one caller to several submitting and cancelling against one
+  book. Work through the ownership problem, then move the book into a task with a clonable
+  handle for submit, cancel, and owned depth results. Use a bounded command queue and
+  individual replies; construction receives an explicitly configured book.
+- **Experiment:** race independent callers and trace the commands actually processed.
+  Keep each core operation synchronous and finish it before applying the next command.
+- **Learn:** ownership across task boundaries, message passing, response futures, and
+  the difference between caller scheduling and the book's command order.
+- **Checkpoint:** compare execution reports and state against a synchronous book given
+  the actual processed sequence. Include rejected orders, cancellations, and stop cascades;
+  do not assume an order among racing callers.
+
+### 7.3 A caller gives up: did its order execute?
+
+- **Build:** exercise cancellation and deadlines around the book handle, including a
+  caller waiting for queue capacity and one waiting for an execution report.
+- **Experiment:** hold the owner at controlled points; cancel a caller before enqueueing,
+  after enqueueing, and after execution but before the reply is received. Saturate the
+  queue while racing capacity against a deadline.
+- **Learn:** cancellation drops futures; `select!` can discard unfinished branches.
+  Cancellation safety depends on where ownership and side effects have moved. Distinguish
+  cancellation of a request future from an explicit order-cancellation command.
+- **Checkpoint:** state exactly which outcomes are known and which are uncertain at each
+  boundary. Dropping a caller after enqueueing does not undo an order. Use explicit test
+  coordination and controlled time; unknown outcomes must not be retried automatically.
+  Apply existing backpressure knowledge to task admission and cancellation semantics.
+
+### 7.4 The owner stops: account for every task and request
+
+- **Build:** give the service explicit ownership of worker tasks, error propagation, and
+  a graceful shutdown path. Separate engine rejections from unavailable workers or replies.
+- **Experiment:** stop ingress with a full queue, keep a handle clone alive during shutdown,
+  drop a reply receiver, and fail the owner task while requests are outstanding.
+- **Learn:** channel closure, task handles, cancellation signals, draining, and joining.
+  Define the service's admission boundary and distinguish graceful completion from failure.
+- **Checkpoint:** graceful shutdown stops admission, finishes admitted work, and joins
+  tasks. Failed workers make outstanding calls terminate with an appropriate failure or
+  unknown outcome; waiting callers do not hang indefinitely. Explain every task's lifetime.
+
+### 7.5 Multiple instruments: remove unrelated queueing
+
+- **Build:** start with instruments behind one dispatcher, then give each book its own
+  owner and bounded queue. Keep the instrument specification, matcher, and storage explicit.
+- **Experiment:** saturate instrument A while querying B. Observe both queue waiting and
+  scheduler progress; compare a busy queue with a long synchronous matching operation.
+- **Learn:** per-instrument ordering and routing, head-of-line waiting, and cooperative
+  scheduling. Separate queues do not by themselves provide CPU isolation.
+- **Checkpoint:** a full queue for A does not make the router wait before serving B.
+  Compare each instrument with its own synchronous reference history and explain any
+  remaining runtime-worker contention. There is no implied global order across instruments.
+
+### 7.6 Remote shards: local calls become uncertain messages
+
+- **Build:** move book owners into local processes, using a static instrument-to-node
+  mapping and a small transport built with the learner's existing networking knowledge.
+  Route orders by instrument plus exchange ID, since exchange IDs are book-local.
+- **Experiment:** disconnect a node before dispatch and after execution but before its
+  response arrives; delay one shard while continuing to use another.
+- **Learn:** propagate deadlines and unavailable/unknown outcomes across a process boundary.
+  Compare these failures with the in-process cancellation experiments. Keep network
+  representations in the service layer and construct prices/quantities through `InstrumentSpec`.
+- **Checkpoint:** requests reach the correct book; one unavailable shard does not prevent
+  another from progressing. Callers can distinguish a known rejection from an uncertain
+  execution outcome. Networking is supporting work, not a TCP-server learning track.
+
+### 7.7 Two copies disagree: establish a reproducible history
+
+- **Build:** apply a finite command sequence to two identically configured books and
+  compare reports and observable state after each prefix.
+- **Experiment:** change command order, omit a cancellation, and reconstruct timestamps
+  independently. Find the first divergence and explain its cause.
+- **Learn:** deterministic replay requires identical inputs, order, and initial state.
+  Use a command sequence distinct from the core's order-ID counter: cancellations and
+  rejected submissions also occupy positions in the mutation history.
+- **Checkpoint:** preserve original timestamps and compare unordered collections
+  canonically. Include pending stops and sequence counters in state comparisons. Explain
+  which history a follower must receive to reproduce the leader's execution.
+
+### 7.8 Replication: reproduce an ordered history
+
+- **Build:** for each shard, a fixed leader sequences mutation commands and retains their
+  history in memory. Followers apply that history in order; clients submit writes and read
+  authoritative state through the leader. Replies initially confirm leader execution,
+  without promising that followers have caught up.
+- **Experiment:** delay a follower, interrupt and restore its connection, redeliver a
+  command, and present a gap in the sequence. Use finite workloads whose histories fit in
+  memory; catch-up uses that retained history.
+- **Learn:** replicate identical command inputs, including timestamps, from the same
+  initial configuration. Use a command sequence distinct from the core's order-ID counter:
+  cancellations and rejected submissions also occupy positions in the mutation history.
+  Duplicate delivery must not execute a mutation twice; gaps must be filled before later
+  commands are applied. A retry from a client is a separate problem from redelivering a
+  sequenced replication command, so unknown client outcomes must not be retried automatically.
+- **Checkpoint:** after the same prefix, leader and followers agree on execution results
+  and canonical observable state, including pending stops and sequence counters. Compare
+  unordered collections canonically. Demonstrate catch-up after reconnect and explain why
+  follower lag and leader loss have different consequences in this fixed-leader exercise.
+
+**Boundaries to track:** future polling, command admission, execution, result delivery,
+and replica application. Identify which of those events is known to have happened and which remains
+uncertain. The first teaching session is 7.1: predict when an async submission changes the
+book and when another task can run. Define each later chunk's concrete interfaces and failure policy
+with the learner when that chunk starts; this is a curriculum, not a reference implementation.
 
 ---
 
@@ -525,7 +669,7 @@ reference commit is evidence for comparison, not evidence of learner completion.
   - [x] 6.2b Property suite over storage backends (2026-08-27) — the invariant bodies run as a
     type-level Cartesian product across three matchers × two stores, plus a differential property
     requiring identical reports and public state from BTree and tick-ladder books.
-  - [ ] 6.2c Guided Unsafe Arena Workshop — **current**. Reference solution: `f9c5afd`; learner
+  - [ ] 6.2c Guided Unsafe Arena Workshop — **unfinished**. Reference solution: `f9c5afd`; learner
     completion: 0/12 chunks. Next: chunk 1, write the slot state machine and initialized-memory
     invariant before touching code.
   - [ ] 6.3 CPU profiling — deterministic steady-state maker-projection runner implemented
@@ -534,4 +678,12 @@ reference commit is evidence for comparison, not evidence of learner completion.
     `kernel.perf_event_paranoid=4` and changing it requires an interactive sudo password. Do not
     mark complete or optimize until the flamegraph is interpreted and the learner can explain
     whether full-level projection is actually dominant.
-- [ ] Phase 7: Advanced Topics
+- [ ] Phase 7: Async Rust and Distributed Order Books — **next workshop** (plan agreed 2026-10-21)
+  - [ ] 7.1 Order-submission futures and task scheduling
+  - [ ] 7.2 Concurrent callers and book ownership
+  - [ ] 7.3 Cancellation, deadlines, and uncertain execution
+  - [ ] 7.4 Worker failure and graceful shutdown
+  - [ ] 7.5 Per-instrument queues and scheduling
+  - [ ] 7.6 Remote shards and uncertain messages
+  - [ ] 7.7 Deterministic command replay
+  - [ ] 7.8 In-memory replication with fixed leaders

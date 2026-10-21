@@ -514,7 +514,7 @@ neighbouring lessons, both recorded rather than quietly fixed:
 | `allocation` | `MatchingAlgorithm`, `Maker`/`Fill`, and the three matchers |
 
 The crate has no root re-exports; paths are module-qualified
-(`order_book::orderbook::OrderBook`).
+(`order_book_core::orderbook::OrderBook`).
 
 ```
 cargo test

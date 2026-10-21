@@ -47,12 +47,12 @@
 
 use std::collections::HashMap;
 
-use order_book::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
-use order_book::instrument::{InstrumentSpec, Qty};
-use order_book::matching::{ExecutionReport, SubmitOutcome};
-use order_book::orderbook::{OrderBook, OrderBookError, OrderLocation};
-use order_book::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
-use order_book::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
+use order_book_core::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
+use order_book_core::instrument::{InstrumentSpec, Qty};
+use order_book_core::matching::{ExecutionReport, SubmitOutcome};
+use order_book_core::orderbook::{OrderBook, OrderBookError, OrderLocation};
+use order_book_core::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
+use order_book_core::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use rust_decimal::Decimal;

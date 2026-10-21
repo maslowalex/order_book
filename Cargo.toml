@@ -1,32 +1,6 @@
-[package]
-name = "order_book"
-authors = ["Oleksandr Maslo"]
-version = "0.1.0"
-edition = "2024"
-description = "A limit order book and matching engine with pluggable allocation policies"
-license = "MIT"
-readme = "README.md"
-publish = false
-
-[dependencies]
-hotpath = "0.25"
-rust_decimal = "1.42.1"
-slotmap = "1.1"
-
-[features]
-default = []
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath/hotpath-alloc"]
-hotpath-prometheus = ["hotpath/hotpath-prometheus"]
-
-[dev-dependencies]
-proptest = "1"
-criterion = { version = "0.8", features = ["html_reports"] }
-rand = "0.9"
-
-[[bench]]
-name = "order_book"
-harness = false
+[workspace]
+members = ["crates/order_book_core", "crates/order_book_service"]
+resolver = "3"
 
 # Keep ordinary release artifacts lean while giving perf/flamegraph enough
 # symbol information to attribute optimized code to Rust functions and lines.

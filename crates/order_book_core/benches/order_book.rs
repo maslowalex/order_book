@@ -32,25 +32,25 @@
 //! Run: `cargo bench`, or filtered: `cargo bench -- 'add_order/tight/1000$'`.
 //! HTML report: `target/criterion/report/index.html`.
 
-use order_book::types::Side;
+use order_book_core::types::Side;
 use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{
     BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
-use order_book::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
-use order_book::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
+use order_book_core::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
+use order_book_core::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
 
 /// Deterministic workload generation. Self-contained because
 /// `src/test_helpers.rs` is `#[cfg(test)]`-private and invisible to bench
 /// targets (benches link the lib as an external crate).
 mod generators {
-    use order_book::allocation::{FifoMatcher, MatchingAlgorithm};
-    use order_book::instrument::{InstrumentSpec, Qty};
-    use order_book::orderbook::OrderBook;
-    use order_book::storage::OrderBookStore;
-    use order_book::types::{ExchangeId, Order, OrderType, Price, Side};
+    use order_book_core::allocation::{FifoMatcher, MatchingAlgorithm};
+    use order_book_core::instrument::{InstrumentSpec, Qty};
+    use order_book_core::orderbook::OrderBook;
+    use order_book_core::storage::OrderBookStore;
+    use order_book_core::types::{ExchangeId, Order, OrderType, Price, Side};
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
@@ -840,7 +840,7 @@ fn bench_matcher(c: &mut Criterion) {
         name: &str,
         matcher: M,
         levels_each: usize,
-        takers: &[order_book::types::Order],
+        takers: &[order_book_core::types::Order],
     ) {
         let ladder = generators::matching_book(matcher, 1_000, 10, 10);
         group.throughput(Throughput::Elements(TAKERS as u64));
