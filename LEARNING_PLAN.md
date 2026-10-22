@@ -417,7 +417,7 @@ Advanced Rust:
 
 ---
 
-## Phase 7: Async Rust and Distributed Order Books — Next Workshop
+## Phase 7: Async Rust and Distributed Order Books — In Progress
 
 **Agreed direction (2026-10-21, corrected after learner feedback):** learn async Rust through
 this order book, starting with futures and task-scheduling fundamentals, then progressing
@@ -439,9 +439,10 @@ change one mechanism → compare. Each chunk produces a runnable experiment, foc
 and an explanation in the learner's own words. The learner writes the conceptual code;
 the assistant teaches and reviews one chunk at a time.
 
-**Planned home:** a separate `crates/order_book_service` workspace member depending on
-`order_book`. Add it when implementation starts. Keep the synchronous engine as the domain
-boundary; networking and coordination live above it. Early exercises use in-process callers
+**Implementation home:** the `crates/order_book_service` workspace member depends on
+`crates/order_book_core` (package `order_book_core`). The root is a virtual Cargo workspace.
+Keep the synchronous engine as the domain boundary; networking and coordination live above it.
+Early exercises use in-process callers
 and real book operations. Introduce dependencies as their lessons need them.
 
 **Endpoint:** locally running processes that own different instruments, with a fixed leader
@@ -463,6 +464,31 @@ failover require a later planning session. The incomplete Phase 6 workshops rema
   async function does not make it yield. Identify the state that survives a suspension and
   what causes another poll. Use the [Tokio futures explanation](https://tokio.rs/tokio/tutorial/async)
   as a reference; constructing a custom executor is outside this workshop.
+
+**Session record — 2026-10-22:**
+
+- Set up the service with Tokio's `current_thread` runtime and a local limit-order helper.
+  The learner wrote the async experiments; the assistant supplied order-construction plumbing
+  and reviewed compiler errors.
+- Observed a synchronous submission burst delaying a spawned progress task, then introduced
+  `yield_now().await` between submissions to allow interleaving. Discussed why `.await` alone
+  does not imply suspension, and why a single thread does not imply execution in handle-await
+  order. Evidence: `1aff762`, `4891d3d`.
+- Discussed sequential awaits and exercised `tokio::join!` and spawned tasks over independent books.
+  Distinguished multiple futures within one task from independently scheduled tasks.
+  Diagnosed an async wrapper returning an unpolled burst future instead of awaiting it.
+  Evidence: `9f71b0f` and the reviewed session experiments.
+- Encountered `spawn`'s `'static` requirement when borrowing books from `main`. Moved each book
+  into an `async move` task, borrowed it for the burst inside that task, and returned the owned
+  book through the `JoinHandle`. Clarified that moving ownership is not temporary and that
+  returning a reference cannot keep a task-owned book alive. Evidence: `0fb4f72`.
+- Practical scheduling and ownership experiments are complete. The learner's own explanation
+  of state retained across suspension and what causes another poll remains a checkpoint;
+  `Pin` and `Send` have not been explored and should be introduced when an experiment needs them.
+- **Next session:** briefly close that checkpoint, then start 7.2 with one long-lived book owner
+  receiving commands. Bounded `mpsc` commands and per-request `oneshot` replies were discussed
+  as the communication mechanism; no channel-based service has been implemented. Define the
+  first command and reply interface with the learner before they implement it.
 
 ### 7.2 Concurrent callers: who owns the book?
 
@@ -566,8 +592,8 @@ failover require a later planning session. The incomplete Phase 6 workshops rema
 
 **Boundaries to track:** future polling, command admission, execution, result delivery,
 and replica application. Identify which of those events is known to have happened and which remains
-uncertain. The first teaching session is 7.1: predict when an async submission changes the
-book and when another task can run. Define each later chunk's concrete interfaces and failure policy
+uncertain. Resume from the 2026-10-22 session record in 7.1, then proceed to 7.2.
+Define each later chunk's concrete interfaces and failure policy
 with the learner when that chunk starts; this is a curriculum, not a reference implementation.
 
 ---
@@ -678,8 +704,9 @@ reference commit is evidence for comparison, not evidence of learner completion.
     `kernel.perf_event_paranoid=4` and changing it requires an interactive sudo password. Do not
     mark complete or optimize until the flamegraph is interpreted and the learner can explain
     whether full-level projection is actually dominant.
-- [ ] Phase 7: Async Rust and Distributed Order Books — **next workshop** (plan agreed 2026-10-21)
-  - [ ] 7.1 Order-submission futures and task scheduling
+- [ ] Phase 7: Async Rust and Distributed Order Books — **in progress** (started 2026-10-22)
+  - [ ] 7.1 Order-submission futures and task scheduling — practical experiments complete;
+    suspension-state/wakeup explanation remains. See the 2026-10-22 session record.
   - [ ] 7.2 Concurrent callers and book ownership
   - [ ] 7.3 Cancellation, deadlines, and uncertain execution
   - [ ] 7.4 Worker failure and graceful shutdown
