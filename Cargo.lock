@@ -590,6 +590,7 @@ dependencies = [
 name = "order_book_service"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "order_book_core",
  "tokio",
 ]
