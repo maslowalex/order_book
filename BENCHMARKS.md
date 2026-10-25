@@ -4,6 +4,133 @@ A history of Criterion measurements from `benches/order_book.rs`. Each dated ent
 records its own baseline, toolchain, workload, and interpretation. Historical
 columns labelled "now" refer to that entry's date, not the current implementation.
 
+## BBTreeStore experiment — 2026-10-25
+
+`BBTreeStore` implements the existing `OrderBookStore` seam with
+`bbtree::unsync::BBTreeMap` **0.1.1**, pinned in the manifest and lockfile. Asks
+use `price.minor()` as the `u64` key; bids use `!price.minor()`. Complementing bids
+preserves best-first iteration while enabling bbtree's automatic integer inline
+keys on both sides. The stored value still carries the original `Price`.
+`BTreeStore` remains the default. Active-level storage is the only substitution;
+stop maps, matching, and order ownership retain their existing implementations.
+Each backend now lives in its own file under `src/storage/`; existing imports
+through `order_book_core::storage` remain valid.
+
+### Method
+
+Same-machine run on Linux `x86_64`, AMD Ryzen 9 7900X (12 cores / 24 threads),
+rustc **1.94.1** (`e408947bf`, 2026-03-25), Criterion **0.8.2**, default Cargo
+bench/release optimization, no additional features or `RUSTFLAGS`. In particular,
+this run does not enable `target-cpu=native` or AVX-512-specific code generation.
+The dependency version and compiler flags define this experiment; these results
+do not establish performance for other bbtree versions or compiler settings.
+
+Both backends use the existing generic storage benchmark body with FIFO, seed
+`0xB00C`, identical orders and bounded instruments. Tight has 41 legal ticks per
+side; wide has 19,901. Every case retains 10 samples, a 500 ms warmup, and a 2 s
+measurement target. Setup, cloning, and result destruction are outside the timed
+routine; read-only cases fence the book and result with `black_box`. No tests or
+other builds ran concurrently with measurement.
+
+The first pass runs BTree then BBTree. Values below are medians and bootstrap
+95% confidence intervals from the saved `estimates.json`, divided by the declared
+operation count: add/cancel by `max(10, N/10)`, bursts by 1,000, best-bid by one.
+Crossing retains the complete batch of 50 takers, each crossing 20 levels.
+Positive deltas mean BBTree took longer; delta columns compare point estimates,
+not a separate statistical significance test.
+
+### Complete first pass
+
+| Workload | BTree median [95% CI] | BBTree median [95% CI] | BBTree time delta |
+|---|---:|---:|---:|
+| `add/tight/100` (ns/op) | 94.93 [90.51, 98.96] | 141.08 [136.11, 142.36] | +48.6% |
+| `add/tight/10000` (ns/op) | 66.53 [66.37, 66.99] | 121.67 [121.10, 123.01] | +82.9% |
+| `add/tight/100000` (ns/op) | 112.60 [109.11, 113.98] | 126.50 [123.86, 137.27] | +12.3% |
+| `add/wide/100` (ns/op) | 118.38 [110.50, 121.58] | 219.82 [210.42, 229.24] | +85.7% |
+| `add/wide/10000` (ns/op) | 107.65 [106.34, 109.44] | 186.96 [183.86, 193.34] | +73.7% |
+| `add/wide/100000` (ns/op) | 326.12 [313.89, 358.57] | 349.90 [340.28, 359.09] | +7.3% |
+| `best_bid/tight/100` (ns/op) | 4.17 [4.12, 4.18] | 3.99 [3.97, 4.00] | -4.3% |
+| `best_bid/tight/100000` (ns/op) | 4.20 [4.18, 4.21] | 5.08 [4.98, 5.35] | +21.2% |
+| `best_bid/wide/100` (ns/op) | 4.17 [4.16, 4.20] | 4.73 [4.70, 4.76] | +13.3% |
+| `best_bid/wide/100000` (ns/op) | 4.26 [4.21, 4.28] | 4.49 [4.47, 4.50] | +5.4% |
+| `burst_1000/tight` (ns/op) | 1069.56 [1065.93, 1076.38] | 1690.98 [1647.58, 1762.25] | +58.1% |
+| `burst_1000/wide` (ns/op) | 352.68 [351.66, 354.15] | 439.01 [431.91, 443.30] | +24.5% |
+| `cancel/tight/100` (ns/op) | 68.01 [64.23, 76.22] | 72.11 [69.61, 78.06] | +6.0% |
+| `cancel/tight/10000` (ns/op) | 89.17 [87.79, 89.73] | 94.60 [94.11, 95.13] | +6.1% |
+| `cancel/tight/100000` (ns/op) | 321.56 [304.72, 339.14] | 752.47 [507.24, 876.63] | +134.0% |
+| `cancel/wide/100` (ns/op) | 101.00 [94.78, 106.10] | 193.54 [186.03, 202.33] | +91.6% |
+| `cancel/wide/10000` (ns/op) | 139.09 [137.60, 143.72] | 171.31 [169.81, 173.46] | +23.2% |
+| `cancel/wide/100000` (ns/op) | 395.52 [380.86, 432.03] | 692.97 [677.65, 732.42] | +75.2% |
+| `cross_limit/20_levels` (ms/batch) | 1.850 [1.844, 1.857] | 1.995 [1.972, 2.111] | +7.8% |
+
+### Repeat pass, reversed backend order
+
+The smaller read/cancel differences, noisy large-book rows, and crossing case
+were repeated with BBTree first and BTree second, keeping inputs and sampling
+settings unchanged. Both saved passes are retained rather than selecting the
+better measurement for either backend.
+
+| Workload | BTree median [95% CI] | BBTree median [95% CI] | BBTree time delta |
+|---|---:|---:|---:|
+| `add/wide/100000` (ns/op) | 397.31 [371.92, 403.44] | 363.19 [358.65, 373.95] | -8.6% |
+| `best_bid/tight/100` (ns/op) | 4.27 [4.25, 4.27] | 4.19 [4.17, 4.22] | -1.7% |
+| `best_bid/tight/100000` (ns/op) | 4.27 [4.25, 4.29] | 4.30 [4.28, 4.32] | +0.7% |
+| `best_bid/wide/100` (ns/op) | 4.32 [4.30, 4.37] | 4.28 [4.20, 4.32] | -0.9% |
+| `best_bid/wide/100000` (ns/op) | 4.27 [4.26, 4.29] | 4.23 [4.23, 4.23] | -0.8% |
+| `cancel/tight/100` (ns/op) | 65.42 [61.17, 72.53] | 71.46 [68.18, 75.99] | +9.2% |
+| `cancel/tight/10000` (ns/op) | 87.24 [86.92, 88.29] | 98.29 [97.28, 100.86] | +12.7% |
+| `cancel/tight/100000` (ns/op) | 513.57 [461.49, 536.55] | 530.12 [518.65, 556.18] | +3.2% |
+| `cross_limit/20_levels` (ms/batch) | 1.883 [1.867, 1.929] | 1.933 [1.915, 1.953] | +2.7% |
+
+### Interpretation and limits
+
+- In the complete pass, BBTree increases insertion time by 49–86% at 100/10k
+  orders. Tight and wide mixed bursts take 58% and 24% longer respectively;
+  wide cancellation also takes longer at every measured size.
+- Best-price reads are approximately tied in the repeat (within 2%). The first
+  pass's larger read differences did not persist, so they do not establish a
+  read-performance advantage for either backend.
+- Wide/100k insertion changes from +7% to -9%; tight/100k cancellation changes
+  from +134% to +3%. These rows are unstable across passes, so there is no
+  reliable winner for them. Tight cancellation at 100/10k remains slower with
+  BBTree in the repeat, but its exact penalty varies.
+- The crossing batch changes from +8% to +3%; that small, variable gap does not
+  justify a strong matching-performance claim.
+
+This experiment provides no performance reason to change the default store.
+It measures the complete order-book operation using the existing cloned-book
+harness, not isolated map operations. Different tree layouts can interact with
+setup/clone cache state even though cloning is untimed. Criterion reported
+10–20% outliers in several cases, and ten samples do not quantify environmental
+drift between passes. No memory-residency, concurrency, or p99 measurements were
+performed, and these figures should not be compared directly with older sessions
+in this file.
+
+### Reproduction and validation
+
+```sh
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo bench --locked --bench order_book -- '^storage/(btree|bbtree)/' --save-baseline bbtree_comparison
+for backend in bbtree btree; do
+  cargo bench --locked --bench order_book -- "^storage/${backend}/(best_bid/|cancel/tight/|add/wide/100000$|cross_limit/)" --save-baseline bbtree_repeat
+done
+```
+
+All **200 tests** pass: 183 library tests, four profiling-runner tests, and 13
+integration property/regression tests. Clippy passes with warnings denied.
+BBTree participates in every matcher/storage invariant, the report/state
+comparison against BTree, non-unit-lot checks, and mixed-operation ownership and
+clone checks. Focused coverage includes repeated insertion retaining queue state,
+mutable lookups, empty stores, independent clones, 10,000-level splitting,
+removal/reinsertion/draining, and `u64` boundary ordering on both sides.
+
+Saved baselines and logs remain local ignored build artifacts under `target/`:
+`bbtree_comparison`, `bbtree_repeat`, `bbtree-comparison.log`,
+`bbtree-repeat.log`, and `bbtree-tests.log`.
+
+---
+
 ## Phase 6.3 — CPU profiling probe (2026-09-10, capture pending)
 
 **Prediction, recorded before capture:** FIFO's `allocate(&[Maker])` boundary makes

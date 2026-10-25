@@ -47,11 +47,15 @@
 
 use std::collections::HashMap;
 
-use order_book_core::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
+use order_book_core::allocation::{
+    FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher,
+};
 use order_book_core::instrument::{InstrumentSpec, Qty};
 use order_book_core::matching::{ExecutionReport, SubmitOutcome};
 use order_book_core::orderbook::{OrderBook, OrderBookError, OrderLocation};
-use order_book_core::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
+use order_book_core::storage::{
+    BBTreeStore, BTreeStore, HashMapStore, OrderBookStore, TickLadderStore,
+};
 use order_book_core::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -69,8 +73,11 @@ use rust_decimal::Decimal;
 macro_rules! for_each_configuration {
     ($check:ident, $($arg:expr),* $(,)?) => {{
         $check::<_, BTreeStore>(FifoMatcher, $($arg),*)?;
+        $check::<_, BBTreeStore>(FifoMatcher, $($arg),*)?;
         $check::<_, BTreeStore>(ProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, BBTreeStore>(ProRataMatcher::new(lot()), $($arg),*)?;
         $check::<_, BTreeStore>(TimeProRataMatcher::new(lot()), $($arg),*)?;
+        $check::<_, BBTreeStore>(TimeProRataMatcher::new(lot()), $($arg),*)?;
         $check::<_, TickLadderStore>(FifoMatcher, $($arg),*)?;
         $check::<_, TickLadderStore>(ProRataMatcher::new(lot()), $($arg),*)?;
         $check::<_, TickLadderStore>(TimeProRataMatcher::new(lot()), $($arg),*)?;
@@ -364,33 +371,46 @@ fn check_storage_agreement<M: MatchingAlgorithm + Clone>(
 ) -> Result<(), TestCaseError> {
     let mut tree = OrderBook::<M, BTreeStore>::try_new(spec(), matcher.clone()).unwrap();
     let mut ladder = OrderBook::<M, TickLadderStore>::try_new(spec(), matcher.clone()).unwrap();
+    let mut bbtree = OrderBook::<M, BBTreeStore>::try_new(spec(), matcher.clone()).unwrap();
     let mut hash_map = OrderBook::<M, HashMapStore>::try_new(spec(), matcher).unwrap();
 
     for order in stream.iter().cloned() {
         let tree_report = tree.submit(order.clone()).unwrap();
         let ladder_report = ladder.submit(order.clone()).unwrap();
+        let bbtree_report = bbtree.submit(order.clone()).unwrap();
         let hash_map_report = hash_map.submit(order).unwrap();
         prop_assert_eq!(&ladder_report, &tree_report, "execution reports diverged");
+        prop_assert_eq!(&bbtree_report, &tree_report, "execution reports diverged");
         prop_assert_eq!(&hash_map_report, &tree_report, "execution reports diverged");
         prop_assert_eq!(resting_snapshot(&ladder), resting_snapshot(&tree));
+        prop_assert_eq!(resting_snapshot(&bbtree), resting_snapshot(&tree));
         prop_assert_eq!(resting_snapshot(&hash_map), resting_snapshot(&tree));
         prop_assert_eq!(level_depths(&ladder), level_depths(&tree));
+        prop_assert_eq!(level_depths(&bbtree), level_depths(&tree));
         prop_assert_eq!(level_depths(&hash_map), level_depths(&tree));
         prop_assert_eq!(ladder.best_bid(), tree.best_bid());
+        prop_assert_eq!(bbtree.best_bid(), tree.best_bid());
         prop_assert_eq!(hash_map.best_bid(), tree.best_bid());
         prop_assert_eq!(ladder.best_ask(), tree.best_ask());
+        prop_assert_eq!(bbtree.best_ask(), tree.best_ask());
         prop_assert_eq!(hash_map.best_ask(), tree.best_ask());
         prop_assert_eq!(ladder.last_trade_price, tree.last_trade_price);
+        prop_assert_eq!(bbtree.last_trade_price, tree.last_trade_price);
         prop_assert_eq!(hash_map.last_trade_price, tree.last_trade_price);
         prop_assert_eq!(locations(&ladder), locations(&tree));
+        prop_assert_eq!(locations(&bbtree), locations(&tree));
         prop_assert_eq!(locations(&hash_map), locations(&tree));
         prop_assert_eq!(&ladder.stop_bids, &tree.stop_bids);
+        prop_assert_eq!(&bbtree.stop_bids, &tree.stop_bids);
         prop_assert_eq!(&hash_map.stop_bids, &tree.stop_bids);
         prop_assert_eq!(&ladder.stop_asks, &tree.stop_asks);
+        prop_assert_eq!(&bbtree.stop_asks, &tree.stop_asks);
         prop_assert_eq!(&hash_map.stop_asks, &tree.stop_asks);
         prop_assert_eq!(ladder.next_seq, tree.next_seq);
+        prop_assert_eq!(bbtree.next_seq, tree.next_seq);
         prop_assert_eq!(hash_map.next_seq, tree.next_seq);
         prop_assert_eq!(ladder.next_arrival, tree.next_arrival);
+        prop_assert_eq!(bbtree.next_arrival, tree.next_arrival);
         prop_assert_eq!(hash_map.next_arrival, tree.next_arrival);
     }
     Ok(())
@@ -1202,8 +1222,11 @@ fn the_lattice_holds_on_a_non_unit_lot(
 ) {
     let lot = lot_ten_spec().lot_size();
     check_lattice_closure::<_, BTreeStore>(FifoMatcher, lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, BBTreeStore>(FifoMatcher, lot_ten_spec(), &stream)?;
     check_lattice_closure::<_, BTreeStore>(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, BBTreeStore>(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
     check_lattice_closure::<_, BTreeStore>(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
+    check_lattice_closure::<_, BBTreeStore>(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
     check_lattice_closure::<_, TickLadderStore>(FifoMatcher, lot_ten_spec(), &stream)?;
     check_lattice_closure::<_, TickLadderStore>(ProRataMatcher::new(lot), lot_ten_spec(), &stream)?;
     check_lattice_closure::<_, TickLadderStore>(TimeProRataMatcher::new(lot), lot_ten_spec(), &stream)?;

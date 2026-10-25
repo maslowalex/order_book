@@ -39,8 +39,12 @@ use std::time::Duration;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
-use order_book_core::allocation::{FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher};
-use order_book_core::storage::{BTreeStore, HashMapStore, OrderBookStore, TickLadderStore};
+use order_book_core::allocation::{
+    FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher,
+};
+use order_book_core::storage::{
+    BBTreeStore, BTreeStore, HashMapStore, OrderBookStore, TickLadderStore,
+};
 
 /// Deterministic workload generation. Self-contained because
 /// `src/test_helpers.rs` is `#[cfg(test)]`-private and invisible to bench
@@ -697,7 +701,7 @@ fn bench_scenarios(c: &mut Criterion) {
 
 /// Storage-layout bake-off with allocation policy, workload, and instrument
 /// held fixed. Unlike the legacy groups above, every spec here has a finite
-/// price band so the BTree and dense ladder receive identical inputs.
+/// price band so every backend receives identical inputs.
 fn bench_storage(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage");
     group
@@ -800,6 +804,7 @@ fn bench_storage(c: &mut Criterion) {
     }
 
     run::<BTreeStore>(&mut group, "btree");
+    run::<BBTreeStore>(&mut group, "bbtree");
     run::<HashMapStore>(&mut group, "hash_map");
     run::<TickLadderStore>(&mut group, "tick_ladder");
     group.finish();

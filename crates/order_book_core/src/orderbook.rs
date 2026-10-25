@@ -1118,7 +1118,7 @@ mod test {
 mod arena_tests {
     use super::*;
     use crate::allocation::{FifoMatcher, ProRataMatcher, TimeProRataMatcher};
-    use crate::storage::{HashMapStore, TickLadderStore};
+    use crate::storage::{BBTreeStore, HashMapStore, TickLadderStore};
     use crate::test_helpers::{order, px, qty};
     use crate::types::TimeInForce;
     use proptest::prelude::*;
@@ -1255,6 +1255,7 @@ mod arena_tests {
             macro_rules! stores {
                 ($matcher:expr) => {{
                     exercise::<_, BTreeStore>($matcher, &ops);
+                    exercise::<_, BBTreeStore>($matcher, &ops);
                     exercise::<_, TickLadderStore>($matcher, &ops);
                     exercise::<_, HashMapStore>($matcher, &ops);
                 }};

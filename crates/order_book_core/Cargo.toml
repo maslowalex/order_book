@@ -9,6 +9,7 @@ readme = "../../README.md"
 publish = false
 
 [dependencies]
+bbtree = "=0.1.1"
 hotpath = "0.25"
 rust_decimal = "1.42.1"
 slotmap = "1.1"
