@@ -1,38 +1,58 @@
 mod helpers;
 
 use order_book_core::{
-    allocation::FifoMatcher, instrument::InstrumentSpec, orderbook::OrderBook, types::Side,
+    allocation::FifoMatcher, instrument::InstrumentSpec, orderbook::OrderBook, types::Order,
+    types::Side,
 };
 
-use tokio::task::yield_now;
-// use anyhow::Result;
+use tokio::sync::mpsc;
+
+struct LimitOrderMessage {
+    side: Side,
+    price: u64,
+    quantity: u64,
+}
+
+impl LimitOrderMessage {
+    fn new(side: Side, price: u64, quantity: u64) -> Self {
+        LimitOrderMessage {
+            side,
+            price,
+            quantity,
+        }
+    }
+
+    fn to_order(&self, spec: &InstrumentSpec) -> Order {
+        helpers::limit_order(&spec, self.side, self.price, self.quantity, "client_id")
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let instrument_spec = InstrumentSpec::cents();
-    let mut order_book_a = OrderBook::new(instrument_spec, FifoMatcher);
-    let mut order_book_b = OrderBook::new(instrument_spec, FifoMatcher);
+    let (tx, mut rx) = mpsc::channel::<LimitOrderMessage>(1);
 
-    let a = tokio::spawn(async move {
-        submit_burst(&mut order_book_a, "A").await;
-        order_book_a
+    let task = tokio::spawn(async move {
+        let mut orderbook = OrderBook::new(instrument_spec, FifoMatcher);
+
+        while let Some(limit_order_message) = rx.recv().await {
+            orderbook
+                .submit(limit_order_message.to_order(&instrument_spec))
+                .expect("channel order is valid");
+        }
+
+        orderbook
     });
 
-    let b = tokio::spawn(async move {
-        submit_burst(&mut order_book_b, "B").await;
-        order_book_b
-    });
-
-    dbg!(a.await.unwrap().best_bid());
-    dbg!(b.await.unwrap().best_bid());
-}
-
-async fn submit_burst<'a>(order_book: &'a mut OrderBook<FifoMatcher>, label: &'a str) -> () {
-    println!("burst {} started!", label);
     for _ in 1..10_000 {
-        let order = helpers::limit_order(&order_book.spec(), Side::Bid, 10_000, 5, "buyer");
-        order_book.submit(order).expect("workshop order is valid");
-        yield_now().await
+        let limit_order_message = LimitOrderMessage::new(Side::Ask, 10_000, 5);
+
+        let _ = tx.send(limit_order_message).await;
     }
-    println!("burst {} finished!", label);
+
+    drop(tx);
+
+    let orderbook = task.await.expect("orderbook doesn't materialized");
+
+    dbg!(orderbook.best_ask());
 }
