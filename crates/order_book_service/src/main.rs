@@ -1,6 +1,8 @@
 use order_book_core::allocation::fifo::FifoMatcher;
 use order_book_core::execution_report::ExecutionReport;
 use order_book_core::instrument::InstrumentSpec;
+use order_book_core::instrument::price::Price;
+use order_book_core::instrument::qty::Qty;
 use order_book_core::order::ExchangeId;
 use order_book_core::order::{OrderValidationError, Side};
 use order_book_core::order_input::OrderInput;
@@ -9,6 +11,9 @@ use order_book_core::order_type::TimeInForce;
 use order_book_core::orderbook::OrderBook;
 use order_book_core::orderbook::OrderBookError;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, sleep};
+
+use std::collections::HashMap;
 
 use tracing::{error, info, warn};
 
@@ -59,6 +64,22 @@ impl BookHandle {
             .map_err(|_| SubmitError::ReplyDropped)?
             .map_err(SubmitError::Execution)
     }
+
+    pub async fn depth(&self) -> Result<HashMap<Side, Vec<(Price, Qty)>>, SubmitError> {
+        let (oneshot_sender, oneshot_receiver) = oneshot::channel();
+        let command = Command::Depth {
+            sender: oneshot_sender,
+        };
+
+        self.sender
+            .send(command)
+            .await
+            .map_err(|_| SubmitError::CommandChannelClosed)?;
+
+        oneshot_receiver
+            .await
+            .map_err(|_| SubmitError::ReplyDropped)
+    }
 }
 
 impl std::fmt::Display for SubmitError {
@@ -80,6 +101,9 @@ enum Command {
     Cancel {
         order_id: ExchangeId,
         sender: oneshot::Sender<Result<(), OrderBookError>>,
+    },
+    Depth {
+        sender: oneshot::Sender<HashMap<Side, Vec<(Price, Qty)>>>,
     },
 }
 
@@ -183,6 +207,11 @@ async fn main() {
 
                     let _ = sender.send(result);
                 }
+                Command::Depth { sender } => {
+                    let result = orderbook.full_depth();
+
+                    let _ = sender.send(result);
+                }
             }
         }
 
@@ -193,6 +222,26 @@ async fn main() {
 
     let sender_a = tokio::spawn(dispatch_orders(handle.clone(), "A", 5));
     let sender_b = tokio::spawn(dispatch_orders(handle.clone(), "B", 5));
+
+    let checker_handle = handle.clone();
+    let n = 8;
+
+    tokio::spawn(async move {
+        for attempt in 0..n {
+            tokio::select! {
+                result = checker_handle.depth() => {
+                    match result {
+                        Ok(depth) => info!(attempt, ?depth, "book depth"),
+                        Err(error) => warn!(attempt, %error, "depth query failed"),
+                    }
+                }
+                _ = sleep(Duration::from_millis(10)) => {
+                    warn!(attempt, "depth query timed out");
+                }
+            }
+        }
+    });
+
     drop(handle);
 
     sender_a.await.expect("SENDER A FAILED");

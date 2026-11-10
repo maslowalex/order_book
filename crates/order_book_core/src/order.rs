@@ -16,7 +16,7 @@ impl ExchangeId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientId(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Ask,
     Bid,

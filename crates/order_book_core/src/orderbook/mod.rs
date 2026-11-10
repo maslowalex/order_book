@@ -344,6 +344,19 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
             .collect()
     }
 
+    pub fn full_depth(&self) -> HashMap<Side, Vec<(Price, Qty)>> {
+        let bids = self
+            .levels(Side::Bid)
+            .map(|level| (level.price, level.total_quantity()))
+            .collect();
+        let asks = self
+            .levels(Side::Ask)
+            .map(|level| (level.price, level.total_quantity()))
+            .collect();
+
+        HashMap::from([(Side::Bid, bids), (Side::Ask, asks)])
+    }
+
     /// Active levels on one side, best price first, independent of backend.
     #[inline]
     pub fn levels(&self, side: Side) -> impl Iterator<Item = PriceLevelView<'_>> {
