@@ -1,5 +1,3 @@
-mod helpers;
-
 use order_book_core::allocation::fifo::FifoMatcher;
 use order_book_core::execution_report::ExecutionReport;
 use order_book_core::instrument::InstrumentSpec;
@@ -35,15 +33,49 @@ enum Command {
     },
 }
 
-fn generate_input(i: u64) -> OrderInput {
+fn generate_input(i: u64, client_id: Option<&str>) -> OrderInput {
+    let client_id = client_id.unwrap_or("UNKNOWN");
+
     OrderInput {
         side: Side::Bid,
         quantity: 50,
         kind: OrderKind::Limit,
-        client_id: "test".to_owned(),
+        client_id: client_id.to_owned(),
         tif: Some(TimeInForce::GTC),
         trigger: None,
         price: Some(1000 + i),
+    }
+}
+
+async fn dispatch_orders(tx: mpsc::Sender<Command>, worker_tag: &str, number_of_orders: u64) -> () {
+    for i in 1..=number_of_orders {
+        let input = generate_input(i, Some(worker_tag));
+        let (oneshot_sender, oneshot_receiver) = oneshot::channel();
+
+        tx.send(Command::Submit {
+            input,
+            sender: oneshot_sender,
+        })
+        .await
+        .expect("book owner stopped receiving commands");
+
+        let response = oneshot_receiver
+            .await
+            .expect("book owner dropped the reply");
+
+        match response {
+            Ok(report) => info!(
+                request = i,
+                worker = worker_tag,
+                order_id = %report.order_id.0,
+                outcome = ?report.outcome,
+                trades = report.trades.len(),
+                cancelled = report.cancelled.len(),
+                triggered = report.triggered.len(),
+                "order processed"
+            ),
+            Err(error) => error!(request = i, error = %error, "order submission failed"),
+        }
     }
 }
 
@@ -73,36 +105,16 @@ async fn main() {
         orderbook
     });
 
-    for i in 1..10_000 {
-        let input = generate_input(i);
-        let (oneshot_sender, oneshot_receiver) = oneshot::channel();
+    let sender_a_tx = tx.clone();
+    let sender_b_tx = tx.clone();
 
-        tx.send(Command::Submit {
-            input,
-            sender: oneshot_sender,
-        })
-        .await
-        .expect("book owner stopped receiving commands");
-
-        let response = oneshot_receiver
-            .await
-            .expect("book owner dropped the reply");
-
-        match response {
-            Ok(report) => info!(
-                request = i,
-                order_id = %report.order_id.0,
-                outcome = ?report.outcome,
-                trades = report.trades.len(),
-                cancelled = report.cancelled.len(),
-                triggered = report.triggered.len(),
-                "order processed"
-            ),
-            Err(error) => error!(request = i, error = %error, "order submission failed"),
-        }
-    }
+    let sender_a = tokio::spawn(dispatch_orders(sender_a_tx, "A", 5));
+    let sender_b = tokio::spawn(dispatch_orders(sender_b_tx, "B", 5));
 
     drop(tx);
+
+    sender_a.await.expect("SENDER A FAILED");
+    sender_b.await.expect("SENDER B FAILED");
 
     let orderbook = task.await.expect("orderbook doesn't materialized");
 
