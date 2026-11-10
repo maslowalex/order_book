@@ -15,6 +15,31 @@ use tracing::{error, info};
 enum SubmitError {
     Execution(OrderBookError),
     Validation(OrderValidationError),
+    CommandChannelClosed,
+    ReplyDropped,
+}
+
+#[derive(Clone)]
+struct BookHandle {
+    sender: mpsc::Sender<Command>,
+}
+
+impl BookHandle {
+    pub async fn submit(&self, input: OrderInput) -> Result<ExecutionReport, SubmitError> {
+        let (oneshot_sender, oneshot_receiver) = oneshot::channel();
+
+        self.sender
+            .send(Command::Submit {
+                input,
+                sender: oneshot_sender,
+            })
+            .await
+            .map_err(|_| SubmitError::CommandChannelClosed)?;
+
+        oneshot_receiver
+            .await
+            .map_err(|_| SubmitError::ReplyDropped)?
+    }
 }
 
 impl std::fmt::Display for SubmitError {
@@ -22,6 +47,8 @@ impl std::fmt::Display for SubmitError {
         match self {
             Self::Execution(error) => write!(f, "submission failed: {error}"),
             Self::Validation(error) => write!(f, "validation failed: {error}"),
+            Self::CommandChannelClosed => write!(f, "command channel closed"),
+            Self::ReplyDropped => write!(f, "reply is dropped"),
         }
     }
 }
@@ -47,21 +74,10 @@ fn generate_input(i: u64, client_id: Option<&str>) -> OrderInput {
     }
 }
 
-async fn dispatch_orders(tx: mpsc::Sender<Command>, worker_tag: &str, number_of_orders: u64) -> () {
+async fn dispatch_orders(handle: BookHandle, worker_tag: &str, number_of_orders: u64) -> () {
     for i in 1..=number_of_orders {
         let input = generate_input(i, Some(worker_tag));
-        let (oneshot_sender, oneshot_receiver) = oneshot::channel();
-
-        tx.send(Command::Submit {
-            input,
-            sender: oneshot_sender,
-        })
-        .await
-        .expect("book owner stopped receiving commands");
-
-        let response = oneshot_receiver
-            .await
-            .expect("book owner dropped the reply");
+        let response = handle.submit(input).await;
 
         match response {
             Ok(report) => info!(
@@ -105,13 +121,11 @@ async fn main() {
         orderbook
     });
 
-    let sender_a_tx = tx.clone();
-    let sender_b_tx = tx.clone();
+    let handle = BookHandle { sender: tx };
 
-    let sender_a = tokio::spawn(dispatch_orders(sender_a_tx, "A", 5));
-    let sender_b = tokio::spawn(dispatch_orders(sender_b_tx, "B", 5));
-
-    drop(tx);
+    let sender_a = tokio::spawn(dispatch_orders(handle.clone(), "A", 5));
+    let sender_b = tokio::spawn(dispatch_orders(handle.clone(), "B", 5));
+    drop(handle);
 
     sender_a.await.expect("SENDER A FAILED");
     sender_b.await.expect("SENDER B FAILED");
