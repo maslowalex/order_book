@@ -1,53 +1,84 @@
 mod helpers;
 
 use order_book_core::allocation::fifo::FifoMatcher;
+use order_book_core::execution_report::ExecutionReport;
 use order_book_core::instrument::InstrumentSpec;
-use order_book_core::order::{Order, Side};
+use order_book_core::order::{Order, OrderValidationError, Side};
+use order_book_core::order_input::OrderInput;
+use order_book_core::order_input::OrderKind;
+use order_book_core::order_type::TimeInForce;
 use order_book_core::orderbook::OrderBook;
-use tokio::sync::mpsc;
+use order_book_core::orderbook::OrderBookError;
+use tokio::sync::{mpsc, oneshot};
 
-struct LimitOrderMessage {
-    side: Side,
-    price: u64,
-    quantity: u64,
+#[derive(Debug)]
+enum SubmitError {
+    Execution(OrderBookError),
+    Validation(OrderValidationError),
 }
 
-impl LimitOrderMessage {
-    fn new(side: Side, price: u64, quantity: u64) -> Self {
-        LimitOrderMessage {
-            side,
-            price,
-            quantity,
-        }
-    }
+enum Command {
+    Submit {
+        input: OrderInput,
+        sender: oneshot::Sender<Result<ExecutionReport, SubmitError>>,
+    },
+}
 
-    fn to_order(&self, spec: &InstrumentSpec) -> Order {
-        helpers::limit_order(&spec, self.side, self.price, self.quantity, "client_id")
-            .expect("invalid_order")
+fn generate_input(i: u64) -> OrderInput {
+    OrderInput {
+        side: Side::Bid,
+        quantity: 50,
+        kind: OrderKind::Limit,
+        client_id: "test".to_owned(),
+        tif: Some(TimeInForce::GTC),
+        trigger: None,
+        price: Some(1000 + i),
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let instrument_spec = InstrumentSpec::cents();
-    let (tx, mut rx) = mpsc::channel::<LimitOrderMessage>(1);
+    let (tx, mut rx) = mpsc::channel::<Command>(1);
 
     let task = tokio::spawn(async move {
         let mut orderbook = OrderBook::new(instrument_spec, FifoMatcher);
 
-        while let Some(limit_order_message) = rx.recv().await {
-            orderbook
-                .submit(limit_order_message.to_order(&instrument_spec))
-                .expect("channel order is valid");
+        while let Some(command) = rx.recv().await {
+            match command {
+                Command::Submit { input, sender } => {
+                    let result = input
+                        .into_order(&instrument_spec)
+                        .map_err(SubmitError::Validation)
+                        .and_then(|order| orderbook.submit(order).map_err(SubmitError::Execution));
+
+                    let _ = sender.send(result);
+                }
+            }
         }
 
         orderbook
     });
 
-    for _ in 1..10_000 {
-        let limit_order_message = LimitOrderMessage::new(Side::Ask, 10_000, 5);
+    for i in 1..10_000 {
+        let input = generate_input(i);
+        let (oneshot_sender, oneshot_receiver) = oneshot::channel();
 
-        let _ = tx.send(limit_order_message).await;
+        tx.send(Command::Submit {
+            input,
+            sender: oneshot_sender,
+        })
+        .await
+        .expect("book owner stopped receiving commands");
+
+        let response = oneshot_receiver
+            .await
+            .expect("book owner dropped the reply");
+
+        match response {
+            Ok(report) => println!("{report:?}"),
+            Err(error) => eprintln!("{error:?}"),
+        }
     }
 
     drop(tx);
