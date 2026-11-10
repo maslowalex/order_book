@@ -47,7 +47,7 @@ pub fn order(side: Side, price: i64, quantity: u64, remaining: Option<u64>, id: 
         builder = builder.remaining_quantity(qty(remaining));
     }
 
-    builder.build()
+    builder.build().expect("test order has all required fields")
 }
 
 pub fn price_level(side: Side, price: i64) -> PriceLevel {

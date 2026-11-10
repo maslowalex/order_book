@@ -166,6 +166,7 @@ fn arb_order() -> impl Strategy<Value = Order> {
                 .side(side)
                 .quantity(qty(quantity))
                 .build()
+                .expect("test order has all required fields")
         },
     )
 }
@@ -195,6 +196,7 @@ fn arb_stream_unique_clients() -> impl Strategy<Value = Vec<Order>> {
                     .side(side)
                     .quantity(qty(quantity))
                     .build()
+                    .expect("test order has all required fields")
             })
             .collect()
     })
@@ -226,6 +228,7 @@ fn arb_lot_ten_order() -> impl Strategy<Value = Order> {
                         .expect("drawn in whole lots"),
                 )
                 .build()
+                .expect("test order has all required fields")
         },
     )
 }
@@ -1011,7 +1014,8 @@ fn check_reject_is_a_no_op<M: MatchingAlgorithm, S: OrderBookStore>(
         .quantity(qty(too_small))
         .client_id("rejected")
         .exchange_id("rejected")
-        .build();
+        .build()
+        .expect("test order has all required fields");
 
     let err = book.submit(bad).expect_err("below the size minimum");
     prop_assert!(matches!(err, OrderBookError::Rejected(_)), "got {err:?}");

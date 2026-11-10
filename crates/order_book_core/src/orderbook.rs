@@ -890,7 +890,8 @@ mod test {
             .client_id("s")
             .exchange_id("s")
             .order_type(OrderType::stop_market(px(50)))
-            .build();
+            .build()
+            .expect("test order has all required fields");
 
         assert!(matches!(
             ob.submit(stop),
@@ -939,7 +940,8 @@ mod test {
             .client_id("t")
             .exchange_id("t")
             .order_type(OrderType::Market)
-            .build();
+            .build()
+            .expect("test order has all required fields");
 
         assert!(ob.submit(taker).is_ok());
     }
@@ -1008,6 +1010,7 @@ mod test {
                 .exchange_id(id)
                 .order_type(OrderType::Market)
                 .build()
+                .expect("test order has all required fields")
         };
         ob.submit(market("t1")).unwrap();
         ob.submit(market("t2")).unwrap();
@@ -1028,7 +1031,8 @@ mod test {
             .client_id("c")
             .exchange_id("m")
             .order_type(OrderType::Market)
-            .build();
+            .build()
+            .expect("test order has all required fields");
         assert_eq!(ob.add_order(market), Err(OrderBookError::NotRestable));
 
         // duplicate id
@@ -1059,7 +1063,8 @@ mod test {
             .client_id("t")
             .exchange_id("t")
             .order_type(OrderType::limit_gtc(px(100)))
-            .build();
+            .build()
+            .expect("test order has all required fields");
         ob.submit(taker).unwrap();
 
         assert_eq!(arrival_at(&ob, Side::Bid, 100, 0), 2, "resident was first");
@@ -1081,7 +1086,8 @@ mod test {
             .client_id("stopper")
             .exchange_id("stop")
             .order_type(OrderType::stop_limit(px(99), px(105)))
-            .build();
+            .build()
+            .expect("test order has all required fields");
         ob.submit(stop).unwrap();
         assert_eq!(ob.next_arrival, 1, "parking is not resting");
 
@@ -1098,7 +1104,8 @@ mod test {
             .client_id("t")
             .exchange_id("t")
             .order_type(OrderType::limit_gtc(px(99)))
-            .build();
+            .build()
+            .expect("test order has all required fields");
         ob.submit(taker).unwrap();
 
         assert_eq!(
@@ -1210,7 +1217,8 @@ mod arena_tests {
                     .client_id(client.to_string())
                     .timestamp(step as u128)
                     .exchange_id("assigned-by-submit")
-                    .build();
+                    .build()
+                    .expect("test order has all required fields");
                 submitted.push(book.submit(incoming).unwrap().order_id);
             }
             assert_ownership(&book);

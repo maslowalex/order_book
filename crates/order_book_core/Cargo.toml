@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 bbtree = "=0.1.1"
+derive_builder = "0.20.2"
 hotpath = "0.25"
 rust_decimal = "1.42.1"
 slotmap = "1.1"

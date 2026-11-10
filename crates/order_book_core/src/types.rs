@@ -1,5 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use derive_builder::Builder;
+
 use crate::allocation::Maker;
 use crate::order_queue::OrderArena;
 use crate::storage::BookLevel;
@@ -131,15 +133,27 @@ pub enum OrderLifecycle {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Builder)]
+#[builder(
+    pattern = "owned",
+    derive(Debug, Clone),
+    custom_constructor,
+    build_fn(error = "OrderValidationError")
+)]
 pub struct Order {
+    #[builder(setter(custom))]
     pub exchange_id: ExchangeId,
+    #[builder(setter(custom))]
     pub client_id: ClientId,
     /// Carries the price(s) too — see `OrderType`. A resting order is always
     /// `Limit`, and its price is its level's price.
     pub order_type: OrderType,
     pub side: Side,
+    #[builder(setter(name = "quantity"))]
     pub original_quantity: Qty,
+    #[builder(
+        default = "self.original_quantity.ok_or_else(|| OrderValidationError::missing_field(\"quantity\"))?"
+    )]
     pub remaining_quantity: Qty,
     pub timestamp: u128, // matters, because of the FIFO processing we need to know the time of the order
     /// When this order joined its price level, on the exchange's own counter —
@@ -176,19 +190,6 @@ pub struct Order {
     pub lifecycle: OrderLifecycle,
 }
 
-#[derive(Debug, Clone)]
-pub struct OrderBuilder {
-    exchange_id: Option<ExchangeId>,
-    client_id: Option<ClientId>,
-    order_type: Option<OrderType>,
-    side: Option<Side>,
-    original_quantity: Option<Qty>,
-    remaining_quantity: Option<Qty>,
-    timestamp: Option<u128>,
-    arrival: Option<u32>,
-    lifecycle: Option<OrderLifecycle>,
-}
-
 impl Default for OrderBuilder {
     fn default() -> Self {
         let timestamp_ns = SystemTime::now()
@@ -205,7 +206,7 @@ impl Default for OrderBuilder {
             // thing this field exists to be authoritative about.
             arrival: Some(0),
             // no order_type default: `Market` silently standing in for a
-            // forgotten `.order_type(...)` hid intent — now it's a loud panic
+            // forgotten `.order_type(...)` hid intent — now it returns an error
             order_type: None,
             exchange_id: None,
             client_id: None,
@@ -216,43 +217,31 @@ impl Default for OrderBuilder {
     }
 }
 
+#[derive(Debug)]
+pub enum OrderValidationError {
+    MissingField(String),
+    InvalidLifecycle,
+}
+
+impl OrderValidationError {
+    pub fn missing_field(field: &str) -> Self {
+        Self::MissingField(field.to_owned())
+    }
+}
+
+impl From<derive_builder::UninitializedFieldError> for OrderValidationError {
+    fn from(error: derive_builder::UninitializedFieldError) -> Self {
+        let field = match error.field_name() {
+            "original_quantity" => "quantity",
+            field => field,
+        };
+        Self::missing_field(field)
+    }
+}
+
 impl OrderBuilder {
-    pub fn build(self) -> Order {
-        let original_quantity = self.original_quantity.expect("quantity doesn't provided");
-        Order {
-            exchange_id: self.exchange_id.expect("exchange_id should be present"),
-            client_id: self.client_id.expect("client_id should be present"),
-            lifecycle: self
-                .lifecycle
-                .expect("somehow lifecycle is not provided and default doesn't applied"),
-            timestamp: self
-                .timestamp
-                .expect("somehow timetamp is not provided and default doesn't applied"),
-            arrival: self
-                .arrival
-                .expect("somehow arrival is not provided and default doesn't applied"),
-            side: self.side.expect("side doesn't provided"),
-            // a fresh order has nothing filled yet, so remaining == original unless
-            // a test explicitly seeds a pre-filled resting order via .remaining_quantity()
-            remaining_quantity: self.remaining_quantity.unwrap_or(original_quantity),
-            original_quantity: self.original_quantity.unwrap_or(original_quantity),
-            order_type: self.order_type.expect("order_type doesn't provided"),
-        }
-    }
-
-    pub fn timestamp(mut self, timestamp: u128) -> Self {
-        self.timestamp = Some(timestamp);
-        self
-    }
-
-    /// Seeds the arrival stamp directly. For tests that need a level with a
-    /// known age profile without submitting orders one at a time — the book
-    /// overwrites this the moment the order actually rests.
-    pub fn arrival(mut self, arrival: u32) -> Self {
-        self.arrival = Some(arrival);
-        self
-    }
-
+    // Preserve the string-based ID setters; the derive generates the other
+    // setters and the fallible build method.
     pub fn exchange_id(mut self, exchange_id: impl Into<String>) -> Self {
         self.exchange_id = Some(ExchangeId(exchange_id.into()));
         self
@@ -260,31 +249,6 @@ impl OrderBuilder {
 
     pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(ClientId(client_id.into()));
-        self
-    }
-
-    pub fn order_type(mut self, order_type: OrderType) -> Self {
-        self.order_type = Some(order_type);
-        self
-    }
-
-    pub fn side(mut self, side: Side) -> Self {
-        self.side = Some(side);
-        self
-    }
-
-    pub fn quantity(mut self, quantity: Qty) -> Self {
-        self.original_quantity = Some(quantity);
-        self
-    }
-
-    pub fn remaining_quantity(mut self, remaining_quantity: Qty) -> Self {
-        self.remaining_quantity = Some(remaining_quantity);
-        self
-    }
-
-    pub fn lifecycle(mut self, lifecycle: OrderLifecycle) -> Self {
-        self.lifecycle = Some(lifecycle);
         self
     }
 }
@@ -438,6 +402,62 @@ impl<'a> PriceLevelView<'a> {
 mod tests {
     use super::*;
     use crate::test_helpers::{order, price_level, px, qty};
+
+    #[test]
+    fn order_builder_preserves_defaults_and_overrides() {
+        let builder = Order::builder()
+            .exchange_id("exchange")
+            .client_id(String::from("client"))
+            .side(Side::Bid)
+            .order_type(OrderType::Market)
+            .quantity(qty(10));
+        let timestamp = builder.timestamp.unwrap();
+        let order = builder.clone().build().unwrap();
+        assert_eq!(order.timestamp, timestamp);
+        assert_eq!(order.original_quantity, qty(10));
+        assert_eq!(order.remaining_quantity, qty(10));
+        assert_eq!(order.lifecycle, OrderLifecycle::New);
+        assert_eq!(order.arrival, 0);
+        assert_eq!(order.exchange_id, ExchangeId("exchange".into()));
+        assert_eq!(order.client_id, ClientId("client".into()));
+
+        let order = builder
+            .remaining_quantity(qty(4))
+            .timestamp(123)
+            .arrival(7)
+            .lifecycle(OrderLifecycle::PartiallyFilled)
+            .build()
+            .unwrap();
+        assert_eq!(order.original_quantity, qty(10));
+        assert_eq!(order.remaining_quantity, qty(4));
+        assert_eq!(order.timestamp, 123);
+        assert_eq!(order.arrival, 7);
+        assert_eq!(order.lifecycle, OrderLifecycle::PartiallyFilled);
+    }
+
+    #[test]
+    fn order_builder_reports_missing_required_fields() {
+        let complete = Order::builder()
+            .exchange_id("exchange")
+            .client_id("client")
+            .side(Side::Bid)
+            .order_type(OrderType::Market)
+            .quantity(qty(10));
+        for field in ["exchange_id", "client_id", "side", "order_type", "quantity"] {
+            let mut builder = complete.clone();
+            match field {
+                "exchange_id" => builder.exchange_id = None,
+                "client_id" => builder.client_id = None,
+                "side" => builder.side = None,
+                "order_type" => builder.order_type = None,
+                "quantity" => builder.original_quantity = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(builder.build(), Err(OrderValidationError::MissingField(name)) if name == field)
+            );
+        }
+    }
 
     #[test]
     fn price_level_constructor_works() {

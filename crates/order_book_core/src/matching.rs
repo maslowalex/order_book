@@ -635,6 +635,7 @@ mod tests {
             .exchange_id(id)
             .order_type(OrderType::limit_gtc(px(price)))
             .build()
+            .expect("test order has all required fields")
     }
 
     fn market_order(side: Side, quantity: u64, id: &str) -> Order {
@@ -645,6 +646,7 @@ mod tests {
             .exchange_id(id)
             .order_type(OrderType::Market)
             .build()
+            .expect("test order has all required fields")
     }
 
     fn ioc_order(side: Side, price: i64, quantity: u64, id: &str) -> Order {
@@ -655,6 +657,7 @@ mod tests {
             .exchange_id(id)
             .order_type(OrderType::limit_ioc(px(price)))
             .build()
+            .expect("test order has all required fields")
     }
 
     fn fok_order(side: Side, price: i64, quantity: u64, id: &str) -> Order {
@@ -665,6 +668,7 @@ mod tests {
             .exchange_id(id)
             .order_type(OrderType::limit_fok(px(price)))
             .build()
+            .expect("test order has all required fields")
     }
 
     fn stop_market(side: Side, trigger: i64, quantity: u64, id: &str) -> Order {
@@ -675,6 +679,7 @@ mod tests {
             .exchange_id(id)
             .order_type(OrderType::stop_market(px(trigger)))
             .build()
+            .expect("test order has all required fields")
     }
 
     fn stop_limit(side: Side, trigger: i64, price: i64, quantity: u64, id: &str) -> Order {
@@ -685,6 +690,7 @@ mod tests {
             .exchange_id(id)
             .order_type(OrderType::stop_limit(px(trigger), px(price)))
             .build()
+            .expect("test order has all required fields")
     }
 
     fn id(s: &str) -> ExchangeId {
@@ -1444,7 +1450,8 @@ mod tests {
             .client_id("alice")
             .exchange_id("a1")
             .order_type(OrderType::limit_gtc(px(100)))
-            .build();
+            .build()
+            .expect("test order has all required fields");
         ob.add_order(maker).unwrap();
 
         let taker = Order::builder()
@@ -1453,7 +1460,8 @@ mod tests {
             .client_id("alice") // same client as the resting order
             .exchange_id("t1")
             .order_type(OrderType::Market)
-            .build();
+            .build()
+            .expect("test order has all required fields");
         let report = ob.submit(taker).unwrap();
 
         assert!(report.trades.is_empty()); // no self-trade printed
@@ -1474,6 +1482,7 @@ mod tests {
             .exchange_id(id_)
             .order_type(OrderType::limit_gtc(px(price)))
             .build()
+            .expect("test order has all required fields")
     }
 
     /// A market buy for `quantity`, from `client`.
@@ -1485,6 +1494,7 @@ mod tests {
             .exchange_id(id_)
             .order_type(OrderType::Market)
             .build()
+            .expect("test order has all required fields")
     }
 
     /// The point of the whole phase, in one case. The same book, the same

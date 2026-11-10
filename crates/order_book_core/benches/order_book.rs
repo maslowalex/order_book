@@ -152,6 +152,7 @@ mod generators {
             .quantity(base_qty(qty))
             .timestamp(ts)
             .build()
+            .expect("benchmark order has all required fields")
     }
 
     /// A book of `n` resting orders (50/50 sides, qty 1..=50), inserted via
@@ -267,6 +268,7 @@ mod generators {
                     .quantity(base_qty(qty))
                     .timestamp(2_000_000 + i as u128)
                     .build()
+                    .expect("benchmark order has all required fields")
             })
             .collect()
     }
@@ -407,6 +409,7 @@ mod generators {
                     .quantity(base_qty(levels_each as u64 * level_depth))
                     .timestamp(3_000_000 + j as u128)
                     .build()
+                    .expect("benchmark order has all required fields")
             })
             .collect()
     }

@@ -144,6 +144,7 @@ fn limit_order(id: String, client: String, price: Price, quantity: Qty, timestam
         .quantity(quantity)
         .timestamp(timestamp)
         .build()
+        .expect("profiling order has all required fields")
 }
 
 fn market_bid(id: String, client: String, quantity: Qty, timestamp: u128) -> Order {
@@ -155,6 +156,7 @@ fn market_bid(id: String, client: String, quantity: Qty, timestamp: u128) -> Ord
         .quantity(quantity)
         .timestamp(timestamp)
         .build()
+        .expect("profiling order has all required fields")
 }
 
 /// Keep one FIFO level at constant depth. Each operation projects the entire
