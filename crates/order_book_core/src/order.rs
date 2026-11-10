@@ -126,6 +126,22 @@ pub enum OrderValidationError {
     Rejected(RejectReason),
 }
 
+impl std::fmt::Display for OrderValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingField(field) => write!(f, "missing required field: {field}"),
+            Self::InvalidLifecycle => f.write_str("invalid order lifecycle"),
+            Self::InvalidPrice(error) => write!(f, "invalid price: {error}"),
+            Self::InvalidTrigger(error) => write!(f, "invalid trigger: {error}"),
+            Self::InvalidQuantity(error) => write!(f, "invalid quantity: {error}"),
+            Self::UnexpectedField(field) => {
+                write!(f, "field is not allowed for this order kind: {field}")
+            }
+            Self::Rejected(reason) => write!(f, "order rejected: {reason}"),
+        }
+    }
+}
+
 impl OrderValidationError {
     pub fn missing_field(field: &str) -> Self {
         Self::MissingField(field.to_owned())

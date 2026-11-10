@@ -126,6 +126,31 @@ pub enum SpecError {
     InvalidSpec(&'static str),
 }
 
+impl std::fmt::Display for SpecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PriceNegative(price) => write!(f, "price {price} must not be negative"),
+            Self::PriceTooPrecise { price, price_scale } => {
+                write!(f, "price {price} exceeds {price_scale} decimal places")
+            }
+            Self::PriceOffTick { price, tick_size } => write!(
+                f,
+                "price {price} is not a multiple of tick size {tick_size}"
+            ),
+            Self::PriceOutOfRange(price) => write!(f, "price {price} is out of range"),
+            Self::QtyNegative(qty) => write!(f, "quantity {qty} must not be negative"),
+            Self::QtyTooPrecise { qty, qty_scale } => {
+                write!(f, "quantity {qty} exceeds {qty_scale} decimal places")
+            }
+            Self::QtyOffLot { qty, lot_size } => {
+                write!(f, "quantity {qty} is not a multiple of lot size {lot_size}")
+            }
+            Self::QtyOutOfRange(qty) => write!(f, "quantity {qty} is out of range"),
+            Self::InvalidSpec(reason) => write!(f, "invalid instrument specification: {reason}"),
+        }
+    }
+}
+
 /// Why an otherwise well-formed order was not admitted.
 ///
 /// Distinct from [`SpecError`], and the distinction is the point. A `SpecError`
@@ -142,6 +167,43 @@ pub enum RejectReason {
     QuantityBelowMinimum { qty: Qty, min: Qty },
     QuantityAboveMaximum { qty: Qty, max: Qty },
     NotionalBelowMinimum { notional: Notional, min: Notional },
+}
+
+impl std::fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PriceBelowMinimum { price, min } => write!(
+                f,
+                "price {} is below minimum {} (minor units)",
+                price.minor(),
+                min.minor()
+            ),
+            Self::PriceAboveMaximum { price, max } => write!(
+                f,
+                "price {} exceeds maximum {} (minor units)",
+                price.minor(),
+                max.minor()
+            ),
+            Self::QuantityBelowMinimum { qty, min } => write!(
+                f,
+                "quantity {} is below minimum {} (base units)",
+                qty.base(),
+                min.base()
+            ),
+            Self::QuantityAboveMaximum { qty, max } => write!(
+                f,
+                "quantity {} exceeds maximum {} (base units)",
+                qty.base(),
+                max.base()
+            ),
+            Self::NotionalBelowMinimum { notional, min } => write!(
+                f,
+                "notional {} is below minimum {} (minor price units × base quantity units)",
+                notional.raw(),
+                min.raw()
+            ),
+        }
+    }
 }
 
 /// The contract specification: what a legal price and a legal quantity look

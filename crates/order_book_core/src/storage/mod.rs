@@ -24,6 +24,16 @@ pub enum StoreError {
     PriceOutsideRange,
 }
 
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnboundedPriceRange => "storage requires a finite maximum price",
+            Self::PriceRangeTooLarge => "price range exceeds storage capacity",
+            Self::PriceOutsideRange => "price is outside the storage range",
+        })
+    }
+}
+
 /// Price-level storage, independent of active-order ownership.
 /// `ensure_level` must return the requested level or reject without mutation.
 /// The engine removes levels after their last order is unlinked.

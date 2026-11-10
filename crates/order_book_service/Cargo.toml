@@ -7,3 +7,5 @@ edition = "2024"
 anyhow = "1.0.104"
 order_book_core = { version = "0.1.0", path = "../order_book_core" }
 tokio = { version = "1.54.0", features = ["rt", "macros", "sync"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

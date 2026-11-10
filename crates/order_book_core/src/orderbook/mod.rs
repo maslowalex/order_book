@@ -131,6 +131,20 @@ pub enum OrderBookError {
     Storage(StoreError),
 }
 
+impl std::fmt::Display for OrderBookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generic => f.write_str("order book operation failed"),
+            Self::ExchangeIdDuplicated => f.write_str("duplicate exchange order ID"),
+            Self::OrderNotFound => f.write_str("order not found"),
+            Self::Unsupported => f.write_str("unsupported order type"),
+            Self::NotRestable => f.write_str("only limit orders can rest in the active book"),
+            Self::Rejected(reason) => write!(f, "order rejected: {reason}"),
+            Self::Storage(error) => write!(f, "storage error: {error}"),
+        }
+    }
+}
+
 impl<M: MatchingAlgorithm> OrderBook<M, BTreeStore> {
     /// A book must be told what instrument it trades AND what policy it
     /// allocates by before it can hold a single order.
