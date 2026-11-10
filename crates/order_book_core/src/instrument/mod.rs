@@ -48,151 +48,22 @@
 //! type. That is what turns "we assume normalization happened upstream" from a
 //! comment into an invariant.
 
-use crate::types::Side;
+use crate::order::Side;
 use rust_decimal::Decimal;
 
 /// `rust_decimal` carries at most 28 decimal places, so a scale beyond this
 /// could never round-trip and is rejected when the spec is built.
 const MAX_SCALE: u32 = 28;
 
-/// A price in minor units of the quote currency — cents for a USD-quoted
-/// instrument, satoshis for a BTC-quoted one.
-///
-/// Unsigned, so a negative price is unrepresentable rather than validated. The
-/// cost of that choice is real and worth naming: instruments *can* trade
-/// negative (WTI in April 2020, and calendar spreads routinely), and this book
-/// cannot model them. The benefit is that every price in the engine is known
-/// non-negative without a single runtime check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Price(u64);
+pub mod notional;
+pub mod price;
+pub mod qty;
+pub mod ticks;
 
-impl Price {
-    /// The underlying count of minor units. Meaningless without the spec that
-    /// produced it — use [`InstrumentSpec::to_decimal`] to get a number a human
-    /// can read.
-    pub const fn minor(self) -> u64 {
-        self.0
-    }
-
-    /// Crate-internal construction, bypassing the tick check. Callable only
-    /// where the value provably came off the lattice already — copying a price
-    /// out of a level, or a test fixture building on a known grid. Public
-    /// callers go through [`InstrumentSpec`].
-    // Unused until the engine itself speaks `Price`; the module lands first so
-    // the migration that follows is a pure type change with nothing new in it.
-    #[allow(dead_code)]
-    pub(crate) const fn from_minor_unchecked(minor: u64) -> Self {
-        Price(minor)
-    }
-}
-
-/// A quantity in base units of the asset — satoshis for BTC, whole shares for
-/// an equity quoted in shares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Qty(u64);
-
-impl Qty {
-    pub const ZERO: Qty = Qty(0);
-
-    pub const fn base(self) -> u64 {
-        self.0
-    }
-
-    pub(crate) const fn from_base_unchecked(base: u64) -> Self {
-        Qty(base)
-    }
-
-    pub const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-}
-
-// Quantities add and subtract like the counts they are, and the operators are
-// carried rather than replaced by `.base()` calls at the ~50 arithmetic sites
-// — a type you have to unwrap to use is a type nobody uses.
-//
-// Overflow behaviour is inherited verbatim from `u64`: panic in debug, wrap in
-// release. That is what the raw `u64` fields did before this type existed, and
-// changing it here would smuggle a behavioural change into a type migration.
-// `PriceLevel::total_quantity` folds without a check and can still overflow a
-// deep enough level; that hazard predates this type and is left visible.
-impl std::ops::Add for Qty {
-    type Output = Qty;
-    fn add(self, rhs: Qty) -> Qty {
-        Qty(self.0 + rhs.0)
-    }
-}
-
-impl std::ops::Sub for Qty {
-    type Output = Qty;
-    fn sub(self, rhs: Qty) -> Qty {
-        Qty(self.0 - rhs.0)
-    }
-}
-
-impl std::ops::AddAssign for Qty {
-    fn add_assign(&mut self, rhs: Qty) {
-        self.0 += rhs.0;
-    }
-}
-
-impl std::ops::SubAssign for Qty {
-    fn sub_assign(&mut self, rhs: Qty) {
-        self.0 -= rhs.0;
-    }
-}
-
-impl std::iter::Sum for Qty {
-    fn sum<I: Iterator<Item = Qty>>(iter: I) -> Qty {
-        iter.fold(Qty::ZERO, |acc, q| acc + q)
-    }
-}
-
-impl<'a> std::iter::Sum<&'a Qty> for Qty {
-    fn sum<I: Iterator<Item = &'a Qty>>(iter: I) -> Qty {
-        iter.copied().sum()
-    }
-}
-
-/// A *difference* between two prices, counted in ticks — which is how a spread
-/// is actually quoted on a trading floor ("it's two ticks wide"), not in
-/// currency.
-///
-/// A separate type because a price difference is not a price: you cannot rest
-/// an order at a spread, and adding two prices together is meaningless. Keeping
-/// them distinct makes `Price + Price` a compile error rather than a plausible
-/// line of code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Ticks(u64);
-
-impl Ticks {
-    pub const fn count(self) -> u64 {
-        self.0
-    }
-
-    #[allow(dead_code)] // see the note on `Price::from_minor_unchecked`
-    pub(crate) const fn from_count(count: u64) -> Self {
-        Ticks(count)
-    }
-}
-
-/// A notional value, in units of (one minor price unit × one base quantity
-/// unit). Integral by construction, so comparing a notional against a floor
-/// never touches `Decimal` and never rounds.
-///
-/// `u128` is exactly wide enough and not one bit wider: the largest product two
-/// `u64`s can make is `(2^64 − 1)² = 2^128 − 2^65 + 1`, which is below
-/// `u128::MAX = 2^128 − 1`. This is the same lesson as the `u128` widening in
-/// the pro-rata allocator, one dimension over — except there the headroom is
-/// comfortable and here it is a single bit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Notional(u128);
-
-impl Notional {
-    pub const fn raw(self) -> u128 {
-        self.0
-    }
-}
+use notional::Notional;
+use price::Price;
+use qty::Qty;
+use ticks::Ticks;
 
 /// Which way [`InstrumentSpec::round_price`] moves a price that is not already
 /// on the tick grid.

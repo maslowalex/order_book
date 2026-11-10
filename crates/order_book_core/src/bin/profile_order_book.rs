@@ -10,11 +10,14 @@ use std::hint::black_box;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use order_book_core::allocation::FifoMatcher;
-use order_book_core::instrument::{InstrumentSpec, Price, Qty};
-use order_book_core::matching::SubmitOutcome;
+use order_book_core::allocation::fifo::FifoMatcher;
+use order_book_core::execution_report::SubmitOutcome;
+use order_book_core::instrument::InstrumentSpec;
+use order_book_core::instrument::price::Price;
+use order_book_core::instrument::qty::Qty;
+use order_book_core::order::{Order, Side};
+use order_book_core::order_type::OrderType;
 use order_book_core::orderbook::OrderBook;
-use order_book_core::types::{Order, OrderType, Side};
 
 const DEFAULT_DEPTH: usize = 10_000;
 const DEFAULT_OPERATIONS: usize = 25_000;

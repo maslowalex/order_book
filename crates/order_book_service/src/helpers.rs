@@ -1,7 +1,6 @@
-use order_book_core::{
-    instrument::InstrumentSpec,
-    types::{Order, OrderType, Side},
-};
+use order_book_core::instrument::InstrumentSpec;
+use order_book_core::order::{Order, Side};
+use order_book_core::order_type::OrderType;
 
 /// Build a fresh GTC limit order for the workshop.
 /// Prices are in minor units and quantities are in base units of `spec`.

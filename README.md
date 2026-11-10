@@ -9,6 +9,30 @@ It is designed to make the important matching decisions explicit and
 testable. It is not a production exchange and should not be used with real
 money.
 
+## Core module layout
+
+Main entities have dedicated modules; their builders, errors, and small supporting
+types stay beside them. Import types directly from their owning module:
+
+| Module | Contents |
+|---|---|
+| `order` | `Order`, its builder and validation error, IDs, side, lifecycle |
+| `order_type` | `OrderType`, `TimeInForce` |
+| `price_level` | Owned price levels and borrowed views |
+| `instrument` | `InstrumentSpec`, conversion errors, admission reasons, rounding |
+| `instrument::{price, qty, ticks, notional}` | Instrument value types, each in its own module |
+| `allocation` | `MatchingAlgorithm`, `Maker`, `Fill` |
+| `allocation::{fifo, pro_rata, time_pro_rata}` | Individual matcher implementations |
+| `orderbook` | `OrderBook`; matching operations live in a private child module |
+| `trade`, `execution_report` | Trades and submission results |
+| `storage::book_level` | Active-level metadata; storage backends remain under `storage` |
+
+For example, use `order_book_core::order::Order` and
+`order_book_core::allocation::fifo::FifoMatcher`. The former `types` and public
+`matching` modules and the old value-type and matcher re-exports are removed.
+Historical learning and benchmark notes retain source paths from their recorded
+revisions.
+
 ## Hotpath profiling
 
 Run the deterministic workload with opt-in function profiling:

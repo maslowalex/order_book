@@ -45,21 +45,24 @@
 //! steps) so that random streams actually cross and stops actually fire;
 //! clients come from a pool of 4 so self-trade prevention gets exercised.
 
-use std::collections::HashMap;
-
-use order_book_core::allocation::{
-    FifoMatcher, MatchingAlgorithm, ProRataMatcher, TimeProRataMatcher,
-};
-use order_book_core::instrument::{InstrumentSpec, Qty};
-use order_book_core::matching::{ExecutionReport, SubmitOutcome};
+use order_book_core::allocation::MatchingAlgorithm;
+use order_book_core::allocation::fifo::FifoMatcher;
+use order_book_core::allocation::pro_rata::ProRataMatcher;
+use order_book_core::allocation::time_pro_rata::TimeProRataMatcher;
+use order_book_core::execution_report::{ExecutionReport, SubmitOutcome};
+use order_book_core::instrument::InstrumentSpec;
+use order_book_core::instrument::price::Price;
+use order_book_core::instrument::qty::Qty;
+use order_book_core::order::{ExchangeId, Order, Side};
+use order_book_core::order_type::{OrderType, TimeInForce};
 use order_book_core::orderbook::{OrderBook, OrderBookError, OrderLocation};
 use order_book_core::storage::{
     BBTreeStore, BTreeStore, HashMapStore, OrderBookStore, TickLadderStore,
 };
-use order_book_core::types::{ExchangeId, Order, OrderType, Price, Side, TimeInForce};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 
 // --- matcher × storage axes --------------------------------------------
 

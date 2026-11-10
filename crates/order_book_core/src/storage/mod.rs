@@ -5,11 +5,13 @@
 //! taker's quantity is shared within one level, while [`OrderBookStore`]
 //! decides how levels are found and held.
 
+use crate::instrument::InstrumentSpec;
 use std::fmt::Debug;
 
-use crate::instrument::InstrumentSpec;
-use crate::order_queue::LevelQueue;
-use crate::types::{Price, Side};
+pub mod book_level;
+use crate::instrument::price::Price;
+use crate::order::Side;
+use book_level::BookLevel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
@@ -20,32 +22,6 @@ pub enum StoreError {
     PriceRangeTooLarge,
     /// The price is outside the span this store was constructed for.
     PriceOutsideRange,
-}
-
-/// Metadata for an active price level. Orders live in the book-wide arena.
-/// Backends construct levels with `new`; only the engine changes queue links.
-#[derive(Debug, Clone)]
-pub struct BookLevel {
-    pub price: Price,
-    pub side: Side,
-    pub(crate) queue: LevelQueue,
-}
-
-impl BookLevel {
-    pub fn new(price: Price, side: Side) -> Self {
-        Self {
-            price,
-            side,
-            queue: LevelQueue::default(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-    pub fn order_count(&self) -> usize {
-        self.queue.len()
-    }
 }
 
 /// Price-level storage, independent of active-order ownership.

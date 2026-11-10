@@ -1,10 +1,9 @@
 mod helpers;
 
-use order_book_core::{
-    allocation::FifoMatcher, instrument::InstrumentSpec, orderbook::OrderBook, types::Order,
-    types::Side,
-};
-
+use order_book_core::allocation::fifo::FifoMatcher;
+use order_book_core::instrument::InstrumentSpec;
+use order_book_core::order::{Order, Side};
+use order_book_core::orderbook::OrderBook;
 use tokio::sync::mpsc;
 
 struct LimitOrderMessage {

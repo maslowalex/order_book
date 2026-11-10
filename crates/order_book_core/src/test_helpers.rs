@@ -1,7 +1,12 @@
-use crate::allocation::{FifoMatcher, MatchingAlgorithm};
-use crate::instrument::{InstrumentSpec, Qty};
+use crate::allocation::MatchingAlgorithm;
+use crate::allocation::fifo::FifoMatcher;
+use crate::instrument::InstrumentSpec;
+use crate::instrument::price::Price;
+use crate::instrument::qty::Qty;
+use crate::order::{Order, Side};
+use crate::order_type::OrderType;
 use crate::orderbook::OrderBook;
-use crate::types::{Order, OrderType, Price, PriceLevel, Side};
+use crate::price_level::PriceLevel;
 
 /// The grid the suite has always used implicitly: prices in cents on a
 /// one-cent tick, quantities in whole units on a one-unit lot.

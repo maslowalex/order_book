@@ -1,11 +1,18 @@
+mod matching;
+
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::allocation::MatchingAlgorithm;
-use crate::instrument::{InstrumentSpec, Qty, RejectReason, Ticks};
+use crate::instrument::price::Price;
+use crate::instrument::qty::Qty;
+use crate::instrument::ticks::Ticks;
+use crate::instrument::{InstrumentSpec, RejectReason};
+use crate::order::{ExchangeId, Order, Side};
 use crate::order_queue::{OrderArena, OrderKey};
+use crate::order_type::OrderType;
+use crate::price_level::{PriceLevel, PriceLevelView};
 use crate::storage::{BTreeStore, OrderBookStore, StoreError};
-use crate::types::{ExchangeId, Order, OrderType, Price, PriceLevel, PriceLevelView, Side};
 
 /// Where a live order physically is — needed by `cancel_order`/`get_order`
 /// to know which structure to search. A bare `(Side, Price, kind)` tuple
@@ -49,7 +56,7 @@ impl OrderAddress {
 /// much. `S` is the *storage* axis — how active bid/ask levels are found and
 /// held. Matching depends only on [`OrderBookStore`], while allocation sees
 /// each level only through
-/// [`PriceLevelView::makers`](crate::types::PriceLevelView::makers) — a matcher sees a
+/// [`PriceLevelView::makers`](crate::price_level::PriceLevelView::makers) — a matcher sees a
 /// slice of sizes and arrivals, never an `Order` and never this struct.
 ///
 /// Note the derives add `Clone`/`Debug` bounds to both parameters. Free for the
@@ -135,7 +142,7 @@ impl<M: MatchingAlgorithm> OrderBook<M, BTreeStore> {
     /// would be the same move on the other axis — FIFO quietly standing in for
     /// a decision nobody made. Callers should be able to point at the line
     /// where they chose each. [`InstrumentSpec::cents`] is the named
-    /// one-cent-tick grid; [`FifoMatcher`](crate::allocation::FifoMatcher) is
+    /// one-cent-tick grid; [`FifoMatcher`](crate::allocation::fifo::FifoMatcher) is
     /// the named price-time policy.
     pub fn new(spec: InstrumentSpec, matcher: M) -> Self {
         Self::try_new(spec, matcher).expect("BTreeStore construction is infallible")
@@ -434,7 +441,7 @@ A: At any moment when a LIMIT order arrives, we must check if it crosses the spr
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::allocation::FifoMatcher;
+    use crate::allocation::fifo::FifoMatcher;
     use crate::instrument::{RejectReason, SpecError};
     use crate::test_helpers::{book, order, px, qty};
     use rust_decimal::Decimal;
@@ -1124,10 +1131,12 @@ mod test {
 #[cfg(test)]
 mod arena_tests {
     use super::*;
-    use crate::allocation::{FifoMatcher, ProRataMatcher, TimeProRataMatcher};
+    use crate::allocation::fifo::FifoMatcher;
+    use crate::allocation::pro_rata::ProRataMatcher;
+    use crate::allocation::time_pro_rata::TimeProRataMatcher;
+    use crate::order_type::TimeInForce;
     use crate::storage::{BBTreeStore, HashMapStore, TickLadderStore};
     use crate::test_helpers::{order, px, qty};
-    use crate::types::TimeInForce;
     use proptest::prelude::*;
     use std::collections::HashSet;
 

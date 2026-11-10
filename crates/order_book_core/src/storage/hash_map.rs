@@ -2,10 +2,11 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap};
 
+use super::book_level::BookLevel;
+use super::{OrderBookStore, StoreError};
 use crate::instrument::InstrumentSpec;
-use crate::types::{Price, Side};
-
-use super::{BookLevel, OrderBookStore, StoreError};
+use crate::instrument::price::Price;
+use crate::order::Side;
 
 #[derive(Debug, Clone, Default)]
 pub struct HashMapStore {

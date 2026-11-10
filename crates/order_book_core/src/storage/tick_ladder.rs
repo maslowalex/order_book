@@ -1,7 +1,8 @@
+use super::book_level::BookLevel;
+use super::{OrderBookStore, StoreError};
 use crate::instrument::InstrumentSpec;
-use crate::types::{Price, Side};
-
-use super::{BookLevel, OrderBookStore, StoreError};
+use crate::instrument::price::Price;
+use crate::order::Side;
 
 /// A dense array with one slot per legal tick for each side.
 ///

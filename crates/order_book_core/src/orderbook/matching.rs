@@ -1,63 +1,16 @@
+use crate::allocation::{Fill, Maker, MatchingAlgorithm};
+use crate::execution_report::{ExecutionReport, SubmitOutcome};
+use crate::instrument::price::Price;
+use crate::instrument::qty::Qty;
+use crate::order::{ExchangeId, Order, Side};
+use crate::order_queue::{OrderArena, OrderKey};
+use crate::order_type::{OrderType, TimeInForce};
+use crate::orderbook::{OrderAddress, OrderBook, OrderBookError};
+use crate::storage::OrderBookStore;
+use crate::trade::Trade;
 use std::cmp;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-
-use crate::allocation::{Fill, Maker, MatchingAlgorithm};
-use crate::instrument::Qty;
-use crate::order_queue::{OrderArena, OrderKey};
-use crate::orderbook::{OrderAddress, OrderBook, OrderBookError};
-use crate::storage::OrderBookStore;
-use crate::types::{ClientId, ExchangeId, Order, OrderType, Price, Side, TimeInForce};
-
-/// A single executed fill between a resting maker and an incoming taker.
-///
-/// The trade always prints at the **maker's** price (price-time priority: the
-/// resting order set the price, the taker accepted it). `quantity` is the filled
-/// amount for this fill, not the size of either order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Trade {
-    pub price: Price,
-    pub quantity: Qty,
-    pub maker_order_id: ExchangeId,
-    pub taker_order_id: ExchangeId,
-    pub maker_client: ClientId,
-    pub taker_client: ClientId,
-    pub taker_side: Side,
-    pub timestamp: u128,
-}
-
-/// What ultimately happened to the incoming (taker) order after `submit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmitOutcome {
-    /// Limit order didn't cross; the whole order now rests in the book.
-    Rested,
-    /// Limit order partially filled; the remainder rests in the book.
-    PartiallyFilledAndRested,
-    /// Order fully filled — nothing left to rest.
-    Filled,
-    /// The unfilled remainder was discarded (market/IOC), or a FOK couldn't
-    /// fill completely and executed nothing.
-    Killed,
-    /// A stop order parked in the stop book, waiting for its trigger.
-    StopPending,
-}
-
-/// The result of submitting one order: every fill it caused, what became of it,
-/// and any resting orders we cancelled to prevent self-trading.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExecutionReport {
-    pub order_id: ExchangeId,
-    pub trades: Vec<Trade>,
-    pub outcome: SubmitOutcome,
-    /// Resting orders cancelled because they belonged to the taker's own client
-    /// (self-trade prevention).
-    pub cancelled: Vec<ExchangeId>,
-    /// Stop orders this submit's trades set off, one report per activated
-    /// stop, in trigger order. FLAT: a triggered stop's own trades may
-    /// trigger further stops, but those land here too (their `triggered` is
-    /// always empty), so consumers never recurse.
-    pub triggered: Vec<ExecutionReport>,
-}
 
 #[derive(Debug, Clone)]
 struct MatchingResult {
@@ -549,7 +502,7 @@ fn fill_against<S: OrderBookStore, M: MatchingAlgorithm>(
 
 /// The allocation contract, checked against a real level.
 ///
-/// Its counterpart in `allocation.rs`'s tests checks clauses (1)-(4) on
+/// Its counterpart in `allocation/tests.rs` checks clauses (1)-(4) on
 /// hand-built slices. This one runs on every allocation the engine ever makes,
 /// and adds the clause the unit tests structurally cannot: **(5), whole lots**.
 /// Only the engine knows the instrument's lot, so only here can "the lattice
@@ -620,8 +573,10 @@ fn debug_assert_fills(fills: &[Fill], available: Qty, makers: &[Maker], lot: u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocation::{ProRataMatcher, TimeProRataMatcher};
+    use crate::allocation::pro_rata::ProRataMatcher;
+    use crate::allocation::time_pro_rata::TimeProRataMatcher;
     use crate::instrument::InstrumentSpec;
+    use crate::order::ClientId;
     use crate::test_helpers::{book, book_with, order, px, qty, spec};
 
     // The `order()` helper builds a resting GTC limit maker with

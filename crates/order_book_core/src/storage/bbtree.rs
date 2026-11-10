@@ -1,9 +1,10 @@
 use ::bbtree::unsync::{BBTreeMap, bbtree_map::Values};
 
+use super::book_level::BookLevel;
+use super::{OrderBookStore, StoreError};
 use crate::instrument::InstrumentSpec;
-use crate::types::{Price, Side};
-
-use super::{BookLevel, OrderBookStore, StoreError};
+use crate::instrument::price::Price;
+use crate::order::Side;
 
 /// B+ tree storage with integer inline keys and best-first iteration.
 ///

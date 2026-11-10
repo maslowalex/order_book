@@ -1,7 +1,7 @@
 use slotmap::{SlotMap, new_key_type};
 
 use crate::allocation::Maker;
-use crate::types::{ClientId, Order};
+use crate::order::{ClientId, Order};
 
 new_key_type! {
     /// Identity of an active order in one book's arena, never exposed to callers.
@@ -184,8 +184,8 @@ impl ExactSizeIterator for IterWithKeys<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::order::Side;
     use crate::test_helpers::order;
-    use crate::types::Side;
 
     fn queued(id: &str) -> Order {
         order(Side::Bid, 100, 1, None, id)
