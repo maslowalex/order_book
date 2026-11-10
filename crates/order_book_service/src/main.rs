@@ -1,6 +1,7 @@
 use order_book_core::allocation::fifo::FifoMatcher;
 use order_book_core::execution_report::ExecutionReport;
 use order_book_core::instrument::InstrumentSpec;
+use order_book_core::order::ExchangeId;
 use order_book_core::order::{OrderValidationError, Side};
 use order_book_core::order_input::OrderInput;
 use order_book_core::order_input::OrderKind;
@@ -9,7 +10,7 @@ use order_book_core::orderbook::OrderBook;
 use order_book_core::orderbook::OrderBookError;
 use tokio::sync::{mpsc, oneshot};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug)]
 enum SubmitError {
@@ -40,6 +41,24 @@ impl BookHandle {
             .await
             .map_err(|_| SubmitError::ReplyDropped)?
     }
+
+    pub async fn cancel(&self, order_id: ExchangeId) -> Result<(), SubmitError> {
+        let (oneshot_sender, oneshot_receiver) = oneshot::channel();
+        let command = Command::Cancel {
+            order_id,
+            sender: oneshot_sender,
+        };
+
+        self.sender
+            .send(command)
+            .await
+            .map_err(|_| SubmitError::CommandChannelClosed)?;
+
+        oneshot_receiver
+            .await
+            .map_err(|_| SubmitError::ReplyDropped)?
+            .map_err(SubmitError::Execution)
+    }
 }
 
 impl std::fmt::Display for SubmitError {
@@ -57,6 +76,10 @@ enum Command {
     Submit {
         input: OrderInput,
         sender: oneshot::Sender<Result<ExecutionReport, SubmitError>>,
+    },
+    Cancel {
+        order_id: ExchangeId,
+        sender: oneshot::Sender<Result<(), OrderBookError>>,
     },
 }
 
@@ -78,6 +101,46 @@ async fn dispatch_orders(handle: BookHandle, worker_tag: &str, number_of_orders:
     for i in 1..=number_of_orders {
         let input = generate_input(i, Some(worker_tag));
         let response = handle.submit(input).await;
+
+        if i == 3 {
+            match &response {
+                Ok(execution_report) => {
+                    let cancelation_result = handle.cancel(execution_report.order_id.clone()).await;
+
+                    match cancelation_result {
+                        Ok(()) => info!(
+                            worker = worker_tag,
+                            order_id = %execution_report.order_id.0,
+                            "order cancelled"
+                        ),
+                        Err(error) => {
+                            error!(request = i, error = %error, "order cancellation failed")
+                        }
+                    }
+
+                    let second_cancelation_result =
+                        handle.cancel(execution_report.order_id.clone()).await;
+
+                    match second_cancelation_result {
+                        Ok(()) => error!(
+                            worker = worker_tag,
+                            order_id = %execution_report.order_id.0,
+                            "ALREADY CANCELLED ORDER WAS ABLE TO CANCEL"
+                        ),
+                        Err(SubmitError::Execution(OrderBookError::OrderNotFound)) => {
+                            warn!(request = i, "You can't cancel already cancelled order")
+                        }
+                        Err(unexpected) => error!(
+                            worker = worker_tag,
+                            order_id = %execution_report.order_id.0,
+                            error = %unexpected,
+                            "Unexpected error during double cancellation"
+                        ),
+                    }
+                }
+                Err(error) => error!(request = i, error = %error, "order cancellation failed"),
+            }
+        }
 
         match response {
             Ok(report) => info!(
@@ -112,6 +175,11 @@ async fn main() {
                         .into_order(&instrument_spec)
                         .map_err(SubmitError::Validation)
                         .and_then(|order| orderbook.submit(order).map_err(SubmitError::Execution));
+
+                    let _ = sender.send(result);
+                }
+                Command::Cancel { order_id, sender } => {
+                    let result = orderbook.cancel_order(order_id);
 
                     let _ = sender.send(result);
                 }
