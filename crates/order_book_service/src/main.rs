@@ -23,6 +23,7 @@ impl LimitOrderMessage {
 
     fn to_order(&self, spec: &InstrumentSpec) -> Order {
         helpers::limit_order(&spec, self.side, self.price, self.quantity, "client_id")
+            .expect("invalid_order")
     }
 }
 

@@ -17,6 +17,7 @@ types stay beside them. Import types directly from their owning module:
 | Module | Contents |
 |---|---|
 | `order` | `Order`, its builder and validation error, IDs, side, lifecycle |
+| `order_input` | Typed raw `OrderInput`, its builder, and `OrderKind`; `into_order(&spec)` validates and constructs a fresh order |
 | `order_type` | `OrderType`, `TimeInForce` |
 | `price_level` | Owned price levels and borrowed views |
 | `instrument` | `InstrumentSpec`, conversion errors, admission reasons, rounding |

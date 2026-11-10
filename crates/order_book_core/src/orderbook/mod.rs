@@ -212,34 +212,9 @@ impl<M: MatchingAlgorithm, S: OrderBookStore> OrderBook<M, S> {
     /// anything that reached this far, because `Price` and `Qty` cannot hold
     /// an off-grid value.
     pub(crate) fn admit(&self, order: &Order) -> Result<(), OrderBookError> {
-        for price in order.order_type.prices().into_iter().flatten() {
-            self.spec
-                .admits_price(price)
-                .map_err(OrderBookError::Rejected)?;
-        }
-        self.spec
-            .admits_qty(order.original_quantity)
-            .map_err(OrderBookError::Rejected)?;
-
-        // Min-notional only applies where a price is known at ingress.
-        // `Market` and `StopMarket` carry none — `limit_price()` returns
-        // `None` for both — so their value is genuinely unknowable here.
-        // Real venues substitute a reference price; this one skips, and says
-        // so rather than pretending the rule was applied.
-        //
-        // Note also what is NOT enforced: a partial fill can leave a resting
-        // remainder worth less than the floor. That dust is allowed to rest.
-        // Cancelling it would make quantity vanish without a corresponding
-        // fill, which is precisely what the conservation and depth-accounting
-        // properties forbid — so it would be a much larger change than it
-        // looks, and it belongs with a deliberate dust policy, not here.
-        if let Some(price) = order.order_type.limit_price() {
-            self.spec
-                .admits_notional(price, order.original_quantity)
-                .map_err(OrderBookError::Rejected)?;
-        }
-
-        Ok(())
+        order
+            .validate_admission(&self.spec)
+            .map_err(OrderBookError::Rejected)
     }
 
     #[inline]

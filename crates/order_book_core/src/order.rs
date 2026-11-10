@@ -1,4 +1,5 @@
 use crate::instrument::qty::Qty;
+use crate::instrument::{InstrumentSpec, RejectReason, SpecError};
 use crate::order_type::OrderType;
 use derive_builder::Builder;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,7 +26,7 @@ pub enum Side {
 pub enum OrderLifecycle {
     #[default]
     New,
-    PartiallyFilled, // represents how much is filled
+    PartiallyFilled,
     Filled,
     Cancelled,
 }
@@ -118,6 +119,11 @@ impl Default for OrderBuilder {
 pub enum OrderValidationError {
     MissingField(String),
     InvalidLifecycle,
+    InvalidPrice(SpecError),
+    InvalidTrigger(SpecError),
+    InvalidQuantity(SpecError),
+    UnexpectedField(&'static str),
+    Rejected(RejectReason),
 }
 
 impl OrderValidationError {
@@ -151,6 +157,32 @@ impl OrderBuilder {
 }
 
 impl Order {
+    /// Admission policy shared by raw-input conversion and book submission.
+    pub(crate) fn validate_admission(&self, spec: &InstrumentSpec) -> Result<(), RejectReason> {
+        for price in self.order_type.prices().into_iter().flatten() {
+            spec.admits_price(price)?;
+        }
+        spec.admits_qty(self.original_quantity)?;
+
+        // Min-notional only applies where a price is known at ingress.
+        // `Market` and `StopMarket` carry none — `limit_price()` returns
+        // `None` for both — so their value is genuinely unknowable here.
+        // Real venues substitute a reference price; this one skips, and says
+        // so rather than pretending the rule was applied.
+        //
+        // Note also what is NOT enforced: a partial fill can leave a resting
+        // remainder worth less than the floor. That dust is allowed to rest.
+        // Cancelling it would make quantity vanish without a corresponding
+        // fill, which is precisely what the conservation and depth-accounting
+        // properties forbid — so it would be a much larger change than it
+        // looks, and it belongs with a deliberate dust policy, not here.
+        if let Some(price) = self.order_type.limit_price() {
+            spec.admits_notional(price, self.original_quantity)?;
+        }
+
+        Ok(())
+    }
+
     pub fn builder() -> OrderBuilder {
         OrderBuilder::default()
     }
