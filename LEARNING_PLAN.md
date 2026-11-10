@@ -445,9 +445,11 @@ Keep the synchronous engine as the domain boundary; networking and coordination 
 Early exercises use in-process callers
 and real book operations. Introduce dependencies as their lessons need them.
 
-**Endpoint:** locally running processes that own different instruments, with a fixed leader
-and in-memory followers for each shard. Persistence, restart recovery, and automatic leader
-failover require a later planning session. The incomplete Phase 6 workshops remain incomplete.
+**Phase 7 endpoint:** locally running processes that own different instruments, with a fixed
+leader and in-memory followers for each shard. Phase 8 extends this foundation with durable
+replication, restart recovery, automatic failover, and cluster experiments. The incomplete
+Phase 6 workshops remain separate; the unsafe-arena workshop is not a prerequisite for this
+distributed-service extension.
 
 ### 7.1 Orders as futures: what actually runs?
 
@@ -485,7 +487,7 @@ failover require a later planning session. The incomplete Phase 6 workshops rema
 - Practical scheduling and ownership experiments are complete. The learner's own explanation
   of state retained across suspension and what causes another poll remains a checkpoint;
   `Pin` and `Send` have not been explored and should be introduced when an experiment needs them.
-- **Next session:** briefly close that checkpoint, then start 7.2 with one long-lived book owner
+- **Next session (as recorded then; superseded by the 2026-11-10 record below):** briefly close that checkpoint, then start 7.2 with one long-lived book owner
   receiving commands. Bounded `mpsc` commands and per-request `oneshot` replies were discussed
   as the communication mechanism; no channel-based service has been implemented. Define the
   first command and reply interface with the learner before they implement it.
@@ -504,6 +506,28 @@ failover require a later planning session. The incomplete Phase 6 workshops rema
   the actual processed sequence. Include rejected orders, cancellations, and stop cascades;
   do not assume an order among racing callers.
 
+**Session record — 2026-11-10:**
+
+- Implemented a single book-owner task with a bounded `mpsc` queue, per-request `oneshot`
+  replies, and a clonable `BookHandle`. Two callers submit orders and exercise cancellation,
+  including rejection of a second cancellation. Evidence: `192fc9f`, `0b3f457`.
+- Added `OrderBook::full_depth()` and a depth command returning an owned
+  `HashMap<Side, Vec<(Price, Qty)>>` snapshot of both sides. The owner collects both sides
+  within one synchronous command; no book references cross the channel. Evidence: `251478c`.
+- Ran a concurrent checker for eight queries, each raced against a fresh 10 ms sleep using
+  `select!`. Observed combined quantities from both callers and removal of the cancelled
+  price level. Every query succeeded in the observed run; the timeout path was not exercised.
+- Discussed why caller-side logs can appear after later book mutations: a submission's
+  `Rested` report describes its original result, even if the caller logs it after cancellation.
+  Caller log order is not an authoritative command-processing trace.
+- Validation at `251478c`: workspace tests and formatting checks passed. This does not
+  complete the concurrent-versus-synchronous checkpoint.
+- **Next:** record commands at the owner in actual processing order and compare reports and
+  final state against a synchronous reference using identical inputs. Cover rejections,
+  cancellations, and stop cascades. The build requirement to pass an explicitly configured
+  book into service construction also remains; the current example constructs it inside the
+  owner task. The 7.1 suspension-state/wakeup explanation remains open.
+
 ### 7.3 A caller gives up: did its order execute?
 
 - **Build:** exercise cancellation and deadlines around the book handle, including a
@@ -518,6 +542,12 @@ failover require a later planning session. The incomplete Phase 6 workshops rema
   boundary. Dropping a caller after enqueueing does not undo an order. Use explicit test
   coordination and controlled time; unknown outcomes must not be retried automatically.
   Apply existing backpressure knowledge to task admission and cancellation semantics.
+
+**Preview — 2026-11-10:** the depth checker introduced `select!` and dropping the losing
+query future. Discussed the distinction between a send still waiting for capacity (not yet
+enqueued) and waiting for a reply (already enqueued, possibly executed). A timeout alone
+does not identify which boundary was reached. Controlled cancellation experiments and the
+learner's explanation of each outcome remain unfinished.
 
 ### 7.4 The owner stops: account for every task and request
 
@@ -592,9 +622,109 @@ failover require a later planning session. The incomplete Phase 6 workshops rema
 
 **Boundaries to track:** future polling, command admission, execution, result delivery,
 and replica application. Identify which of those events is known to have happened and which remains
-uncertain. Resume from the 2026-10-22 session record in 7.1, then proceed to 7.2.
+uncertain. Resume from the 2026-11-10 session record in 7.2; finish its checkpoint before
+the controlled cancellation experiments in 7.3. Retain the open 7.1 explanation checkpoint.
 Define each later chunk's concrete interfaces and failure policy
 with the learner when that chunk starts; this is a curriculum, not a reference implementation.
+
+---
+
+## Phase 8: Fault-Tolerant Order-Book Cluster — Planned
+
+**Agreed extension (2026-11-09):** keep Phase 7 as the foundation, then practise distributing
+books across a durable cluster. Integrate an established consensus implementation, begin with
+static placement, and progress to operator-triggered rebalancing. Run load and chaos experiments
+locally first and then across separate machines.
+
+**Final deliverable:** a Rust service that distributes books, replicates their state durably,
+automatically replaces failed leaders, and moves books between nodes while clients continue
+operating. Deliver a reproducible load generator, chaos-test suite, and correctness evidence
+under failure. Completion also requires the learner to explain and reproduce the mechanisms.
+
+Keep the synchronous core as the domain boundary and put coordination in the service layer.
+Follow the existing predict → implement → reproduce → explain → change → compare loop; the
+learner writes the conceptual implementation. Choose concrete APIs and the consensus library
+with the learner when the corresponding lesson begins.
+
+### 8.1 Service contract: account for every request
+
+- **Build:** submission, cancellation, authoritative book queries, and request-outcome lookup.
+  Introduce stable client request IDs and deduplication. Routing identifies the instrument;
+  retries and ownership changes preserve request identity.
+- **Experiment:** lose a response after execution, retry the same request, and reconcile its
+  outcome. Distinguish engine rejection, successful execution, and uncertain outcomes.
+- **Learn:** client-request identity is distinct from order IDs and replication sequence
+  numbers. Submission success does not imply a fill: an order may rest, fill, or be cancelled.
+- **Checkpoint:** define the final contract that a success reply promises durable commitment
+  and a retry cannot execute the request twice. Enable that promise only once 8.2 implements
+  durable replication; Phase 7's leader-execution reply remains a weaker guarantee.
+  Start a client request ledger and correctness checker here and extend them in each stage.
+
+### 8.2 Durable replicated books: recover committed history
+
+- **Build:** integrate an established consensus implementation. A shard is the replication
+  and placement unit, contains one or more books, and has one authoritative command order.
+  Add durable log replay, snapshots, and restart recovery, including request deduplication
+  and outcomes needed to preserve the service contract.
+- **Experiment:** crash around commitment, application, and reply delivery; restart from
+  retained disk state. Compare replay from the log with restoration from a snapshot plus log.
+- **Learn:** admission, commitment, application, and acknowledgement are distinct events.
+  Replicate the inputs needed for deterministic execution, building on 7.7–7.8.
+- **Checkpoint:** acknowledged mutations survive restarts, retries do not execute twice,
+  and recovered reports and canonical state agree with synchronous reference replay.
+
+### 8.3 Failover and partitions: who may make progress?
+
+- **Build:** start with three nodes and three replicas per shard, spreading shard leaders
+  across nodes. Add automatic leader replacement and catch-up for returning replicas.
+- **Experiment:** kill leaders and followers during traffic; isolate a minority, delay
+  communication, reconnect replicas, and restart the entire cluster with disks retained.
+- **Learn:** only a partition with a quorum may commit mutations. Authoritative reads must
+  not expose stale state as current; an unreachable quorum limits availability.
+- **Checkpoint:** no acknowledged mutation disappears, minority partitions cannot commit
+  conflicting histories, and recovered replicas converge. Explain what clients observe
+  during election, loss of quorum, and recovery.
+
+### 8.4 Placement and rebalancing: move ownership under load
+
+- **Build:** statically assign books evenly to shards and configure replica placement.
+  Add operator-triggered shard movement and leadership transfer, including adding a node.
+  Use the consensus implementation's supported membership-change mechanism.
+- **Experiment:** compare balanced traffic with a hot instrument, move a shard while
+  submitting and cancelling orders, and interrupt a move before recovering it.
+- **Learn:** equal book counts do not imply equal load. Replica placement and leadership
+  placement affect different resources; routing must follow ownership changes safely.
+- **Checkpoint:** movement preserves committed history and request identity, clients can
+  reconcile outcomes, and recovery leaves an authoritative owner for each shard.
+  Move existing shards as units; automatic load-based placement and splitting a single
+  hot book are outside this extension.
+
+### 8.5 Load and chaos: prove the contract across machines
+
+- **Build:** finish the reproducible workload generator and chaos harness developed alongside
+  8.1–8.4. Retain offered requests, retries, responses, latency, and final outcomes. Exercise
+  balanced traffic, hot instruments, bursts, and overload, first locally and then on separate
+  machines. Choose hosting details and numerical performance targets when that environment
+  is available.
+- **Experiment:** repeat leader/follower crashes, individual and full-cluster restarts,
+  minority partitions, delayed communication, lost replies, reconnects, and interrupted
+  rebalancing while clients remain active. Preserve disks in restart experiments.
+- **Measure:** offered load, committed throughput, latency percentiles, rejection and timeout
+  rates, recovery time, and replication lag. Report degradation during faults rather than
+  requiring every request to succeed during an outage.
+- **Verify:** reconcile the client ledger with committed execution history. Replay the actual
+  committed order through the synchronous core and compare reports and final state. Check
+  no acknowledged mutation is lost and no client request executes twice. After recovery,
+  account for every generated request: explicit rejections are valid outcomes, but unresolved
+  requests prevent a successful correctness verdict.
+- **Checkpoint:** reproduce the multi-machine results and explain both the correctness
+  evidence and the observed availability/performance tradeoffs.
+
+**Failure model and limits:** assume crash failures and network faults with durable disks
+retained. Byzantine behavior and permanent loss of every replica's disk are excluded. Use
+finite test histories and retain deduplication records throughout each experiment. This is
+a learning cluster; passing the experiments is evidence for the stated guarantees, not a
+claim of production-exchange readiness.
 
 ---
 
@@ -707,10 +837,23 @@ reference commit is evidence for comparison, not evidence of learner completion.
 - [ ] Phase 7: Async Rust and Distributed Order Books — **in progress** (started 2026-10-22)
   - [ ] 7.1 Order-submission futures and task scheduling — practical experiments complete;
     suspension-state/wakeup explanation remains. See the 2026-10-22 session record.
-  - [ ] 7.2 Concurrent callers and book ownership
-  - [ ] 7.3 Cancellation, deadlines, and uncertain execution
+  - [ ] 7.2 Concurrent callers and book ownership — submit, cancel, and owned two-sided depth
+    queries implemented (through `251478c`, 2026-11-10). Explicit book construction boundary
+    and synchronous-reference comparison of actual processed commands remain.
+    - [x] Bounded command queue, per-request replies, and clonable handle
+    - [x] Concurrent submission, cancellation, and depth-query demonstration
+    - [ ] Service construction receives an explicitly configured book
+    - [ ] Owner processing trace and reference comparison, including rejections and stop cascades
+  - [ ] 7.3 Cancellation, deadlines, and uncertain execution — `select!` timeout preview done;
+    no timeout observed yet. Controlled cancellation experiments remain.
   - [ ] 7.4 Worker failure and graceful shutdown
   - [ ] 7.5 Per-instrument queues and scheduling
   - [ ] 7.6 Remote shards and uncertain messages
   - [ ] 7.7 Deterministic command replay
   - [ ] 7.8 In-memory replication with fixed leaders
+- [ ] Phase 8: Fault-Tolerant Order-Book Cluster — **planned** (agreed 2026-11-09)
+  - [ ] 8.1 Service contract, request identity, deduplication, and outcome accounting
+  - [ ] 8.2 Durable consensus replication, snapshots, and restart recovery
+  - [ ] 8.3 Automatic failover, partitions, and replica catch-up
+  - [ ] 8.4 Static placement followed by operator-triggered rebalancing
+  - [ ] 8.5 Local and multi-machine load/chaos experiments with correctness reconciliation
